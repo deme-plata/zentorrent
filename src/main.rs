@@ -23,6 +23,7 @@ type ManagedTorrentHandle = Arc<ManagedTorrent>;
 
 mod catalog;
 mod rss;
+mod seed;
 mod update;
 use catalog::CatalogEntry;
 
@@ -68,6 +69,22 @@ fn main() -> eframe::Result<()> {
             }
             Err(e) => {
                 eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+
+    // `zentorrent --login <feed url> <user> <password>`: test a tracker login.
+    if args.get(1).map(String::as_str) == Some("--login") {
+        let (Some(u), Some(n), Some(p)) = (args.get(2), args.get(3), args.get(4)) else {
+            eprintln!("usage: zentorrent --login <feed url> <username> <password>");
+            std::process::exit(2);
+        };
+        match rt.block_on(rss::login(u, n, p)) {
+            Ok(c) => println!("logged in; session cookie has {} part(s)", c.split("; ").count()),
+            Err(e) => {
+                eprintln!("error: {e:#}");
                 std::process::exit(1);
             }
         }
@@ -186,6 +203,8 @@ struct Inbox {
     /// (feed url, items or error)
     feeds: Vec<(String, Result<Vec<rss::Item>, String>)>,
     update: Option<Upd>,
+    /// (feed url, cookie or error) from a Log in click.
+    login: Vec<(String, Result<String, String>)>,
     busy: usize,
 }
 
@@ -202,6 +221,7 @@ enum Upd {
 #[derive(PartialEq, Clone, Copy)]
 enum View {
     Downloads,
+    Seeding,
     Feeds,
 }
 
@@ -216,6 +236,11 @@ struct FeedView {
     filter: String,
     in_flight: usize,
     last_refresh: Option<Instant>,
+    login_user: String,
+    login_pass: String,
+    login_busy: bool,
+    /// Feed of the last ⬇ click, to open its login box if the site refuses.
+    last_pick: Option<String>,
 }
 
 struct App {
@@ -235,6 +260,9 @@ struct App {
     http: reqwest::Client,
     upd: Upd,
     upd_checked: Option<Instant>,
+    ledger: seed::Ledger,
+    last_tick: Instant,
+    last_ledger_save: Instant,
 }
 
 impl App {
@@ -242,7 +270,18 @@ impl App {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
 
         let (session, session_error) =
-            match rt.block_on(Session::new_with_opts(folder.clone(), SessionOptions::default())) {
+            // Persistence: librqbit remembers every torrent (and where it got
+            // to) in the data dir, so a restart resumes downloads and seeding.
+            match rt.block_on(Session::new_with_opts(
+                folder.clone(),
+                SessionOptions {
+                    persistence: Some(librqbit::SessionPersistenceConfig::Json {
+                        folder: Some(seed::data_dir().join("session")),
+                    }),
+                    fastresume: true,
+                    ..Default::default()
+                },
+            )) {
                 Ok(s) => (Some(s), None),
                 Err(e) => (None, Some(format!("could not start the torrent engine: {e:#}"))),
             };
@@ -258,12 +297,30 @@ impl App {
             });
         }
 
+        // Torrents restored from the previous run.
+        let ledger = seed::Ledger::load();
+        let mut transfers = Vec::new();
+        if let Some(s) = &session {
+            let handles: Vec<ManagedTorrentHandle> = s.with_torrents(|it| it.map(|(_, h)| h.clone()).collect());
+            {
+                for h in &handles {
+                    let hash = h.info_hash().as_string();
+                    let e = ledger.entries.get(&hash);
+                    transfers.push(Transfer {
+                        name: h.name().or_else(|| e.map(|e| e.name.clone())).unwrap_or_else(|| hash.clone()),
+                        folder: e.map(|e| e.folder.clone()).unwrap_or_else(|| folder.clone()),
+                        handle: h.clone(),
+                    });
+                }
+            }
+        }
+
         Self {
             rt,
             session,
             session_error,
             inbox,
-            transfers: Vec::new(),
+            transfers,
             catalog: Vec::new(),
             catalog_loading: true,
             folder,
@@ -279,6 +336,180 @@ impl App {
                 .expect("http client"),
             upd: Upd::Checking,
             upd_checked: None,
+            ledger,
+            last_tick: Instant::now(),
+            last_ledger_save: Instant::now(),
+        }
+    }
+
+    /// Once a second: fold upload counters into the ledger, count seed
+    /// time, and pause torrents that reached the seed goal.
+    fn tick_ledger(&mut self) {
+        let dt = self.last_tick.elapsed();
+        if dt < Duration::from_secs(1) {
+            return;
+        }
+        self.last_tick = Instant::now();
+        let mut to_pause = Vec::new();
+        let goals = self.ledger.clone_goals();
+        for t in &self.transfers {
+            let s = t.handle.stats();
+            let hash = t.handle.info_hash().as_string();
+            let private = t.handle.with_metadata(|m| m.info.info().private).unwrap_or(false);
+            let e = self.ledger.entries.entry(hash).or_insert_with(|| seed::Entry {
+                name: t.name.clone(),
+                folder: t.folder.clone(),
+                ..Default::default()
+            });
+            e.private = private;
+            if s.total_bytes > 0 {
+                e.size = s.total_bytes;
+            }
+            e.observe_uploaded(s.uploaded_bytes);
+            let seeding = s.finished && !t.handle.is_paused() && s.error.is_none();
+            if seeding {
+                e.seed_secs += dt.as_secs();
+            }
+            if seeding && !e.goal_reached && goals.goal_met(e) {
+                e.goal_reached = true;
+                to_pause.push(t.handle.clone());
+            }
+        }
+        if let Some(sess) = self.session.clone() {
+            for h in to_pause {
+                let sess = sess.clone();
+                self.rt.spawn(async move {
+                    let _ = sess.pause(&h).await;
+                });
+            }
+        }
+        if self.last_ledger_save.elapsed() >= Duration::from_secs(30) {
+            self.save_ledger();
+        }
+    }
+
+    fn save_ledger(&mut self) {
+        self.last_ledger_save = Instant::now();
+        if let Err(e) = self.ledger.save() {
+            self.errors.push(format!("could not save ratio ledger: {e:#}"));
+        }
+    }
+
+    fn seeding_ui(&mut self, ui: &mut egui::Ui) {
+        let (up, size) = self.ledger.totals();
+        ui.horizontal(|ui| {
+            ui.heading("Seeding & ratio");
+            ui.label(
+                egui::RichText::new(format!(
+                    "uploaded {} of {}  ·  overall ratio {:.2}",
+                    human(up),
+                    human(size),
+                    if size > 0 { up as f64 / size as f64 } else { 0.0 }
+                ))
+                .weak(),
+            );
+        });
+        ui.label(
+            egui::RichText::new(
+                "Ratio = what you have uploaded ÷ the torrent's size. Private trackers ask you to keep it at 1.0 or \
+                 more, so leave finished torrents seeding. Counts survive restarts.",
+            )
+            .weak()
+            .small(),
+        );
+        ui.horizontal(|ui| {
+            let mut changed = false;
+            ui.label("Stop seeding at ratio");
+            let mut r_on = self.ledger.ratio_goal > 0.0;
+            changed |= ui.checkbox(&mut r_on, "").changed();
+            if !r_on {
+                self.ledger.ratio_goal = 0.0;
+            } else {
+                if self.ledger.ratio_goal == 0.0 {
+                    self.ledger.ratio_goal = 1.0;
+                }
+                changed |= ui.add(egui::DragValue::new(&mut self.ledger.ratio_goal).range(0.1..=50.0).speed(0.05)).changed();
+            }
+            ui.add_space(12.0);
+            ui.label("or after");
+            let mut h_on = self.ledger.hours_goal > 0.0;
+            changed |= ui.checkbox(&mut h_on, "").changed();
+            if !h_on {
+                self.ledger.hours_goal = 0.0;
+            } else {
+                if self.ledger.hours_goal == 0.0 {
+                    self.ledger.hours_goal = 72.0;
+                }
+                changed |= ui.add(egui::DragValue::new(&mut self.ledger.hours_goal).range(1.0..=8760.0).suffix(" h")).changed();
+            }
+            if !r_on && !h_on {
+                ui.label(egui::RichText::new("(off: seed forever)").weak().small());
+            }
+            if changed {
+                self.save_ledger();
+            }
+        });
+        ui.separator();
+
+        if self.transfers.is_empty() {
+            ui.label(egui::RichText::new("Nothing is seeding yet. Finished downloads show up here.").weak());
+            return;
+        }
+        let mut toggle = None;
+        egui::ScrollArea::both().show(ui, |ui| {
+            egui::Grid::new("seedgrid").striped(true).num_columns(8).spacing([10.0, 6.0]).show(ui, |ui| {
+                for h in ["Torrent", "", "Size", "Uploaded", "Ratio", "Seeded", "Up now", "State"] {
+                    ui.strong(h);
+                }
+                ui.end_row();
+                for t in &self.transfers {
+                    let s = t.handle.stats();
+                    let hash = t.handle.info_hash().as_string();
+                    let e = self.ledger.entries.get(&hash).cloned().unwrap_or_default();
+                    let paused = t.handle.is_paused();
+                    let name: String = t.name.chars().take(34).collect();
+                    ui.label(name).on_hover_text(&t.name);
+                    ui.label(if e.private { "🔒" } else { "" }).on_hover_text(if e.private {
+                        "Private torrent: tracker only, no DHT"
+                    } else {
+                        "Public torrent"
+                    });
+                    ui.label(human(s.total_bytes));
+                    ui.label(human(e.uploaded));
+                    let r = e.ratio();
+                    let col = if r >= 1.0 {
+                        egui::Color32::from_rgb(90, 200, 120)
+                    } else if r >= 0.5 {
+                        egui::Color32::from_rgb(230, 190, 80)
+                    } else {
+                        egui::Color32::from_rgb(230, 110, 100)
+                    };
+                    ui.colored_label(col, format!("{r:.2}"));
+                    ui.label(seed::duration(e.seed_secs));
+                    ui.label(s.live.as_ref().map(|l| speed(l.upload_speed.mbps)).unwrap_or_default());
+                    let state = if !s.finished {
+                        "Downloading"
+                    } else if paused && e.goal_reached {
+                        "Goal reached"
+                    } else if paused {
+                        "Paused"
+                    } else {
+                        "Seeding"
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label(state);
+                        if ui.small_button(if paused { "▶" } else { "⏸" }).clicked() {
+                            toggle = Some((t.handle.clone(), paused));
+                        }
+                    });
+                    ui.end_row();
+                }
+            });
+        });
+        if let (Some((h, paused)), Some(sess)) = (toggle, self.session.clone()) {
+            self.rt.spawn(async move {
+                let _ = if paused { sess.unpause(&h).await } else { sess.pause(&h).await };
+            });
         }
     }
 
@@ -458,7 +689,35 @@ impl App {
         for t in ib.added.drain(..) {
             let id = t.handle.id();
             if !self.transfers.iter().any(|x| x.handle.id() == id) {
+                let e = self.ledger.entries.entry(t.handle.info_hash().as_string()).or_default();
+                e.name = t.name.clone();
+                e.folder = t.folder.clone();
                 self.transfers.push(t);
+            }
+        }
+        for (url, res) in ib.login.drain(..) {
+            self.fv.login_busy = false;
+            match res {
+                Ok(cookie) => {
+                    if let Some(f) = self.store.feeds.iter_mut().find(|f| f.url == url) {
+                        f.cookie = cookie;
+                    }
+                    self.fv.login_pass.clear();
+                    self.fv.status.insert(url, "logged in ✔ — downloads will now work".into());
+                    let _ = self.store.save();
+                }
+                Err(e) => {
+                    self.fv.status.insert(url, format!("error: {e}"));
+                }
+            }
+        }
+        for e in &ib.errors {
+            // The site wants a login: open that feed's login box.
+            if e.contains("wants you logged in") {
+                if let Some(i) = self.fv.last_pick.as_ref().and_then(|u| self.store.feeds.iter().position(|f| &f.url == u)) {
+                    self.fv.selected = Some(i);
+                    self.view = View::Feeds;
+                }
             }
         }
         self.errors.extend(ib.errors.drain(..));
@@ -480,7 +739,7 @@ enum Source {
 impl Source {
     fn from_feed(link: String, cookie: &str) -> Self {
         if link.starts_with("http://") || link.starts_with("https://") {
-            Source::Fetch { url: link, cookie: cookie.to_string() }
+            Source::Fetch { url: link, cookie: rss::clean_cookie(cookie) }
         } else {
             Source::Link(link)
         }
@@ -512,6 +771,7 @@ impl eframe::App for App {
                 ui.label(egui::RichText::new("egui · librqbit").weak());
                 ui.add_space(16.0);
                 ui.selectable_value(&mut self.view, View::Downloads, format!("Downloads ({})", self.transfers.len()));
+                ui.selectable_value(&mut self.view, View::Seeding, "Seeding & ratio");
                 ui.selectable_value(&mut self.view, View::Feeds, format!("RSS feeds ({})", self.store.feeds.len()));
                 self.update_ui(ui, ctx);
             });
@@ -591,6 +851,12 @@ impl eframe::App for App {
             }
         });
 
+        self.tick_ledger();
+        if self.view == View::Seeding {
+            egui::CentralPanel::default().show(root, |ui| self.seeding_ui(ui));
+            ctx.request_repaint_after(Duration::from_millis(1000));
+            return;
+        }
         if self.view == View::Feeds {
             egui::CentralPanel::default().show(root, |ui| self.feeds_ui(ui, ctx));
             ctx.request_repaint_after(Duration::from_millis(500));
@@ -634,6 +900,8 @@ impl eframe::App for App {
             });
             if let Some(i) = remove {
                 let t = self.transfers.remove(i);
+                self.ledger.entries.remove(&t.handle.info_hash().as_string());
+                self.save_ledger();
                 if let Some(s) = self.session.clone() {
                     self.rt.spawn(async move {
                         let _ = s.delete(t.handle.id().into(), false).await;
@@ -644,6 +912,11 @@ impl eframe::App for App {
 
         // Live progress: redraw twice a second while anything is running.
         ctx.request_repaint_after(Duration::from_millis(500));
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.tick_ledger();
+        let _ = self.ledger.save();
     }
 }
 
@@ -727,6 +1000,7 @@ impl App {
         let mut remove = None;
         let mut refresh_one = None;
         let mut changed = false;
+        let mut login_req: Option<(String, String, String)> = None;
         for (i, f) in self.store.feeds.iter_mut().enumerate() {
             let sel = self.fv.selected == Some(i);
             ui.horizontal(|ui| {
@@ -766,29 +1040,59 @@ impl App {
                     }
                 });
                 ui.horizontal(|ui| {
-                    ui.label("Login cookie:").on_hover_text(
-                        "Only needed when the tracker says \"registered users only\".\n\
-                         In your browser, logged in to the tracker: F12 → Network → reload → \
-                         click any request → Request Headers → copy the value of Cookie \
-                         (looks like  uid=…; pass=…).",
+                    ui.label("Log in to the tracker:").on_hover_text(
+                        "Needed when the site says \"registered users only\". ZenTorrent logs in once and keeps \
+                         only the session cookie. Your password is not saved.",
+                    );
+                    ui.add(egui::TextEdit::singleline(&mut self.fv.login_user).hint_text("username").desired_width(120.0));
+                    let pw = ui.add(
+                        egui::TextEdit::singleline(&mut self.fv.login_pass).password(true).hint_text("password").desired_width(120.0),
+                    );
+                    let can = !self.fv.login_busy && !self.fv.login_user.trim().is_empty() && !self.fv.login_pass.is_empty();
+                    let go = ui.add_enabled(can, egui::Button::new("Log in")).clicked()
+                        || (can && pw.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                    if go {
+                        login_req = Some((f.url.clone(), self.fv.login_user.trim().to_string(), self.fv.login_pass.clone()));
+                    }
+                    if self.fv.login_busy {
+                        ui.spinner();
+                    }
+                    ui.label(
+                        egui::RichText::new(if f.cookie.trim().is_empty() { "not logged in" } else { "logged in ✔" })
+                            .weak()
+                            .small(),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("…or paste a browser cookie:").weak().small()).on_hover_text(
+                        "In your browser, logged in to the tracker: F12 → Network → reload → click any request → \
+                         Request Headers → copy the value of Cookie (looks like  uid=…; pass=…).",
                     );
                     let r = ui.add(
                         egui::TextEdit::singleline(&mut f.cookie)
                             .password(true)
-                            .hint_text("uid=…; pass=…   (optional)")
+                            .hint_text("uid=…; pass=…")
                             .desired_width(260.0),
                     );
-                    changed |= r.lost_focus();
-                    ui.label(
-                        egui::RichText::new(if f.cookie.trim().is_empty() { "not set" } else { "set ✔" })
-                            .weak()
-                            .small(),
-                    );
+                    if r.lost_focus() {
+                        f.cookie = rss::clean_cookie(&f.cookie);
+                        changed = true;
+                    }
                 });
             }
         }
         if changed {
             self.save_feeds();
+        }
+        if let Some((url, user, pass)) = login_req {
+            self.fv.login_busy = true;
+            self.fv.status.insert(url.clone(), "logging in…".into());
+            let (inbox, ctx) = (self.inbox.clone(), ctx.clone());
+            self.rt.spawn(async move {
+                let res = rss::login(&url, &user, &pass).await.map_err(|e| format!("{e:#}"));
+                inbox.lock().unwrap().login.push((url, res));
+                ctx.request_repaint();
+            });
         }
         if let Some(i) = refresh_one {
             self.refresh_feeds(ctx, Some(i));
@@ -813,7 +1117,7 @@ impl App {
             Some(f) => vec![(f.name.clone(), f.url.clone(), f.cookie.clone())],
             None => self.store.feeds.iter().map(|f| (f.name.clone(), f.url.clone(), f.cookie.clone())).collect(),
         };
-        let mut pick: Option<(rss::Item, String)> = None;
+        let mut pick: Option<(rss::Item, String, String)> = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
             let mut shown = 0;
             for (name, url, cookie) in &feeds {
@@ -822,7 +1126,7 @@ impl App {
                     shown += 1;
                     ui.horizontal(|ui| {
                         if ui.small_button("⬇").on_hover_text("Download").clicked() {
-                            pick = Some((it.clone(), cookie.clone()));
+                            pick = Some((it.clone(), cookie.clone(), url.clone()));
                         }
                         ui.label(&it.title);
                         let mut meta = String::new();
@@ -843,9 +1147,10 @@ impl App {
                 ui.label(egui::RichText::new(if self.fv.in_flight > 0 { "Reading feeds…" } else { "No items." }).weak());
             }
         });
-        if let Some((it, cookie)) = pick {
+        if let Some((it, cookie, url)) = pick {
+            self.fv.last_pick = Some(url);
+            self.fv.status.insert(self.fv.last_pick.clone().unwrap(), format!("starting “{}” — see Downloads", it.title));
             self.start(ctx, it.title.clone(), Source::from_feed(it.link, &cookie));
-            self.view = View::Downloads;
         }
     }
 }

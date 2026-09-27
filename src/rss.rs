@@ -309,6 +309,100 @@ fn entity(name: &str) -> String {
     }
 }
 
+/// Clean up a pasted cookie: drop a leading "Cookie:", join lines.
+pub fn clean_cookie(raw: &str) -> String {
+    let s = raw.trim();
+    let s = s.strip_prefix("Cookie:").or_else(|| s.strip_prefix("cookie:")).unwrap_or(s);
+    s.split(['\n', '\r']).map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join("; ")
+}
+
+/// Log in to a TBDev-style tracker (TorrentBytes and most classic private
+/// trackers: `POST /takelogin.php` with `username` + `password`) and return
+/// the session cookie. The password is used for this one request and is
+/// never stored.
+pub async fn login(feed_url: &str, username: &str, password: &str) -> anyhow::Result<String> {
+    let base = site_root(feed_url).ok_or_else(|| anyhow::anyhow!("feed link has no host"))?;
+    let client = reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 (ZenTorrent)")
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    // 1. The login page hands out the pre-login session cookie the form needs.
+    let pre = client.get(format!("{base}/login.php")).send().await?;
+    let mut jar = cookies_from(pre.headers());
+    let _ = pre.bytes().await;
+    // 2. Post the form with that cookie.
+    let body = format!("username={}&password={}", urlenc(username), urlenc(password));
+    let mut req = client
+        .post(format!("{base}/takelogin.php"))
+        .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(reqwest::header::REFERER, format!("{base}/login.php"))
+        .body(body);
+    if !jar.is_empty() {
+        req = req.header(reqwest::header::COOKIE, &jar);
+    }
+    let resp = req.send().await?;
+    let status = resp.status();
+    let new = cookies_from(resp.headers());
+    let text = resp.text().await.unwrap_or_default();
+    jar = merge_cookies(&jar, &new);
+    if new.is_empty() {
+        let said = describe(text.as_bytes());
+        anyhow::bail!("login refused (HTTP {status}): {said} — check username and password");
+    }
+    // 3. Proof: the first .torrent in the feed must now download.
+    let http = reqwest::Client::builder().user_agent("ZenTorrent").timeout(std::time::Duration::from_secs(30)).build()?;
+    if let Ok(items) = fetch(&http, feed_url).await {
+        if let Some(it) = items.iter().find(|i| i.link.starts_with("http")) {
+            fetch_torrent(&http, &it.link, Some(&jar))
+                .await
+                .map_err(|e| anyhow::anyhow!("logged in, but downloads still fail: {e:#}"))?;
+        }
+    }
+    Ok(jar)
+}
+
+/// Later cookies replace earlier ones with the same name.
+fn merge_cookies(old: &str, new: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for kv in old.split("; ").chain(new.split("; ")).filter(|k| k.contains('=')) {
+        let k = kv.split('=').next().unwrap();
+        out.retain(|x| x.split('=').next() != Some(k));
+        out.push(kv.to_string());
+    }
+    out.join("; ")
+}
+
+fn site_root(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    let host = rest.split(['/', '?', '#']).next()?;
+    (!host.is_empty()).then(|| format!("{scheme}://{host}"))
+}
+
+fn cookies_from(h: &reqwest::header::HeaderMap) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for v in h.get_all(reqwest::header::SET_COOKIE) {
+        let Ok(v) = v.to_str() else { continue };
+        let kv = v.split(';').next().unwrap_or("").trim();
+        let Some((k, val)) = kv.split_once('=') else { continue };
+        if val.is_empty() || val == "deleted" {
+            continue;
+        }
+        out.retain(|x| !x.starts_with(&format!("{k}=")));
+        out.push(kv.to_string());
+    }
+    out.join("; ")
+}
+
+fn urlenc(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
 /// Download a .torrent file ourselves (User-Agent + optional cookie) and
 /// check it really is one, so the error names what the site sent instead.
 pub async fn fetch_torrent(
@@ -422,6 +516,20 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("x Not found") && !e.contains("<p>"), "{e}");
+    }
+
+    #[test]
+    fn cookie_paste_and_login_helpers() {
+        assert_eq!(clean_cookie("Cookie: uid=1; pass=ab\n"), "uid=1; pass=ab");
+        assert_eq!(clean_cookie("uid=1\npass=ab"), "uid=1; pass=ab");
+        assert_eq!(urlenc("a b&ø"), "a%20b%26%C3%B8");
+        assert_eq!(site_root("https://www.t.net/rss.php?passkey=x").unwrap(), "https://www.t.net");
+        let mut h = reqwest::header::HeaderMap::new();
+        for v in ["uid=7; expires=x; path=/", "pass=abc; path=/", "hashv=deleted", "uid=8"] {
+            h.append(reqwest::header::SET_COOKIE, v.parse().unwrap());
+        }
+        assert_eq!(cookies_from(&h), "pass=abc; uid=8");
+        assert_eq!(merge_cookies("PHPSESSID=a; checksum=b", "uid=1; checksum=c"), "PHPSESSID=a; uid=1; checksum=c");
     }
 
     #[test]
