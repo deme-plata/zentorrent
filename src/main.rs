@@ -22,6 +22,7 @@ use librqbit::{
 type ManagedTorrentHandle = Arc<ManagedTorrent>;
 
 mod catalog;
+mod meta;
 mod rss;
 mod seed;
 mod update;
@@ -205,6 +206,10 @@ struct Inbox {
     update: Option<Upd>,
     /// (feed url, cookie or error) from a Log in click.
     login: Vec<(String, Result<String, String>)>,
+    /// (query key, OMDb answer or error)
+    meta: Vec<(String, Result<Option<meta::Info>, String>)>,
+    /// (imdb id, poster bytes or error)
+    posters: Vec<(String, Result<Vec<u8>, String>)>,
     busy: usize,
 }
 
@@ -261,6 +266,11 @@ struct App {
     upd: Upd,
     upd_checked: Option<Instant>,
     ledger: seed::Ledger,
+    meta_cache: meta::Cache,
+    meta_jobs: tokio::sync::mpsc::UnboundedSender<MetaJob>,
+    meta_pending: std::collections::HashSet<String>,
+    meta_error: Option<String>,
+    textures: HashMap<String, Option<egui::TextureHandle>>,
     last_tick: Instant,
     last_ledger_save: Instant,
 }
@@ -315,6 +325,8 @@ impl App {
             }
         }
 
+        let meta_jobs = spawn_meta_worker(&rt, inbox.clone(), cc.egui_ctx.clone());
+
         Self {
             rt,
             session,
@@ -333,6 +345,11 @@ impl App {
             upd: Upd::Checking,
             upd_checked: None,
             ledger,
+            meta_cache: meta::Cache::load(),
+            meta_jobs,
+            meta_pending: Default::default(),
+            meta_error: None,
+            textures: HashMap::new(),
             last_tick: Instant::now(),
             last_ledger_save: Instant::now(),
         }
@@ -705,6 +722,25 @@ impl App {
                 self.transfers.push(t);
             }
         }
+        let mut meta_dirty = false;
+        for (key, res) in ib.meta.drain(..) {
+            self.meta_pending.remove(&key);
+            match res {
+                Ok(info) => {
+                    self.meta_cache.put(key, info);
+                    meta_dirty = true;
+                }
+                // Bad key / limit / network: show it, do not cache it.
+                Err(e) => self.meta_error = Some(e),
+            }
+        }
+        if meta_dirty {
+            self.meta_cache.save();
+        }
+        for (id, res) in ib.posters.drain(..) {
+            let tex = res.ok().and_then(|b| poster_texture(ctx, &id, &b));
+            self.textures.insert(id, tex);
+        }
         for (url, res) in ib.login.drain(..) {
             self.fv.login_busy = false;
             match res {
@@ -736,6 +772,53 @@ impl App {
             self.catalog_loading = false;
         }
     }
+}
+
+/// Work for the ratings worker: one request at a time, politely spaced.
+enum MetaJob {
+    Lookup { key: String, query: meta::Query, api_key: String },
+    Poster { imdb_id: String, url: String },
+}
+
+/// The single background worker for OMDb lookups and poster downloads.
+fn spawn_meta_worker(
+    rt: &tokio::runtime::Runtime,
+    inbox: Arc<Mutex<Inbox>>,
+    ctx: egui::Context,
+) -> tokio::sync::mpsc::UnboundedSender<MetaJob> {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<MetaJob>();
+    rt.spawn(async move {
+        let http = reqwest::Client::builder()
+            .user_agent(concat!("ZenTorrent/", env!("CARGO_PKG_VERSION"), " (+ratings via OMDb)"))
+            .https_only(true)
+            .timeout(Duration::from_secs(20))
+            .build()
+            .expect("http client");
+        while let Some(job) = rx.recv().await {
+            match job {
+                MetaJob::Lookup { key, query, api_key } => {
+                    let r = meta::lookup(&http, &api_key, &query).await.map_err(|e| format!("{e:#}"));
+                    inbox.lock().unwrap().meta.push((key, r));
+                    ctx.request_repaint();
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
+                MetaJob::Poster { imdb_id, url } => {
+                    let r = meta::poster(&http, &imdb_id, &url).await.map_err(|e| format!("{e:#}"));
+                    inbox.lock().unwrap().posters.push((imdb_id, r));
+                    ctx.request_repaint();
+                }
+            }
+        }
+    });
+    tx
+}
+
+/// Decode a poster into a small texture.
+fn poster_texture(ctx: &egui::Context, id: &str, bytes: &[u8]) -> Option<egui::TextureHandle> {
+    let img = image::load_from_memory(bytes).ok()?.thumbnail(120, 180).to_rgba8();
+    let size = [img.width() as usize, img.height() as usize];
+    let ci = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
+    Some(ctx.load_texture(format!("poster-{id}"), ci, egui::TextureOptions::LINEAR))
 }
 
 enum Source {
@@ -1011,6 +1094,41 @@ impl App {
                 ui.spinner();
             }
         });
+        ui.horizontal_wrapped(|ui| {
+            let mut changed = ui.checkbox(&mut self.store.show_ratings, "Posters & ratings").changed();
+            if self.store.show_ratings {
+                ui.label("OMDb key:");
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut self.store.omdb_key)
+                        .password(true)
+                        .hint_text("free key")
+                        .desired_width(110.0),
+                );
+                if r.changed() {
+                    self.meta_error = None;
+                }
+                changed |= r.lost_focus();
+                if self.store.omdb_key.trim().is_empty() {
+                    ui.hyperlink_to("get a free key (1,000/day)", "https://www.omdbapi.com/apikey.aspx");
+                } else {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "IMDb · Rotten Tomatoes · Metascore via OMDb (HTTPS) · {}/{} lookups today",
+                            self.meta_cache.used_today(),
+                            meta::DAILY_BUDGET
+                        ))
+                        .weak()
+                        .small(),
+                    );
+                }
+                if let Some(e) = &self.meta_error {
+                    ui.colored_label(egui::Color32::LIGHT_RED, e);
+                }
+            }
+            if changed {
+                self.save_feeds();
+            }
+        });
         ui.separator();
 
         if self.store.feeds.is_empty() {
@@ -1144,35 +1262,139 @@ impl App {
             None => self.store.feeds.iter().map(|f| (f.name.clone(), f.url.clone(), f.cookie.clone())).collect(),
         };
         let mut pick: Option<(rss::Item, String, String)> = None;
+        // Cached ratings always show; NEW lookups stop while the key is refused.
+        let ratings_on = self.store.show_ratings && !self.store.omdb_key.trim().is_empty();
+        let can_lookup = ratings_on && self.meta_error.is_none();
+        let mut to_lookup: Vec<(String, meta::Query)> = Vec::new();
+        let mut to_poster: Vec<(String, String)> = Vec::new();
         egui::ScrollArea::vertical().show(ui, |ui| {
             let mut shown = 0;
             for (name, url, cookie) in &feeds {
                 let Some(items) = self.fv.items.get(url) else { continue };
                 for it in items.iter().filter(|it| needle.is_empty() || it.title.to_lowercase().contains(&needle)) {
                     shown += 1;
+                    let mut sub = String::new();
+                    if let Some(sz) = it.size {
+                        sub += &human(sz);
+                    }
+                    if !it.date.is_empty() {
+                        sub += &format!("  ·  {}", it.date);
+                    }
+                    if feeds.len() > 1 {
+                        sub += &format!("  ·  {name}");
+                    }
+                    // Ratings: cached answer, or queue a lookup.
+                    let info = match (ratings_on, meta::guess(&it.title, &it.category)) {
+                        (true, Some(q)) => {
+                            let k = q.key();
+                            match self.meta_cache.get(&k) {
+                                Some(found) => found,
+                                None => {
+                                    if can_lookup && !self.meta_pending.contains(&k) && to_lookup.len() < 40 {
+                                        to_lookup.push((k, q));
+                                    }
+                                    None
+                                }
+                            }
+                        }
+                        _ => None,
+                    };
+                    let Some(info) = info else {
+                        ui.horizontal(|ui| {
+                            if ui.small_button("⬇").on_hover_text("Download").clicked() {
+                                pick = Some((it.clone(), cookie.clone(), url.clone()));
+                            }
+                            ui.label(&it.title);
+                            ui.label(egui::RichText::new(&sub).weak().small());
+                        });
+                        continue;
+                    };
                     ui.horizontal(|ui| {
                         if ui.small_button("⬇").on_hover_text("Download").clicked() {
                             pick = Some((it.clone(), cookie.clone(), url.clone()));
                         }
-                        ui.label(&it.title);
-                        let mut meta = String::new();
-                        if let Some(sz) = it.size {
-                            meta += &human(sz);
+                        let (w, h) = (46.0, 68.0);
+                        match self.textures.get(&info.imdb_id) {
+                            Some(Some(t)) => {
+                                ui.add(egui::Image::new(t).fit_to_exact_size(egui::vec2(w, h)).corner_radius(3.0));
+                            }
+                            other => {
+                                let (r, _) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
+                                ui.painter().rect_filled(r, 3.0, ui.visuals().faint_bg_color);
+                                if other.is_none() {
+                                    if let Some(p) = &info.poster {
+                                        to_poster.push((info.imdb_id.clone(), p.clone()));
+                                    }
+                                }
+                            }
                         }
-                        if !it.date.is_empty() {
-                            meta += &format!("  ·  {}", it.date);
-                        }
-                        if feeds.len() > 1 {
-                            meta += &format!("  ·  {name}");
-                        }
-                        ui.label(egui::RichText::new(meta).weak().small());
+                        ui.vertical(|ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.strong(format!("{} ({})", info.title, info.year));
+                                if !info.genre.is_empty() {
+                                    ui.label(egui::RichText::new(&info.genre).weak().small());
+                                }
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                if let Some(r) = info.imdb_rating {
+                                    ui.label(
+                                        egui::RichText::new(format!(" IMDb {r:.1} "))
+                                            .strong()
+                                            .color(egui::Color32::BLACK)
+                                            .background_color(egui::Color32::from_rgb(245, 197, 24)),
+                                    )
+                                    .on_hover_text(format!("{} votes", info.imdb_votes));
+                                }
+                                if let Some(t) = info.rotten {
+                                    let (bg, word) = if t >= 60 {
+                                        (egui::Color32::from_rgb(250, 80, 50), "Fresh")
+                                    } else {
+                                        (egui::Color32::from_rgb(110, 170, 60), "Rotten")
+                                    };
+                                    ui.label(
+                                        egui::RichText::new(format!(" Rotten Tomatoes {t}% "))
+                                            .strong()
+                                            .color(egui::Color32::WHITE)
+                                            .background_color(bg),
+                                    )
+                                    .on_hover_text(format!("Tomatometer: {word}"));
+                                }
+                                if let Some(m) = info.metascore {
+                                    ui.label(egui::RichText::new(format!("Metascore {m}")).small());
+                                }
+                                ui.hyperlink_to("IMDb page", info.imdb_url());
+                            });
+                            ui.label(egui::RichText::new(format!("{}   {sub}", it.title)).weak().small())
+                                .on_hover_text(if info.plot.is_empty() { "—".to_string() } else { info.plot.clone() });
+                        });
                     });
+                    ui.add_space(2.0);
                 }
             }
             if shown == 0 {
                 ui.label(egui::RichText::new(if self.fv.in_flight > 0 { "Reading feeds…" } else { "No items." }).weak());
             }
         });
+        let mut spent = false;
+        for (key, query) in to_lookup {
+            if !self.meta_cache.spend() {
+                self.meta_error = Some(format!("daily limit of {} lookups reached — more tomorrow", meta::DAILY_BUDGET));
+                break;
+            }
+            self.meta_pending.insert(key.clone());
+            let _ = self.meta_jobs.send(MetaJob::Lookup { key, query, api_key: self.store.omdb_key.trim().to_string() });
+            spent = true;
+        }
+        if spent {
+            self.meta_cache.save(); // keep the daily count honest across restarts
+        }
+        for (imdb_id, url) in to_poster {
+            if self.textures.contains_key(&imdb_id) {
+                continue;
+            }
+            self.textures.insert(imdb_id.clone(), None);
+            let _ = self.meta_jobs.send(MetaJob::Poster { imdb_id, url });
+        }
         if let Some((it, cookie, url)) = pick {
             self.fv.last_pick = Some(url);
             self.fv.status.insert(self.fv.last_pick.clone().unwrap(), format!("starting “{}” — see Downloads", it.title));

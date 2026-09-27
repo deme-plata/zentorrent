@@ -81,6 +81,15 @@ pub struct FeedStore {
     pub refresh_minutes: u64,
     #[serde(default)]
     pub feeds: Vec<Feed>,
+    /// Free OMDb API key for posters + IMDb / Rotten Tomatoes / Metascore.
+    #[serde(default)]
+    pub omdb_key: String,
+    #[serde(default = "yes")]
+    pub show_ratings: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 fn default_interval() -> u64 {
@@ -94,6 +103,8 @@ pub struct Item {
     pub link: String,
     pub size: Option<u64>,
     pub date: String,
+    /// Tracker category ("Movies/HD", "TV/HD", "Music"), used to skip rating lookups.
+    pub category: String,
 }
 
 pub fn store_path() -> Option<PathBuf> {
@@ -243,6 +254,9 @@ pub fn parse(xml: &str) -> anyhow::Result<Vec<Item>> {
                             "magnetURI" | "magneturi" => {
                                 c.magnet.get_or_insert(v);
                             }
+                            "category" => {
+                                c.category.get_or_insert(v);
+                            }
                             "pubDate" | "published" | "updated" | "date" => {
                                 c.date.get_or_insert(v);
                             }
@@ -272,6 +286,7 @@ struct Cand {
     guid: Option<String>,
     size: Option<u64>,
     date: Option<String>,
+    category: Option<String>,
 }
 
 impl Cand {
@@ -288,6 +303,7 @@ impl Cand {
             link,
             size: self.size,
             date: self.date.unwrap_or_default(),
+            category: self.category.unwrap_or_default(),
         })
     }
 }
@@ -495,6 +511,7 @@ mod tests {
         assert_eq!(v[0].title, "Debian 13 & friends");
         assert_eq!(v[0].link, "https://example.org/dl.php?id=1&passkey=abc");
         assert_eq!(v[0].size, Some(123));
+        assert_eq!(v[0].category, "");
         assert_eq!(v[1].title, "Arch <2026>");
         assert_eq!(v[1].link, "magnet:?xt=urn:btih:abc");
     }
