@@ -23,6 +23,7 @@ type ManagedTorrentHandle = Arc<ManagedTorrent>;
 
 mod catalog;
 mod rss;
+mod update;
 use catalog::CatalogEntry;
 
 fn main() -> eframe::Result<()> {
@@ -46,6 +47,29 @@ fn main() -> eframe::Result<()> {
         if let Err(e) = rt.block_on(cli(link, dir)) {
             eprintln!("error: {e:#}");
             std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    // `zentorrent --update`: check the signed channel and install if newer.
+    if args.get(1).map(String::as_str) == Some("--update") {
+        println!("ZenTorrent {} ({})", update::VERSION, update::TARGET);
+        match rt.block_on(update::check()) {
+            Ok(None) => println!("up to date"),
+            Ok(Some(m)) => {
+                println!("v{} available: {}", m.version, m.notes);
+                match rt.block_on(update::install(&m)) {
+                    Ok(()) => println!("installed v{} — start ZenTorrent again", m.version),
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
         }
         return Ok(());
     }
@@ -161,7 +185,18 @@ struct Inbox {
     catalog: Option<Vec<CatalogEntry>>,
     /// (feed url, items or error)
     feeds: Vec<(String, Result<Vec<rss::Item>, String>)>,
+    update: Option<Upd>,
     busy: usize,
+}
+
+#[derive(Clone)]
+enum Upd {
+    Checking,
+    UpToDate,
+    Available(update::Manifest),
+    Installing(String),
+    Installed(String),
+    Failed(String),
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -198,6 +233,8 @@ struct App {
     store: rss::FeedStore,
     fv: FeedView,
     http: reqwest::Client,
+    upd: Upd,
+    upd_checked: Option<Instant>,
 }
 
 impl App {
@@ -240,7 +277,76 @@ impl App {
                 .timeout(Duration::from_secs(30))
                 .build()
                 .expect("http client"),
+            upd: Upd::Checking,
+            upd_checked: None,
         }
+    }
+
+    fn check_update(&mut self, ctx: &egui::Context) {
+        self.upd = Upd::Checking;
+        self.upd_checked = Some(Instant::now());
+        let (inbox, ctx) = (self.inbox.clone(), ctx.clone());
+        self.rt.spawn(async move {
+            let u = match update::check().await {
+                Ok(Some(m)) => Upd::Available(m),
+                Ok(None) => Upd::UpToDate,
+                Err(e) => Upd::Failed(e),
+            };
+            inbox.lock().unwrap().update = Some(u);
+            ctx.request_repaint();
+        });
+    }
+
+    fn install_update(&mut self, ctx: &egui::Context, m: update::Manifest) {
+        self.upd = Upd::Installing(m.version.clone());
+        let (inbox, ctx) = (self.inbox.clone(), ctx.clone());
+        self.rt.spawn(async move {
+            let u = match update::install(&m).await {
+                Ok(()) => Upd::Installed(m.version),
+                Err(e) => Upd::Failed(e),
+            };
+            inbox.lock().unwrap().update = Some(u);
+            ctx.request_repaint();
+        });
+    }
+
+    fn update_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            match self.upd.clone() {
+                Upd::Available(m) => {
+                    let b = egui::Button::new(
+                        egui::RichText::new(format!("⬆ Update to v{}", m.version)).strong().color(egui::Color32::BLACK),
+                    )
+                    .fill(egui::Color32::from_rgb(90, 200, 120));
+                    if ui.add(b).on_hover_text(if m.notes.is_empty() { "New version".into() } else { m.notes.clone() }).clicked() {
+                        self.install_update(ctx, m);
+                    }
+                }
+                Upd::Installing(v) => {
+                    ui.label(format!("Installing v{v}…"));
+                    ui.spinner();
+                }
+                Upd::Installed(v) => {
+                    if ui.button(format!("↻ Restart into v{v}")).clicked() {
+                        update::relaunch();
+                    }
+                }
+                Upd::Checking => {
+                    ui.spinner();
+                }
+                Upd::UpToDate => {
+                    if ui.small_button("Check for updates").on_hover_text("You have the newest version").clicked() {
+                        self.check_update(ctx);
+                    }
+                }
+                Upd::Failed(e) => {
+                    if ui.small_button("Retry update check").on_hover_text(e).clicked() {
+                        self.check_update(ctx);
+                    }
+                }
+            }
+            ui.label(egui::RichText::new(format!("v{}", update::VERSION)).weak());
+        });
     }
 
     /// Re-read every feed (or just one) in the background.
@@ -346,6 +452,9 @@ impl App {
         }
 
         let mut ib = self.inbox.lock().unwrap();
+        if let Some(u) = ib.update.take() {
+            self.upd = u;
+        }
         for t in ib.added.drain(..) {
             let id = t.handle.id();
             if !self.transfers.iter().any(|x| x.handle.id() == id) {
@@ -389,6 +498,11 @@ impl eframe::App for App {
         if due && !self.store.feeds.is_empty() {
             self.refresh_feeds(ctx, None);
         }
+        // Update check at start-up and every 6 hours (never during an install).
+        let upd_due = self.upd_checked.is_none_or(|t| t.elapsed() >= Duration::from_secs(6 * 3600));
+        if upd_due && !matches!(self.upd, Upd::Installing(_) | Upd::Installed(_) | Upd::Available(_)) {
+            self.check_update(ctx);
+        }
         let busy = self.inbox.lock().unwrap().busy;
 
         egui::Panel::top("top").show(root, |ui| {
@@ -399,6 +513,7 @@ impl eframe::App for App {
                 ui.add_space(16.0);
                 ui.selectable_value(&mut self.view, View::Downloads, format!("Downloads ({})", self.transfers.len()));
                 ui.selectable_value(&mut self.view, View::Feeds, format!("RSS feeds ({})", self.store.feeds.len()));
+                self.update_ui(ui, ctx);
             });
             ui.add_space(4.0);
 
