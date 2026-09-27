@@ -50,6 +50,23 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    // `zentorrent --fetch <torrent url> [cookie]`: test a feed download link.
+    if args.get(1).map(String::as_str) == Some("--fetch") {
+        let Some(url) = args.get(2).cloned() else {
+            eprintln!("usage: zentorrent --fetch <torrent url> [cookie]");
+            std::process::exit(2);
+        };
+        let http = reqwest::Client::builder().user_agent("ZenTorrent/0.2").build().expect("http");
+        match rt.block_on(rss::fetch_torrent(&http, &url, args.get(3).map(String::as_str))) {
+            Ok(b) => println!("ok: valid .torrent, {} bytes", b.len()),
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+
     // `zentorrent --feed <url>`: print what ZenTorrent sees in an RSS feed.
     if args.get(1).map(String::as_str) == Some("--feed") {
         let Some(url) = args.get(2).cloned() else {
@@ -257,11 +274,22 @@ impl App {
         let folder = self.folder.clone();
         let inbox = self.inbox.clone();
         let ctx = ctx.clone();
+        let http = self.http.clone();
         inbox.lock().unwrap().busy += 1;
         self.rt.spawn(async move {
-            let add = match &source {
-                Source::Link(s) => AddTorrent::from_url(s.clone()),
-                Source::Bytes(b) => AddTorrent::from_bytes(b.clone()),
+            let add = match source {
+                Source::Link(s) => AddTorrent::from_url(s),
+                Source::Bytes(b) => AddTorrent::from_bytes(b),
+                Source::Fetch { url, cookie } => match rss::fetch_torrent(&http, &url, Some(&cookie)).await {
+                    Ok(b) => AddTorrent::from_bytes(b),
+                    Err(e) => {
+                        let mut ib = inbox.lock().unwrap();
+                        ib.busy -= 1;
+                        ib.errors.push(format!("{label}: {e:#}"));
+                        ctx.request_repaint();
+                        return;
+                    }
+                },
             };
             let opts = AddTorrentOptions {
                 output_folder: Some(folder.to_string_lossy().into_owned()),
@@ -295,9 +323,10 @@ impl App {
                     if let Some(f) = self.store.feeds.iter_mut().find(|f| f.url == url) {
                         let auto: Vec<rss::Item> = f.absorb(&items).into_iter().cloned().collect();
                         dirty = true;
+                        let cookie = f.cookie.clone();
                         for it in auto {
                             self.fv.status.insert(url.clone(), format!("auto-downloading “{}”", it.title));
-                            self.start(ctx, it.title.clone(), Source::Link(it.link.clone()));
+                            self.start(ctx, it.title.clone(), Source::from_feed(it.link.clone(), &cookie));
                         }
                     }
                     self.fv.status.entry(url.clone()).and_modify(|s| {
@@ -334,6 +363,19 @@ impl App {
 enum Source {
     Link(String),
     Bytes(Vec<u8>),
+    /// A .torrent URL from a feed: fetched by ZenTorrent (User-Agent +
+    /// the feed's login cookie) and checked before it reaches librqbit.
+    Fetch { url: String, cookie: String },
+}
+
+impl Source {
+    fn from_feed(link: String, cookie: &str) -> Self {
+        if link.starts_with("http://") || link.starts_with("https://") {
+            Source::Fetch { url: link, cookie: cookie.to_string() }
+        } else {
+            Source::Link(link)
+        }
+    }
 }
 
 impl eframe::App for App {
@@ -608,6 +650,26 @@ impl App {
                         None => {}
                     }
                 });
+                ui.horizontal(|ui| {
+                    ui.label("Login cookie:").on_hover_text(
+                        "Only needed when the tracker says \"registered users only\".\n\
+                         In your browser, logged in to the tracker: F12 → Network → reload → \
+                         click any request → Request Headers → copy the value of Cookie \
+                         (looks like  uid=…; pass=…).",
+                    );
+                    let r = ui.add(
+                        egui::TextEdit::singleline(&mut f.cookie)
+                            .password(true)
+                            .hint_text("uid=…; pass=…   (optional)")
+                            .desired_width(260.0),
+                    );
+                    changed |= r.lost_focus();
+                    ui.label(
+                        egui::RichText::new(if f.cookie.trim().is_empty() { "not set" } else { "set ✔" })
+                            .weak()
+                            .small(),
+                    );
+                });
             }
         }
         if changed {
@@ -632,20 +694,20 @@ impl App {
             ui.label(egui::RichText::new(format!("saving to {}", self.folder.display())).weak().small());
         });
         let needle = self.fv.filter.to_lowercase();
-        let feeds: Vec<(String, String)> = match self.fv.selected.and_then(|i| self.store.feeds.get(i)) {
-            Some(f) => vec![(f.name.clone(), f.url.clone())],
-            None => self.store.feeds.iter().map(|f| (f.name.clone(), f.url.clone())).collect(),
+        let feeds: Vec<(String, String, String)> = match self.fv.selected.and_then(|i| self.store.feeds.get(i)) {
+            Some(f) => vec![(f.name.clone(), f.url.clone(), f.cookie.clone())],
+            None => self.store.feeds.iter().map(|f| (f.name.clone(), f.url.clone(), f.cookie.clone())).collect(),
         };
-        let mut pick: Option<rss::Item> = None;
+        let mut pick: Option<(rss::Item, String)> = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
             let mut shown = 0;
-            for (name, url) in &feeds {
+            for (name, url, cookie) in &feeds {
                 let Some(items) = self.fv.items.get(url) else { continue };
                 for it in items.iter().filter(|it| needle.is_empty() || it.title.to_lowercase().contains(&needle)) {
                     shown += 1;
                     ui.horizontal(|ui| {
                         if ui.small_button("⬇").on_hover_text("Download").clicked() {
-                            pick = Some(it.clone());
+                            pick = Some((it.clone(), cookie.clone()));
                         }
                         ui.label(&it.title);
                         let mut meta = String::new();
@@ -666,8 +728,8 @@ impl App {
                 ui.label(egui::RichText::new(if self.fv.in_flight > 0 { "Reading feeds…" } else { "No items." }).weak());
             }
         });
-        if let Some(it) = pick {
-            self.start(ctx, it.title.clone(), Source::Link(it.link));
+        if let Some((it, cookie)) = pick {
+            self.start(ctx, it.title.clone(), Source::from_feed(it.link, &cookie));
             self.view = View::Downloads;
         }
     }

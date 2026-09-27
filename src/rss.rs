@@ -24,6 +24,11 @@ pub struct Feed {
     pub auto_regex: String,
     #[serde(default)]
     pub auto_enabled: bool,
+    /// Browser login cookie (`uid=…; pass=…`), sent when downloading the
+    /// .torrent files. Some trackers (TorrentBytes, most TBDev sites) put
+    /// the passkey only on the feed URL and require a login for downloads.
+    #[serde(default)]
+    pub cookie: String,
     /// Links already present when the feed was last read. Auto-download
     /// only fires for links NOT in this set.
     #[serde(default)]
@@ -304,6 +309,57 @@ fn entity(name: &str) -> String {
     }
 }
 
+/// Download a .torrent file ourselves (User-Agent + optional cookie) and
+/// check it really is one, so the error names what the site sent instead.
+pub async fn fetch_torrent(
+    client: &reqwest::Client,
+    url: &str,
+    cookie: Option<&str>,
+) -> anyhow::Result<Vec<u8>> {
+    let mut req = client.get(url);
+    if let Some(c) = cookie.map(str::trim).filter(|c| !c.is_empty()) {
+        req = req.header(reqwest::header::COOKIE, c);
+    }
+    let resp = req.send().await?;
+    let status = resp.status();
+    let body = resp.bytes().await?.to_vec();
+    if !status.is_success() {
+        anyhow::bail!("HTTP {status}: {}", describe(&body));
+    }
+    check_torrent(&body)?;
+    Ok(body)
+}
+
+/// A .torrent is a bencoded dictionary: it starts with `d`.
+pub fn check_torrent(body: &[u8]) -> anyhow::Result<()> {
+    if body.first() == Some(&b'd') {
+        return Ok(());
+    }
+    if body.starts_with(&[0x1f, 0x8b]) {
+        anyhow::bail!("the site sent a gzip-compressed file, not a .torrent");
+    }
+    let said = describe(body);
+    let hint = if said.to_lowercase().contains("registered") || said.to_lowercase().contains("login") {
+        " — this tracker wants you logged in: open the feed and paste your login cookie"
+    } else {
+        ""
+    };
+    anyhow::bail!("not a .torrent file; the site answered: \"{said}\"{hint}")
+}
+
+/// Short, readable version of a non-torrent reply (HTML tags stripped).
+fn describe(body: &[u8]) -> String {
+    let text = String::from_utf8_lossy(&body[..body.len().min(4096)]);
+    let text = regex::Regex::new(r"(?s)<(script|style)[^>]*>.*?</(script|style)>|<[^>]*>")
+        .unwrap()
+        .replace_all(&text, " ");
+    let mut out: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if out.chars().count() > 140 {
+        out = out.chars().take(140).collect::<String>() + "…";
+    }
+    if out.is_empty() { "(empty reply)".into() } else { out }
+}
+
 /// Compile a feed's auto-download rule. `None` = rule off or empty.
 pub fn rule(feed: &Feed) -> Option<Result<regex::Regex, regex::Error>> {
     let pat = feed.auto_regex.trim();
@@ -355,6 +411,17 @@ mod tests {
         let v = parse(t).unwrap();
         assert_eq!(v[0].link, "magnet:?xt=urn:btih:ff");
         assert_eq!(v[0].size, Some(999));
+    }
+
+    #[test]
+    fn non_torrent_replies_are_named() {
+        assert!(check_torrent(b"d8:announce3:abce").is_ok());
+        let e = check_torrent(b"This torrent is for registered users only.").unwrap_err().to_string();
+        assert!(e.contains("registered users only") && e.contains("login cookie"), "{e}");
+        let e = check_torrent(b"<html><head><title>x</title><style>p{}</style></head><body><p>Not found</p></body></html>")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("x Not found") && !e.contains("<p>"), "{e}");
     }
 
     #[test]
