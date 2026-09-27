@@ -5554,15 +5554,17 @@ dependencies = [
 
 [[package]]
 name = "zentorrent"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "dirs",
  "eframe",
  "librqbit",
+ "quick-xml",
  "regex",
  "reqwest",
  "rfd",
+ "serde",
  "serde_json",
  "tokio",
 ]
