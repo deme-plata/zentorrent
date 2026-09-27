@@ -270,6 +270,7 @@ struct App {
     meta_jobs: tokio::sync::mpsc::UnboundedSender<MetaJob>,
     meta_pending: std::collections::HashSet<String>,
     meta_error: Option<String>,
+    meta_error_at: Option<Instant>,
     textures: HashMap<String, Option<egui::TextureHandle>>,
     last_tick: Instant,
     last_ledger_save: Instant,
@@ -349,6 +350,7 @@ impl App {
             meta_jobs,
             meta_pending: Default::default(),
             meta_error: None,
+            meta_error_at: None,
             textures: HashMap::new(),
             last_tick: Instant::now(),
             last_ledger_save: Instant::now(),
@@ -596,6 +598,8 @@ impl App {
     /// Re-read every feed (or just one) in the background.
     fn refresh_feeds(&mut self, ctx: &egui::Context, only: Option<usize>) {
         self.fv.last_refresh = Some(Instant::now());
+        // A refused key (e.g. not yet activated) gets another try on every refresh.
+        self.meta_error = None;
         for (i, f) in self.store.feeds.iter().enumerate() {
             if only.is_some_and(|o| o != i) {
                 continue;
@@ -731,7 +735,10 @@ impl App {
                     meta_dirty = true;
                 }
                 // Bad key / limit / network: show it, do not cache it.
-                Err(e) => self.meta_error = Some(e),
+                Err(e) => {
+                    self.meta_error = Some(e);
+                    self.meta_error_at = Some(Instant::now());
+                }
             }
         }
         if meta_dirty {
@@ -1121,8 +1128,21 @@ impl App {
                         .small(),
                     );
                 }
+                // Retry by itself 5 minutes after a refusal (key just activated, network back).
+                if self.meta_error_at.is_some_and(|t| t.elapsed() >= Duration::from_secs(300)) {
+                    self.meta_error = None;
+                    self.meta_error_at = None;
+                }
+                let mut retry = false;
                 if let Some(e) = &self.meta_error {
                     ui.colored_label(egui::Color32::LIGHT_RED, e);
+                    if e.contains("Invalid API key") {
+                        ui.label(egui::RichText::new("new key? open the activation link in OMDb's email").weak().small());
+                    }
+                    retry = ui.small_button("Retry").clicked();
+                }
+                if retry {
+                    self.meta_error = None;
                 }
             }
             if changed {
