@@ -97,7 +97,7 @@ fn main() -> eframe::Result<()> {
             eprintln!("usage: zentorrent --fetch <torrent url> [cookie]");
             std::process::exit(2);
         };
-        let http = reqwest::Client::builder().user_agent("ZenTorrent/0.2").build().expect("http");
+        let http = rss::http();
         match rt.block_on(rss::fetch_torrent(&http, &url, args.get(3).map(String::as_str))) {
             Ok(b) => println!("ok: valid .torrent, {} bytes", b.len()),
             Err(e) => {
@@ -114,7 +114,7 @@ fn main() -> eframe::Result<()> {
             eprintln!("usage: zentorrent --feed <rss url>");
             std::process::exit(2);
         };
-        let http = reqwest::Client::builder().user_agent("ZenTorrent/0.2").build().expect("http");
+        let http = rss::http();
         match rt.block_on(rss::fetch(&http, &url)) {
             Ok(items) => {
                 println!("{} items from {}", items.len(), rss::display_url(&url));
@@ -329,11 +329,7 @@ impl App {
             view: View::Downloads,
             store: rss::FeedStore::load(),
             fv: FeedView::default(),
-            http: reqwest::Client::builder()
-                .user_agent("ZenTorrent/0.2")
-                .timeout(Duration::from_secs(30))
-                .build()
-                .expect("http client"),
+            http: rss::http(),
             upd: Upd::Checking,
             upd_checked: None,
             ledger,
@@ -595,6 +591,20 @@ impl App {
                 inbox.lock().unwrap().feeds.push((url, res));
                 ctx.request_repaint();
             });
+        }
+    }
+
+    /// Jump to the RSS tab with the right feed's log-in box open.
+    fn open_login(&mut self) {
+        self.view = View::Feeds;
+        let i = self
+            .fv
+            .last_pick
+            .as_ref()
+            .and_then(|u| self.store.feeds.iter().position(|f| &f.url == u))
+            .or((self.store.feeds.len() == 1).then_some(0));
+        if i.is_some() {
+            self.fv.selected = i;
         }
     }
 
@@ -875,10 +885,18 @@ impl eframe::App for App {
             }
             if !self.errors.is_empty() {
                 let mut clear = false;
-                ui.horizontal(|ui| {
-                    ui.colored_label(egui::Color32::LIGHT_RED, self.errors.last().unwrap());
+                let mut to_login = false;
+                ui.horizontal_wrapped(|ui| {
+                    let last = self.errors.last().unwrap();
+                    ui.colored_label(egui::Color32::LIGHT_RED, last);
+                    if last.contains("wants you logged in") {
+                        to_login = ui.button("Log in to tracker…").clicked();
+                    }
                     clear = ui.small_button("x").clicked();
                 });
+                if to_login {
+                    self.open_login();
+                }
                 if clear {
                     self.errors.clear();
                 }
@@ -924,10 +942,18 @@ impl App {
     fn feeds_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         if !self.errors.is_empty() {
             let mut clear = false;
-            ui.horizontal(|ui| {
-                ui.colored_label(egui::Color32::LIGHT_RED, self.errors.last().unwrap());
+            let mut to_login = false;
+            ui.horizontal_wrapped(|ui| {
+                let last = self.errors.last().unwrap();
+                ui.colored_label(egui::Color32::LIGHT_RED, last);
+                if last.contains("wants you logged in") {
+                    to_login = ui.button("Log in to tracker…").clicked();
+                }
                 clear = ui.small_button("x").clicked();
             });
+            if to_login {
+                self.open_login();
+            }
             if clear {
                 self.errors.clear();
             }

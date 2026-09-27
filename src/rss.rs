@@ -15,6 +15,20 @@ use std::{collections::HashSet, path::PathBuf};
 use quick_xml::{events::Event, Reader};
 use serde::{Deserialize, Serialize};
 
+/// One User-Agent for everything that talks to a tracker (feed, log-in,
+/// .torrent download). Some trackers tie the session to the User-Agent, so
+/// a cookie obtained under one name and used under another is refused.
+pub const UA: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0 ZenTorrent";
+
+/// A shared client for tracker traffic.
+pub fn http() -> reqwest::Client {
+    reqwest::Client::builder()
+        .user_agent(UA)
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("http client")
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Feed {
     pub name: String,
@@ -323,7 +337,7 @@ pub fn clean_cookie(raw: &str) -> String {
 pub async fn login(feed_url: &str, username: &str, password: &str) -> anyhow::Result<String> {
     let base = site_root(feed_url).ok_or_else(|| anyhow::anyhow!("feed link has no host"))?;
     let client = reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (ZenTorrent)")
+        .user_agent(UA)
         .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
@@ -351,7 +365,7 @@ pub async fn login(feed_url: &str, username: &str, password: &str) -> anyhow::Re
         anyhow::bail!("login refused (HTTP {status}): {said} — check username and password");
     }
     // 3. Proof: the first .torrent in the feed must now download.
-    let http = reqwest::Client::builder().user_agent("ZenTorrent").timeout(std::time::Duration::from_secs(30)).build()?;
+    let http = http();
     if let Ok(items) = fetch(&http, feed_url).await {
         if let Some(it) = items.iter().find(|i| i.link.starts_with("http")) {
             fetch_torrent(&http, &it.link, Some(&jar))
@@ -434,7 +448,7 @@ pub fn check_torrent(body: &[u8]) -> anyhow::Result<()> {
     }
     let said = describe(body);
     let hint = if said.to_lowercase().contains("registered") || said.to_lowercase().contains("login") {
-        " — this tracker wants you logged in: open the feed and paste your login cookie"
+        " — this tracker wants you logged in: RSS feeds → click the feed name → Log in"
     } else {
         ""
     };
@@ -511,7 +525,7 @@ mod tests {
     fn non_torrent_replies_are_named() {
         assert!(check_torrent(b"d8:announce3:abce").is_ok());
         let e = check_torrent(b"This torrent is for registered users only.").unwrap_err().to_string();
-        assert!(e.contains("registered users only") && e.contains("login cookie"), "{e}");
+        assert!(e.contains("registered users only") && e.contains("Log in"), "{e}");
         let e = check_torrent(b"<html><head><title>x</title><style>p{}</style></head><body><p>Not found</p></body></html>")
             .unwrap_err()
             .to_string();
