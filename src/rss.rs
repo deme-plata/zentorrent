@@ -24,6 +24,8 @@ pub const UA: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 F
 pub fn http() -> reqwest::Client {
     reqwest::Client::builder()
         .user_agent(UA)
+        // A dead connection is given up on fast; `fetch` then retries.
+        .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .expect("http client")
@@ -147,13 +149,75 @@ pub fn display_url(url: &str) -> String {
     if hidden { format!("{host}  (link hidden)") } else { host.to_string() }
 }
 
-pub async fn fetch(client: &reqwest::Client, url: &str) -> anyhow::Result<Vec<Item>> {
-    let resp = client.get(url).send().await?;
-    let status = resp.status();
-    let body = resp.text().await?;
-    if !status.is_success() {
-        anyhow::bail!("HTTP {status}");
+/// Split a uTorrent-style feed link `https://…/rss.php?…:COOKIE:uid=1;pass=x`
+/// into the real URL and the cookie it carries (empty if none).
+pub fn split_cookie(url: &str) -> (&str, &str) {
+    match url.split_once(":COOKIE:") {
+        Some((u, c)) => (u, c),
+        None => (url, ""),
     }
+}
+
+/// The cookie to send for a feed: the one saved with it, else the one
+/// embedded in its link (`uid=1;pass=x` → `uid=1; pass=x`).
+pub fn feed_cookie(saved: &str, url: &str) -> String {
+    if !saved.trim().is_empty() {
+        return saved.to_string();
+    }
+    split_cookie(url).1.split(';').map(str::trim).filter(|kv| kv.contains('=')).collect::<Vec<_>>().join("; ")
+}
+
+/// Pauses before the 2nd and 3rd attempt. A home connection that drops a
+/// packet (or a tracker that stalls once) must not leave the feed empty.
+const RETRY: [u64; 2] = [3, 8];
+
+pub async fn fetch(client: &reqwest::Client, url: &str) -> anyhow::Result<Vec<Item>> {
+    let mut attempt = 0;
+    loop {
+        match fetch_once(client, url).await {
+            Ok(items) => return Ok(items),
+            Err(Fail::Final(e)) => return Err(e),
+            Err(Fail::Transient(_)) if attempt < RETRY.len() => {
+                tokio::time::sleep(std::time::Duration::from_secs(RETRY[attempt])).await;
+                attempt += 1;
+            }
+            Err(Fail::Transient(e)) => anyhow::bail!("{e} (tried {} times)", attempt + 1),
+        }
+    }
+}
+
+enum Fail {
+    /// Timeout, connection refused/reset, 5xx: worth another try.
+    Transient(anyhow::Error),
+    Final(anyhow::Error),
+}
+
+/// reqwest errors print the URL, and a feed URL carries the passkey.
+fn net(e: reqwest::Error) -> Fail {
+    let transient = e.is_timeout() || e.is_connect() || e.is_request() || e.is_body();
+    let e = anyhow::anyhow!("{}", e.without_url());
+    if transient { Fail::Transient(e) } else { Fail::Final(e) }
+}
+
+async fn fetch_once(client: &reqwest::Client, link: &str) -> Result<Vec<Item>, Fail> {
+    let mut req = client.get(split_cookie(link).0);
+    let cookie = feed_cookie("", link);
+    if !cookie.is_empty() {
+        req = req.header(reqwest::header::COOKIE, cookie);
+    }
+    let resp = req.send().await.map_err(net)?;
+    let status = resp.status();
+    let body = resp.text().await.map_err(net)?;
+    if status.is_server_error() {
+        return Err(Fail::Transient(anyhow::anyhow!("HTTP {status}")));
+    }
+    if !status.is_success() {
+        return Err(Fail::Final(anyhow::anyhow!("HTTP {status}")));
+    }
+    parse_feed(&body).map_err(Fail::Final)
+}
+
+fn parse_feed(body: &str) -> anyhow::Result<Vec<Item>> {
     let items = parse(&body)?;
     if items.is_empty() && !body.contains("<item") && !body.contains("<entry") {
         // A login page or error page, not a feed. Do not echo the body.
@@ -569,6 +633,27 @@ mod tests {
         let d = display_url(u);
         assert!(!d.contains("SECRET") && !d.contains("me&"));
         assert!(d.starts_with("www.tracker.example"));
+    }
+
+    #[test]
+    fn utorrent_cookie_suffix_is_split_off_the_link() {
+        let u = "https://www.t.net/rss.php?passkey=k&4&9&direct=1:COOKIE:pass=abc;uid=7";
+        assert_eq!(split_cookie(u), ("https://www.t.net/rss.php?passkey=k&4&9&direct=1", "pass=abc;uid=7"));
+        assert_eq!(feed_cookie("", u), "pass=abc; uid=7");
+        assert_eq!(feed_cookie("uid=1; pass=z", u), "uid=1; pass=z", "a saved cookie wins");
+        assert_eq!(split_cookie("https://x/rss"), ("https://x/rss", ""));
+        assert_eq!(feed_cookie("", "https://x/rss"), "");
+        assert_eq!(display_url(u), "www.t.net  (link hidden)");
+    }
+
+    #[tokio::test]
+    async fn fetch_errors_never_print_the_passkey() {
+        // Nothing listens on port 9; the connection is refused at once.
+        let c = reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(2)).build().unwrap();
+        let e = fetch_once(&c, "http://127.0.0.1:9/rss.php?passkey=SECRET:COOKIE:pass=SECRET2").await;
+        let Err(Fail::Transient(e)) = e else { panic!("refused connection must be retried") };
+        let s = format!("{e:#}");
+        assert!(!s.contains("SECRET"), "{s}");
     }
 
     #[test]

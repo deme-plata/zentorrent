@@ -21,6 +21,9 @@ use librqbit::{
 
 type ManagedTorrentHandle = Arc<ManagedTorrent>;
 
+/// How soon a feed that failed to load is tried again.
+const FEED_RETRY: Duration = Duration::from_secs(60);
+
 mod catalog;
 mod meta;
 mod rss;
@@ -121,7 +124,8 @@ fn main() -> eframe::Result<()> {
                 println!("{} items from {}", items.len(), rss::display_url(&url));
                 for it in items {
                     let sz = it.size.map(human).unwrap_or_default();
-                    println!("  {}  [{sz}]  {}", it.title, it.link.chars().take(90).collect::<String>());
+                    let cat = if it.category.is_empty() { String::new() } else { format!("{{{}}}  ", it.category) };
+                    println!("  {}  [{sz}]  {cat}{}", it.title, it.link.chars().take(90).collect::<String>());
                 }
             }
             Err(e) => {
@@ -241,6 +245,9 @@ struct FeedView {
     filter: String,
     in_flight: usize,
     last_refresh: Option<Instant>,
+    /// A feed failed: re-read the failed ones at this time instead of
+    /// waiting the whole refresh interval with an empty list.
+    retry_at: Option<Instant>,
     login_user: String,
     login_pass: String,
     login_busy: bool,
@@ -691,7 +698,7 @@ impl App {
                     if let Some(f) = self.store.feeds.iter_mut().find(|f| f.url == url) {
                         let auto: Vec<rss::Item> = f.absorb(&items).into_iter().cloned().collect();
                         dirty = true;
-                        let cookie = f.cookie.clone();
+                        let cookie = rss::feed_cookie(&f.cookie, &f.url);
                         for it in auto {
                             self.fv.status.insert(url.clone(), format!("auto-downloading “{}”", it.title));
                             self.start(ctx, it.title.clone(), Source::from_feed(it.link.clone(), &cookie));
@@ -705,7 +712,9 @@ impl App {
                     self.fv.items.insert(url, items);
                 }
                 Err(e) => {
-                    self.fv.status.insert(url, format!("error: {e}"));
+                    // The last good items stay on screen; only the status says it failed.
+                    self.fv.status.insert(url, format!("error: {e} — trying again in 1 min"));
+                    self.fv.retry_at.get_or_insert(Instant::now() + FEED_RETRY);
                 }
             }
         }
@@ -820,6 +829,32 @@ fn spawn_meta_worker(
     tx
 }
 
+/// Small chips after a feed item's title: the tracker's category
+/// ("Movies/HD", "Music/MP3") and, once OMDb knows the title, its genres
+/// ("Action, Sci-Fi" → two chips).
+fn tags(ui: &mut egui::Ui, category: &str, genre: &str) {
+    let chip = |ui: &mut egui::Ui, text: &str, bg: egui::Color32, fg: egui::Color32| {
+        ui.label(egui::RichText::new(format!(" {text} ")).small().color(fg).background_color(bg))
+    };
+    let dark = ui.visuals().dark_mode;
+    if !category.is_empty() {
+        let (bg, fg) = if dark {
+            (egui::Color32::from_gray(60), egui::Color32::from_gray(220))
+        } else {
+            (egui::Color32::from_gray(222), egui::Color32::from_gray(40))
+        };
+        chip(ui, category, bg, fg).on_hover_text("tracker category");
+    }
+    for g in genre.split(',').map(str::trim).filter(|g| !g.is_empty()) {
+        let (bg, fg) = if dark {
+            (egui::Color32::from_rgb(38, 70, 110), egui::Color32::from_rgb(200, 225, 255))
+        } else {
+            (egui::Color32::from_rgb(214, 232, 252), egui::Color32::from_rgb(20, 60, 110))
+        };
+        chip(ui, g, bg, fg).on_hover_text("genre (IMDb, via OMDb)");
+    }
+}
+
 /// Decode a poster into a small texture.
 fn poster_texture(ctx: &egui::Context, id: &str, bytes: &[u8]) -> Option<egui::TextureHandle> {
     let img = image::load_from_memory(bytes).ok()?.thumbnail(120, 180).to_rgba8();
@@ -855,7 +890,16 @@ impl eframe::App for App {
             Some(t) => t.elapsed() >= Duration::from_secs(self.store.refresh_minutes.max(1) * 60),
         };
         if due && !self.store.feeds.is_empty() {
+            self.fv.retry_at = None;
             self.refresh_feeds(ctx, None);
+        } else if self.fv.retry_at.is_some_and(|t| Instant::now() >= t) && self.fv.in_flight == 0 {
+            self.fv.retry_at = None;
+            let failed: Vec<usize> = (0..self.store.feeds.len())
+                .filter(|&i| self.fv.status.get(&self.store.feeds[i].url).is_some_and(|s| s.starts_with("error")))
+                .collect();
+            for i in failed {
+                self.refresh_feeds(ctx, Some(i));
+            }
         }
         // Update check at start-up and every 6 hours (never during an install).
         let upd_due = self.upd_checked.is_none_or(|t| t.elapsed() >= Duration::from_secs(6 * 3600));
@@ -1273,13 +1317,22 @@ impl App {
         // ── items ───────────────────────────────────────────────────
         ui.horizontal(|ui| {
             ui.label("Filter:");
-            ui.add(egui::TextEdit::singleline(&mut self.fv.filter).hint_text("words in the title").desired_width(240.0));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.fv.filter)
+                    .hint_text("title, category or genre")
+                    .desired_width(240.0),
+            );
             ui.label(egui::RichText::new(format!("saving to {}", self.folder.display())).weak().small());
         });
         let needle = self.fv.filter.to_lowercase();
         let feeds: Vec<(String, String, String)> = match self.fv.selected.and_then(|i| self.store.feeds.get(i)) {
-            Some(f) => vec![(f.name.clone(), f.url.clone(), f.cookie.clone())],
-            None => self.store.feeds.iter().map(|f| (f.name.clone(), f.url.clone(), f.cookie.clone())).collect(),
+            Some(f) => vec![(f.name.clone(), f.url.clone(), rss::feed_cookie(&f.cookie, &f.url))],
+            None => self
+                .store
+                .feeds
+                .iter()
+                .map(|f| (f.name.clone(), f.url.clone(), rss::feed_cookie(&f.cookie, &f.url)))
+                .collect(),
         };
         let mut pick: Option<(rss::Item, String, String)> = None;
         // Cached ratings always show; NEW lookups stop while the key is refused.
@@ -1291,7 +1344,17 @@ impl App {
             let mut shown = 0;
             for (name, url, cookie) in &feeds {
                 let Some(items) = self.fv.items.get(url) else { continue };
-                for it in items.iter().filter(|it| needle.is_empty() || it.title.to_lowercase().contains(&needle)) {
+                for it in items {
+                    // Genre is only known once OMDb has answered for this title.
+                    let genre = meta::guess(&it.title, &it.category)
+                        .and_then(|q| self.meta_cache.get(&q.key()).flatten())
+                        .map(|i| i.genre)
+                        .unwrap_or_default();
+                    if !needle.is_empty()
+                        && ![&it.title, &it.category, &genre].iter().any(|s| s.to_lowercase().contains(&needle))
+                    {
+                        continue;
+                    }
                     shown += 1;
                     let mut sub = String::new();
                     if let Some(sz) = it.size {
@@ -1325,6 +1388,7 @@ impl App {
                                 pick = Some((it.clone(), cookie.clone(), url.clone()));
                             }
                             ui.label(&it.title);
+                            tags(ui, &it.category, &genre);
                             ui.label(egui::RichText::new(&sub).weak().small());
                         });
                         continue;
@@ -1351,9 +1415,7 @@ impl App {
                         ui.vertical(|ui| {
                             ui.horizontal_wrapped(|ui| {
                                 ui.strong(format!("{} ({})", info.title, info.year));
-                                if !info.genre.is_empty() {
-                                    ui.label(egui::RichText::new(&info.genre).weak().small());
-                                }
+                                tags(ui, &it.category, &info.genre);
                             });
                             ui.horizontal_wrapped(|ui| {
                                 if let Some(r) = info.imdb_rating {
