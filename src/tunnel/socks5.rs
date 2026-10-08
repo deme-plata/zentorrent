@@ -1,4 +1,4 @@
-// VENDORED from flux crates/flux-irontunnel/src/socks5.rs @ 4fb1ad85.
+// VENDORED from flux crates/flux-irontunnel/src/socks5.rs @ 60dc7146.
 // Do not edit here: change it in flux, then run scripts/vendor-irontunnel.sh.
 //! The local SOCKS5 front door (RFC 1928), CONNECT only, no authentication.
 //!

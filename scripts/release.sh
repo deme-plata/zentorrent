@@ -18,17 +18,31 @@ python3 - "$VER" "$LIVE" <<'PY' || { echo "✗ $VER is not newer than live $LIVE
 import sys; p=lambda v:[int(x) for x in v.split('.')]; sys.exit(0 if p(sys.argv[1])>p(sys.argv[2]) else 1)
 PY
 
-sed -i "0,/^version = \".*\"/s//version = \"$VER\"/" Cargo.toml
-echo "▸ building $VER"
-CARGO_TARGET_DIR=/home/storage/zentorrent-target nice -n10 fluxc build --release
-CARGO_TARGET_DIR=/home/storage/zentorrent-target-win nice -n10 fluxc build --release --target x86_64-pc-windows-gnu
+# Build dirs: a release from a second checkout (worktree) MUST use its own dirs. On
+# 2026-10-08 two releases shared /home/storage/zentorrent-target and the 0.8.0 Linux
+# artifact was the other checkout's 0.7.1 binary, copied 26 s after it landed.
+TGT="${ZT_TARGET:-/home/storage/zentorrent-target}"
+TGTW="${ZT_TARGET_WIN:-/home/storage/zentorrent-target-win}"
 
-L=zentorrent-$VER-linux-x64; W=zentorrent-$VER-windows-x64.exe
-cp /home/storage/zentorrent-target/release/zentorrent "$DL/$L"
-cp /home/storage/zentorrent-target-win/x86_64-pc-windows-gnu/release/zentorrent.exe "$DL/$W"
-git archive --prefix="zentorrent-$VER/" -o "$DL/zentorrent-$VER-src.tar.gz" HEAD
+sed -i "0,/^version = \".*\"/s//version = \"$VER\"/" Cargo.toml
+echo "▸ building $VER  (targets: $TGT, $TGTW)"
+CARGO_TARGET_DIR="$TGT" nice -n10 fluxc build --release
+CARGO_TARGET_DIR="$TGTW" nice -n10 fluxc build --release --target x86_64-pc-windows-gnu
 
 TMP=$(mktemp -d /home/storage/sigil-scratch/zt-release.XXXX); trap 'rm -rf "$TMP"' EXIT
+L=zentorrent-$VER-linux-x64; W=zentorrent-$VER-windows-x64.exe
+# Copy out FIRST, then check the copies: nothing can change them between the check and
+# the publish. A binary that does not embed this version is refused, never published.
+cp "$TGT/release/zentorrent" "$TMP/$L"
+cp "$TGTW/x86_64-pc-windows-gnu/release/zentorrent.exe" "$TMP/$W"
+for f in "$L" "$W"; do
+  grep -aq "ZenTorrent/$VER updater" "$TMP/$f" \
+    || { echo "✗ $f does not embed version $VER (overwritten by another build?) — refusing to publish" >&2; exit 1; }
+done
+echo "✓ both binaries embed version $VER"
+cp "$TMP/$L" "$DL/$L"
+cp "$TMP/$W" "$DL/$W"
+git archive --prefix="zentorrent-$VER/" -o "$DL/zentorrent-$VER-src.tar.gz" HEAD
 python3 - "$VER" "$NOTE" "$DL/$L" "$DL/$W" "$BASE" "$TMP/m.json" <<'PY'
 import json,sys,os,subprocess
 ver,note,l,w,base,out=sys.argv[1:]

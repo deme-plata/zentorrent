@@ -1,4 +1,4 @@
-// VENDORED from flux crates/flux-irontunnel/src/proxy.rs @ 4fb1ad85.
+// VENDORED from flux crates/flux-irontunnel/src/proxy.rs @ 60dc7146.
 // Do not edit here: change it in flux, then run scripts/vendor-irontunnel.sh.
 //! The client side: a SOCKS5 proxy on loopback whose every connection leaves through
 //! an encrypted tunnel to the relay. This is the surface an app (ZenTorrent) embeds:

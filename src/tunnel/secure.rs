@@ -1,4 +1,4 @@
-// VENDORED from flux crates/flux-irontunnel/src/secure.rs @ 4fb1ad85.
+// VENDORED from flux crates/flux-irontunnel/src/secure.rs @ 60dc7146.
 // Do not edit here: change it in flux, then run scripts/vendor-irontunnel.sh.
 //! IronTunnel v1 secure channel — the encrypted replacement for the v0.0.2 handshake.
 //!

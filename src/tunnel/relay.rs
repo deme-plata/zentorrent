@@ -1,4 +1,4 @@
-// VENDORED from flux crates/flux-irontunnel/src/relay.rs @ 4fb1ad85.
+// VENDORED from flux crates/flux-irontunnel/src/relay.rs @ 60dc7146.
 // Do not edit here: change it in flux, then run scripts/vendor-irontunnel.sh.
 //! The relay: the far end of the tunnel, where traffic leaves for the internet.
 //!
@@ -18,7 +18,7 @@ use super::{IronTunnelError, Result};
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -106,7 +106,9 @@ fn is_global_v6(a: Ipv6Addr) -> bool {
 pub struct RelayConfig {
     pub listen: SocketAddr,
     pub keypair: Arc<StaticKeypair>,
-    pub authorized: Arc<HashSet<PublicKey>>,
+    /// Swappable while running: replace the set to add or revoke a client without
+    /// dropping anyone's open tunnels (the relay binary reloads its file on change).
+    pub authorized: Arc<RwLock<HashSet<PublicKey>>>,
     pub egress: EgressPolicy,
     pub handshake_timeout: Duration,
     pub connect_timeout: Duration,
@@ -118,7 +120,7 @@ impl RelayConfig {
         Self {
             listen,
             keypair: Arc::new(keypair),
-            authorized: Arc::new(authorized),
+            authorized: Arc::new(RwLock::new(authorized)),
             egress: EgressPolicy::default(),
             handshake_timeout: Duration::from_secs(10),
             connect_timeout: Duration::from_secs(10),
@@ -198,7 +200,7 @@ pub async fn start_relay(cfg: RelayConfig) -> Result<RelayHandle> {
 
 async fn serve(sock: TcpStream, cfg: &RelayConfig, st: &RelayStats) -> Result<()> {
     sock.set_nodelay(true).ok();
-    let hs = server_handshake(sock, &cfg.keypair, |k| cfg.authorized.contains(k));
+    let hs = server_handshake(sock, &cfg.keypair, |k| cfg.authorized.read().map(|a| a.contains(k)).unwrap_or(false));
     let (_client, (mut rd, mut wr)) = match tokio::time::timeout(cfg.handshake_timeout, hs).await {
         Ok(Ok(ok)) => ok,
         Ok(Err(e)) => {
