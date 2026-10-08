@@ -21,9 +21,16 @@ self-replace = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 regex = "1"
 anyhow = "1"
+url = "2"
 dirs = "6"
 
 [profile.release]
 opt-level = 3
 lto = "thin"
 strip = true
+
+# librqbit 9.0.1 with one added getter (TorrentStateLive::ratelimits) so the
+# Details panel can change a torrent's speed limits while it runs.
+# See vendor/README-zentorrent.md.
+[patch.crates-io]
+librqbit = { path = "vendor/librqbit" }

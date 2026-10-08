@@ -27,6 +27,16 @@ pub struct Entry {
     /// The user's labels on this torrent (sidebar → Labels).
     #[serde(default)]
     pub labels: Vec<String>,
+    /// This torrent's speed limits in KiB/s (Details → Settings). 0 = unlimited.
+    #[serde(default)]
+    pub down_limit_kib: u32,
+    #[serde(default)]
+    pub up_limit_kib: u32,
+    /// This torrent's own seed goal; 0 = use the global goal.
+    #[serde(default)]
+    pub goal_ratio: f64,
+    #[serde(default)]
+    pub goal_hours: f64,
     /// librqbit's per-run counter as last seen (not saved: a new run starts at 0).
     #[serde(skip)]
     pub seen: u64,
@@ -63,12 +73,29 @@ pub struct Ledger {
     /// when no torrent carries it yet).
     #[serde(default)]
     pub labels: Vec<String>,
+    /// Speed limits for all torrents together, in KiB/s. 0 = unlimited.
+    #[serde(default)]
+    pub global_down_kib: u32,
+    #[serde(default)]
+    pub global_up_kib: u32,
 }
 
 impl Default for Ledger {
     fn default() -> Self {
-        Self { ratio_goal: 0.0, hours_goal: 0.0, entries: HashMap::new(), labels: Vec::new() }
+        Self {
+            ratio_goal: 0.0,
+            hours_goal: 0.0,
+            entries: HashMap::new(),
+            labels: Vec::new(),
+            global_down_kib: 0,
+            global_up_kib: 0,
+        }
     }
+}
+
+/// KiB/s → librqbit's bytes/s limit; 0 means no limit.
+pub fn bps(kib: u32) -> Option<std::num::NonZeroU32> {
+    std::num::NonZeroU32::new(kib.saturating_mul(1024))
 }
 
 pub fn data_dir() -> PathBuf {
@@ -130,10 +157,12 @@ impl Ledger {
         }
     }
 
-    /// Has this finished torrent met the seed goal?
+    /// Has this finished torrent met its seed goal? A torrent's own goal
+    /// (Details → Settings) wins over the global one.
     pub fn goal_met(&self, e: &Entry) -> bool {
-        (self.ratio_goal > 0.0 && e.ratio() >= self.ratio_goal)
-            || (self.hours_goal > 0.0 && e.seed_secs as f64 >= self.hours_goal * 3600.0)
+        let ratio = if e.goal_ratio > 0.0 { e.goal_ratio } else { self.ratio_goal };
+        let hours = if e.goal_hours > 0.0 { e.goal_hours } else { self.hours_goal };
+        (ratio > 0.0 && e.ratio() >= ratio) || (hours > 0.0 && e.seed_secs as f64 >= hours * 3600.0)
     }
 
     pub fn totals(&self) -> (u64, u64) {
@@ -214,5 +243,24 @@ mod tests {
         l.delete_label("film");
         assert!(l.labels.is_empty() && l.entries["ab"].labels.is_empty());
         assert_eq!(l.ratio_floor(), 1.0);
+    }
+
+    #[test]
+    fn a_torrents_own_goal_and_limits() {
+        let l = Ledger { ratio_goal: 2.0, ..Default::default() };
+        let mut e = Entry { size: 100, uploaded: 150, ..Default::default() };
+        assert!(!l.goal_met(&e), "global goal 2.0 not reached at 1.5");
+        e.goal_ratio = 1.2;
+        assert!(l.goal_met(&e), "own goal 1.2 wins over the global 2.0");
+        e.goal_ratio = 0.0;
+        e.goal_hours = 1.0;
+        e.seed_secs = 3600;
+        assert!(l.goal_met(&e), "own seed-time goal");
+        assert_eq!(bps(0), None, "0 = unlimited");
+        assert_eq!(bps(500).map(|v| v.get()), Some(512_000));
+        assert_eq!(bps(u32::MAX).map(|v| v.get()), Some(u32::MAX), "saturates instead of wrapping");
+        // Old ratio.json without the new fields still loads with everything off.
+        let back: Ledger = serde_json::from_slice(br#"{"entries":{"ab":{"name":"x","folder":"/","size":1,"uploaded":0,"seed_secs":0,"private":false}}}"#).unwrap();
+        assert_eq!((back.global_down_kib, back.entries["ab"].down_limit_kib, back.entries["ab"].goal_ratio), (0, 0, 0.0));
     }
 }

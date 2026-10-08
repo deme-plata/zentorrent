@@ -17,7 +17,10 @@ use std::time::Instant;
 use eframe::egui::{self, Color32, RichText};
 
 /// Below this (MiB/s) a torrent counts as not moving bytes.
-const ACTIVE_MIBS: f64 = 1.0 / 1024.0; // 1 KB/s
+pub const ACTIVE_MIBS: f64 = 1.0 / 1024.0; // 1 KB/s
+/// Seconds of nothing arriving before a download counts as Stalled. Shorter
+/// would flag every torrent while it verifies its last pieces.
+pub const STALL_SECS: u32 = 10;
 /// Trackers shown before "Show all".
 const SITES_SHOWN: usize = 6;
 /// Seconds of history in the speed sparkline.
@@ -104,6 +107,8 @@ pub struct Facts {
     pub live: bool,
     pub down_mibs: f64,
     pub up_mibs: f64,
+    /// Seconds in a row that nothing has arrived (from the speed history).
+    pub idle_secs: u32,
     pub private: bool,
     pub ratio: f64,
     pub uploaded: u64,
@@ -123,7 +128,9 @@ impl Facts {
             Status::Completed => self.finished,
             Status::Paused => self.paused && !self.error,
             Status::Active => running && self.down_mibs + self.up_mibs > ACTIVE_MIBS,
-            Status::Stalled => !self.finished && running && self.live && self.down_mibs <= ACTIVE_MIBS,
+            Status::Stalled => {
+                !self.finished && running && self.live && self.down_mibs <= ACTIVE_MIBS && self.idle_secs >= STALL_SECS
+            }
             Status::Errored => self.error,
             Status::NeedsSeeding => self.private && self.finished && self.ratio < ratio_floor,
         }
@@ -634,6 +641,10 @@ mod tests {
         dl.down_mibs = 2.0;
         let mut stalled = t("stalled");
         stalled.down_mibs = 0.0;
+        stalled.idle_secs = 30;
+        // Finishing: nothing arriving for a moment while the last pieces verify.
+        let finishing = Facts { idle_secs: 3, ..t("finishing") };
+        assert!(!finishing.is(Status::Stalled, floor), "a short pause is not a stall");
         let seed = Facts { finished: true, up_mibs: 0.5, ..t("seed") };
         let paused = Facts { finished: true, paused: true, ..t("paused") };
         let err = Facts { error: true, ..t("err") };

@@ -49,6 +49,21 @@ everything in it exists because someone needed it on a real private tracker.
 | **Search** | `Ctrl+F`. Matches names, labels and tracker names. |
 | **Speed sparkline** | The last 90 seconds of ⬇/⬆ at a glance. |
 
+### Details: one torrent, up close *(new in 0.7)*
+
+<img src="docs/details.png" alt="ZenTorrent's Details panel: a live download/upload speed graph above Status, Details, Files, Peers and Settings tabs" width="100%">
+
+Press **Details** on any torrent:
+
+| | |
+|---|---|
+| **Live speed graph** | 5 minutes of ⬇/⬆ as gradient areas on a scale that always lands on round numbers. Hover for the exact speed at any second. |
+| **Status** | Downloaded, lifetime upload and ratio, speed, time left, peers, seeding time, pieces verified, average piece time. |
+| **Details** | Info hash and magnet link (one click to copy, hash and name only), save folder, piece size, and trackers shown as host only. Your passkey never appears. |
+| **Files** | Choose which files to download, with per-file progress and a **Largest only** button for the one film or ISO in a pack. |
+| **Peers** | Everyone you're trading with: address, client (qBittorrent, Deluge, µTorrent…), TCP/uTP, and what you got from and sent to each. |
+| **Settings** | **This torrent's own download/upload limits**, applied instantly with no restart or re-check. Its own seed goal, labels, pause/resume. Plus limits for **all torrents**. Everything is remembered across restarts. |
+
 ### Everything else
 
 - **Seeding & ratio ledger.** Lifetime upload per torrent survives restarts (librqbit's own counter resets every run). Stop seeding at a ratio or after N hours.
@@ -64,13 +79,13 @@ Grab a build from **[GitHub Releases](https://github.com/deme-plata/zentorrent/r
 
 | Platform | GitHub Releases | Mirror |
 |---|---|---|
-| Windows x64 | [`zentorrent-0.6.0-windows-x64.exe`](https://github.com/deme-plata/zentorrent/releases/download/v0.6.0/zentorrent-0.6.0-windows-x64.exe) | [quillon.xyz](https://quillon.xyz/downloads/zentorrent-0.6.0-windows-x64.exe) |
-| Linux x64 | [`zentorrent-0.6.0-linux-x64`](https://github.com/deme-plata/zentorrent/releases/download/v0.6.0/zentorrent-0.6.0-linux-x64) | [quillon.xyz](https://quillon.xyz/downloads/zentorrent-0.6.0-linux-x64) |
+| Windows x64 | [`zentorrent-0.7.0-windows-x64.exe`](https://github.com/deme-plata/zentorrent/releases/download/v0.7.0/zentorrent-0.7.0-windows-x64.exe) | [quillon.xyz](https://quillon.xyz/downloads/zentorrent-0.7.0-windows-x64.exe) |
+| Linux x64 | [`zentorrent-0.7.0-linux-x64`](https://github.com/deme-plata/zentorrent/releases/download/v0.7.0/zentorrent-0.7.0-linux-x64) | [quillon.xyz](https://quillon.xyz/downloads/zentorrent-0.7.0-linux-x64) |
 
 Both are byte-identical to what the in-app updater installs. Their BLAKE3 hashes are in the Ed25519-signed [`zentorrent-latest.json`](https://quillon.xyz/downloads/zentorrent-latest.json).
 
 ```bash
-chmod +x zentorrent-0.6.0-linux-x64 && ./zentorrent-0.6.0-linux-x64
+chmod +x zentorrent-0.7.0-linux-x64 && ./zentorrent-0.7.0-linux-x64
 ```
 
 ## 🛠 Build from source
@@ -117,6 +132,8 @@ flowchart LR
 |---|---|
 | `src/main.rs` | the window, tabs, transfer list, CLI modes |
 | `src/sidebar.rs` | the faceted navigator: statuses, tracker → site grouping, labels, drag & drop, sparkline |
+| `src/details.rs` | the Details panel: speed graph, Status / Details / Files / Peers / Settings tabs |
+| `vendor/librqbit` | librqbit 9.0.1 plus **one** added getter, so a torrent's speed limits can change while it runs ([why](vendor/README-zentorrent.md)) |
 | `src/rss.rs` | feed parser (RSS 2.0 / Atom / Torznab), `.torrent` fetch + validation, tracker log-in |
 | `src/meta.rs` | release-name → title/year guesser, OMDb lookups, poster cache, daily budget |
 | `src/seed.rs` | lifetime ratio ledger, seed goals, labels |
@@ -134,10 +151,13 @@ flowchart LR
 ## 🗺 Roadmap
 
 - [x] Sidebar: status / tracker / label facets, drag & drop, per-tracker ratio *(0.6)*
-- [ ] **IronTunnel** — a built-in Rust VPN tunnel, so torrent traffic can be bound to the tunnel *(in progress)*
-- [ ] Search tab across trackers (Torznab / Jackett)
-- [ ] Speed limits and schedules
-- [ ] Tray icon · macOS build
+- [x] Details panel: speed graph, files, peers, per-torrent and global speed limits *(0.7)*
+- [ ] RSS search (genre, seeders, activity) and a history that remembers every feed item
+- [ ] Opt-in, anonymous usage statistics *(0.8)*
+- [ ] **Flux MoE assistant tab**: ask about your feeds and history, let it sort a music folder by genre
+- [ ] **IronTunnel**: a built-in Rust VPN tunnel to bind torrent traffic to *(in progress)*
+- [ ] Built-in audio/video player
+- [ ] Speed schedules · tray icon · macOS build
 
 ## License
 

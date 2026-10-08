@@ -23,6 +23,7 @@ type ManagedTorrentHandle = Arc<ManagedTorrent>;
 /// How soon a feed that failed to load is tried again.
 const FEED_RETRY: Duration = Duration::from_secs(60);
 
+mod details;
 mod meta;
 mod rss;
 mod seed;
@@ -279,6 +280,10 @@ struct App {
     sidebar: sidebar::Sidebar,
     /// Per-transfer facts for this frame, same order as `transfers`.
     facts: Vec<sidebar::Facts>,
+    /// The open Details panel, if any.
+    details: Option<details::Details>,
+    /// Per-torrent (down, up) MiB/s, one sample a second, for the Details graph.
+    history: HashMap<String, std::collections::VecDeque<(f32, f32)>>,
 }
 
 impl App {
@@ -324,7 +329,7 @@ impl App {
 
         let meta_jobs = spawn_meta_worker(&rt, inbox.clone(), cc.egui_ctx.clone());
 
-        Self {
+        let app = Self {
             rt,
             session,
             session_error,
@@ -350,6 +355,80 @@ impl App {
             last_ledger_save: Instant::now(),
             sidebar: Default::default(),
             facts: Vec::new(),
+            details: None,
+            history: HashMap::new(),
+        };
+        app.apply_global_limits();
+        app
+    }
+
+    /// The "All torrents" limits from the ledger → the engine.
+    fn apply_global_limits(&self) {
+        if let Some(s) = &self.session {
+            s.ratelimits.set_download_bps(seed::bps(self.ledger.global_down_kib));
+            s.ratelimits.set_upload_bps(seed::bps(self.ledger.global_up_kib));
+        }
+    }
+
+    /// A torrent's own limits from the ledger → its live state. Called every
+    /// tick: a resumed torrent gets a fresh limiter, so this re-applies it.
+    fn apply_torrent_limits(&self, t: &Transfer) {
+        let Some(live) = t.handle.live() else { return };
+        let e = self.ledger.entries.get(&t.handle.info_hash().as_string());
+        let (down, up) = e.map(|e| (seed::bps(e.down_limit_kib), seed::bps(e.up_limit_kib))).unwrap_or_default();
+        let lim = live.ratelimits();
+        if lim.get_download_bps() != down {
+            lim.set_download_bps(down);
+        }
+        if lim.get_upload_bps() != up {
+            lim.set_upload_bps(up);
+        }
+    }
+
+    /// Draw the Details panel and carry out what it asks for.
+    fn details_ui(&mut self, ctx: &egui::Context) {
+        let Some(mut d) = self.details.take() else { return };
+        let Some(i) = self.transfers.iter().position(|t| t.handle.info_hash().as_string() == d.hash) else {
+            return; // the torrent was removed: the panel closes
+        };
+        let Some(f) = self.facts.iter().find(|f| f.hash == d.hash).cloned() else {
+            self.details = Some(d);
+            return;
+        };
+        let hash = d.hash.clone();
+        let actions = details::show(ctx, &mut d, &self.transfers[i], &f, &mut self.ledger, self.history.get(&hash));
+        let mut keep = true;
+        for a in actions {
+            match a {
+                details::Action::Close => keep = false,
+                details::Action::Pause(p) => self.set_paused(&d.hash, p),
+                details::Action::OpenFolder => {
+                    let _ = open_folder(&self.transfers[i].folder);
+                }
+                details::Action::Label(l, on) => {
+                    self.ledger.set_label(&d.hash, &l, on);
+                    self.save_ledger();
+                }
+                details::Action::LedgerChanged => {
+                    self.save_ledger();
+                    self.apply_global_limits();
+                    self.apply_torrent_limits(&self.transfers[i]);
+                }
+                details::Action::SetFiles(only) => {
+                    if let Some(sess) = self.session.clone() {
+                        let (h, inbox, ctx, name) = (self.transfers[i].handle.clone(), self.inbox.clone(), ctx.clone(), self.transfers[i].name.clone());
+                        self.rt.spawn(async move {
+                            if let Err(e) = sess.update_only_files(&h, &only).await {
+                                inbox.lock().unwrap().errors.push(format!("{name}: could not change the file selection: {e:#}"));
+                                ctx.request_repaint();
+                            }
+                        });
+                    }
+                }
+            }
+        }
+        if keep {
+            self.details = Some(d);
         }
     }
 
@@ -367,7 +446,14 @@ impl App {
                     t.handle.shared().trackers.iter().filter_map(|u| u.host_str().map(sidebar::site)).collect();
                 sites.sort();
                 sites.dedup();
+                // Trailing seconds with nothing arriving, from the per-second history.
+                let idle_secs = self
+                    .history
+                    .get(&hash)
+                    .map(|h| h.iter().rev().take_while(|(d, _)| (*d as f64) <= sidebar::ACTIVE_MIBS).count() as u32)
+                    .unwrap_or(0);
                 sidebar::Facts {
+                    idle_secs,
                     name: t.name.clone(),
                     finished: s.finished,
                     paused: t.handle.is_paused(),
@@ -455,6 +541,12 @@ impl App {
         for t in &self.transfers {
             let s = t.handle.stats();
             let hash = t.handle.info_hash().as_string();
+            let (down, up) = s.live.as_ref().map(|l| (l.download_speed.mbps as f32, l.upload_speed.mbps as f32)).unwrap_or_default();
+            let h = self.history.entry(hash.clone()).or_default();
+            h.push_back((down, up));
+            while h.len() > details::HISTORY {
+                h.pop_front();
+            }
             let private = t.handle.with_metadata(|m| m.info.info().private).unwrap_or(false);
             let e = self.ledger.entries.entry(hash).or_insert_with(|| seed::Entry {
                 name: t.name.clone(),
@@ -474,6 +566,9 @@ impl App {
                 e.goal_reached = true;
                 to_pause.push(t.handle.clone());
             }
+        }
+        for t in &self.transfers {
+            self.apply_torrent_limits(t);
         }
         if let Some(sess) = self.session.clone() {
             for h in to_pause {
@@ -1065,6 +1160,8 @@ impl eframe::App for App {
         self.sidebar_actions(actions);
 
         self.tick_ledger();
+        // Drawn before the central panels; as a modal it sits above all of them.
+        self.details_ui(ctx);
         if self.view == View::Seeding {
             egui::CentralPanel::default().show(root, |ui| self.seeding_ui(ui));
             ctx.request_repaint_after(Duration::from_millis(1000));
@@ -1132,6 +1229,7 @@ impl eframe::App for App {
             }
             let mut remove = None;
             let mut relabel: Vec<(String, String, bool)> = Vec::new();
+            let mut open_details: Option<String> = None;
             let labels = self.ledger.labels.clone();
             egui::ScrollArea::vertical().show(ui, |ui| {
                 for (i, t) in self.transfers.iter().enumerate() {
@@ -1139,7 +1237,7 @@ impl eframe::App for App {
                         continue;
                     }
                     let Some(f) = self.facts.get(i) else { continue };
-                    transfer_row(ui, &self.rt, self.session.as_ref(), t, f, &labels, &mut relabel, || remove = Some(i));
+                    transfer_row(ui, &self.rt, self.session.as_ref(), t, f, &labels, &mut relabel, &mut open_details, || remove = Some(i));
                     ui.add_space(4.0);
                 }
                 if shown == 0 && !self.transfers.is_empty() {
@@ -1155,9 +1253,13 @@ impl eframe::App for App {
                 }
                 self.save_ledger();
             }
+            if let Some(hash) = open_details {
+                self.details = Some(details::Details::new(hash));
+            }
             if let Some(i) = remove {
                 let t = self.transfers.remove(i);
                 self.ledger.entries.remove(&t.handle.info_hash().as_string());
+                self.history.remove(&t.handle.info_hash().as_string());
                 self.save_ledger();
                 if let Some(s) = self.session.clone() {
                     self.rt.spawn(async move {
@@ -1613,6 +1715,7 @@ fn transfer_row(
     f: &sidebar::Facts,
     all_labels: &[String],
     relabel: &mut Vec<(String, String, bool)>,
+    open_details: &mut Option<String>,
     mut on_remove: impl FnMut(),
 ) {
     let s = t.handle.stats();
@@ -1652,6 +1755,13 @@ fn transfer_row(
                         }
                     }
                 });
+                if ui
+                    .small_button("Details")
+                    .on_hover_text("Speed graph, files, peers and this torrent's own settings")
+                    .clicked()
+                {
+                    *open_details = Some(f.hash.clone());
+                }
                 if ui.small_button("Open folder").clicked() {
                     let _ = open_folder(&t.folder);
                 }
