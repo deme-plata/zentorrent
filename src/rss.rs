@@ -107,6 +107,19 @@ pub struct Item {
     pub date: String,
     /// Tracker category ("Movies/HD", "TV/HD", "Music"), used to skip rating lookups.
     pub category: String,
+    /// Swarm numbers when the feed reports them (Torznab attrs, ezRSS/Nyaa
+    /// elements, or "Seeders: 12" in a TBDev description).
+    pub seeders: Option<u32>,
+    pub leechers: Option<u32>,
+    /// Times downloaded ("snatched", "grabs", "completed").
+    pub grabs: Option<u32>,
+    /// Download doesn't count against your ratio (Torznab downloadvolumefactor 0).
+    pub freeleech: bool,
+    pub infohash: String,
+    /// Every extra category, genre and tag the feed gives ("Trance", "FLAC").
+    pub tags: Vec<String>,
+    /// The item's description as plain text, shortened.
+    pub description: String,
 }
 
 pub fn store_path() -> Option<PathBuf> {
@@ -273,7 +286,7 @@ pub fn parse(xml: &str) -> anyhow::Result<Vec<Item>> {
                         }
                     }
                     // Torznab: <torznab:attr name="magneturl" value=".."/>
-                    "attr" => match (attr("name").as_deref(), attr("value")) {
+                    "attr" => match (attr("name").map(|n| n.to_ascii_lowercase()).as_deref(), attr("value")) {
                         (Some("magneturl"), Some(v)) => {
                             c.magnet.get_or_insert(v);
                         }
@@ -282,6 +295,20 @@ pub fn parse(xml: &str) -> anyhow::Result<Vec<Item>> {
                                 c.size.get_or_insert(n);
                             }
                         }
+                        (Some("seeders"), Some(v)) => c.seeders = c.seeders.or(v.trim().parse().ok()),
+                        (Some("leechers"), Some(v)) => c.leechers = c.leechers.or(v.trim().parse().ok()),
+                        // Torznab "peers" = seeders + leechers.
+                        (Some("peers"), Some(v)) => c.peers = c.peers.or(v.trim().parse().ok()),
+                        (Some("grabs"), Some(v)) => c.grabs = c.grabs.or(v.trim().parse().ok()),
+                        (Some("infohash"), Some(v)) => {
+                            c.infohash.get_or_insert(v.to_ascii_lowercase());
+                        }
+                        (Some("downloadvolumefactor"), Some(v)) => {
+                            if v.trim().parse::<f64>().is_ok_and(|f| f == 0.0) {
+                                c.freeleech = true;
+                            }
+                        }
+                        (Some("genre" | "tag" | "tags"), Some(v)) => c.add_tags(&v),
                         _ => {}
                     },
                     _ => {}
@@ -319,15 +346,32 @@ pub fn parse(xml: &str) -> anyhow::Result<Vec<Item>> {
                                 c.magnet.get_or_insert(v);
                             }
                             "category" => {
-                                c.category.get_or_insert(v);
+                                if c.category.is_none() {
+                                    c.category = Some(v);
+                                } else {
+                                    c.add_tags(&v);
+                                }
                             }
                             "pubDate" | "published" | "updated" | "date" => {
                                 c.date.get_or_insert(v);
                             }
-                            "size" | "contentLength" => {
-                                if let Ok(n) = v.parse() {
+                            // <size>123</size>, or Nyaa's human-readable <nyaa:size>1.2 GiB</nyaa:size>
+                            "size" | "contentLength" | "contentlength" => {
+                                if let Some(n) = v.parse().ok().or_else(|| parse_size(&v)) {
                                     c.size.get_or_insert(n);
                                 }
+                            }
+                            // ezRSS <torrent:seeds>, Nyaa <nyaa:seeders>, plain <seeders>
+                            "seeders" | "seeds" => c.seeders = c.seeders.or(v.parse().ok()),
+                            // ezRSS <torrent:peers> counts the leechers.
+                            "leechers" | "peers" => c.leechers = c.leechers.or(v.parse().ok()),
+                            "downloads" | "grabs" | "snatched" | "completed" => c.grabs = c.grabs.or(v.parse().ok()),
+                            "infoHash" | "infohash" => {
+                                c.infohash.get_or_insert(v.to_ascii_lowercase());
+                            }
+                            "genre" | "tags" | "tag" | "keywords" => c.add_tags(&v),
+                            "description" | "summary" | "content" => {
+                                c.description.get_or_insert(v);
                             }
                             _ => {}
                         }
@@ -351,10 +395,31 @@ struct Cand {
     size: Option<u64>,
     date: Option<String>,
     category: Option<String>,
+    seeders: Option<u32>,
+    leechers: Option<u32>,
+    /// Torznab "peers" (seeders + leechers); turned into leechers at the end.
+    peers: Option<u32>,
+    grabs: Option<u32>,
+    freeleech: bool,
+    infohash: Option<String>,
+    tags: Vec<String>,
+    description: Option<String>,
 }
 
+/// How much of a description is kept (search text, not an archive).
+const DESCRIPTION_CHARS: usize = 400;
+
 impl Cand {
-    fn finish(self) -> Option<Item> {
+    /// "Trance, Progressive" or "Trance|Uplifting" → separate tags, no duplicates.
+    fn add_tags(&mut self, v: &str) {
+        for t in v.split([',', '|', ';', '/']).map(str::trim).filter(|t| !t.is_empty() && t.len() <= 40) {
+            if !self.tags.iter().any(|x| x.eq_ignore_ascii_case(t)) {
+                self.tags.push(t.to_string());
+            }
+        }
+    }
+
+    fn finish(mut self) -> Option<Item> {
         let link = [&self.magnet, &self.enclosure, &self.link, &self.guid]
             .into_iter()
             .flatten()
@@ -362,14 +427,80 @@ impl Cand {
             .or(self.enclosure.as_ref())
             .or(self.link.as_ref())?
             .clone();
+        let description = self.description.as_deref().map(plain_text).unwrap_or_default();
+        // TBDev-style feeds put the numbers in the description text.
+        if self.seeders.is_none() {
+            self.seeders = number_after(&description, r"seed(?:er)?s?");
+        }
+        if self.leechers.is_none() {
+            self.leechers = number_after(&description, r"leech(?:er)?s?");
+        }
+        if self.grabs.is_none() {
+            self.grabs = number_after(&description, r"(?:snatche?d?|completed|grabs|downloaded)");
+        }
+        if self.size.is_none() {
+            self.size = regex::Regex::new(r"(?i)\bsize\s*[:=]\s*([\d.,]+\s*[kmgt]?i?b)\b")
+                .ok()
+                .and_then(|re| re.captures(&description))
+                .and_then(|c| parse_size(c.get(1)?.as_str()));
+        }
+        if self.leechers.is_none() {
+            if let (Some(p), Some(s)) = (self.peers, self.seeders) {
+                self.leechers = Some(p.saturating_sub(s));
+            }
+        }
+        let title = self.title.unwrap_or_else(|| link.clone());
+        // A tag that repeats the main category ("Audio" from "Audio/Lossless") adds nothing.
+        if let Some(cat) = &self.category {
+            self.tags.retain(|t| !t.eq_ignore_ascii_case(cat));
+        }
+        let lower = format!("{title} {description}").to_lowercase();
+        let freeleech = self.freeleech || lower.contains("freeleech") || lower.contains("free leech");
         Some(Item {
-            title: self.title.unwrap_or_else(|| link.clone()),
+            title,
             link,
             size: self.size,
             date: self.date.unwrap_or_default(),
             category: self.category.unwrap_or_default(),
+            seeders: self.seeders,
+            leechers: self.leechers,
+            grabs: self.grabs,
+            freeleech,
+            infohash: self.infohash.unwrap_or_default(),
+            tags: self.tags,
+            description: description.chars().take(DESCRIPTION_CHARS).collect(),
         })
     }
+}
+
+/// HTML in a description → one line of plain text.
+fn plain_text(html: &str) -> String {
+    let t = regex::Regex::new(r"(?s)<(script|style)[^>]*>.*?</(script|style)>|<[^>]*>").unwrap().replace_all(html, " ");
+    t.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The number after a label: "Seeders: 12", "seeds=3", "Snatched 40 times".
+fn number_after(text: &str, label: &str) -> Option<u32> {
+    let re = regex::Regex::new(&format!(r"(?i)\b{label}\s*[:=]?\s*(\d{{1,9}})\b")).ok()?;
+    re.captures(text)?.get(1)?.as_str().parse().ok()
+}
+
+/// "1.2 GiB", "700 MB", "4.5GB" → bytes (binary units, as trackers mean them).
+pub fn parse_size(s: &str) -> Option<u64> {
+    let s = s.trim().to_ascii_lowercase().replace(',', ".");
+    // A bare number ("12") is bytes: no unit to split off.
+    let split = s.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(s.len());
+    let (num, unit) = s.split_at(split);
+    let n: f64 = num.parse().ok()?;
+    let mul = match unit.trim().trim_end_matches('b').trim_end_matches('i') {
+        "" => 1.0,
+        "k" => 1024.0,
+        "m" => 1024.0 * 1024.0,
+        "g" => 1024.0 * 1024.0 * 1024.0,
+        "t" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        _ => return None,
+    };
+    Some((n * mul) as u64)
 }
 
 fn is_torrentish(s: &str) -> bool {
@@ -669,6 +800,61 @@ mod tests {
         assert_eq!(got[0].link, "b");
         // Same read again: nothing new.
         assert!(f.absorb(&[it("Debian 13", "b")]).is_empty());
+    }
+
+    #[test]
+    fn torznab_swarm_numbers_freeleech_and_genre() {
+        let x = r#"<rss xmlns:torznab="http://torznab.com/schemas/2015/feed"><channel><item>
+            <title>Some Artist - Live Set 2024 [FLAC]</title><link>https://idx/dl/1.torrent</link>
+            <category>Audio</category><category>Audio/Lossless</category>
+            <torznab:attr name="seeders" value="42"/><torznab:attr name="peers" value="50"/>
+            <torznab:attr name="grabs" value="310"/><torznab:attr name="infohash" value="ABCDEF"/>
+            <torznab:attr name="downloadvolumefactor" value="0"/>
+            <torznab:attr name="genre" value="Trance, Progressive"/>
+            </item></channel></rss>"#;
+        let it = &parse(x).unwrap()[0];
+        assert_eq!((it.seeders, it.leechers, it.grabs), (Some(42), Some(8), Some(310)), "leechers = peers - seeders");
+        assert!(it.freeleech);
+        assert_eq!(it.infohash, "abcdef");
+        assert_eq!(it.category, "Audio", "first category stays the main one");
+        // "Audio/Lossless" splits so each part is searchable on its own; "Audio" repeats the category.
+        assert_eq!(it.tags, ["Lossless", "Trance", "Progressive"].map(String::from).to_vec());
+    }
+
+    #[test]
+    fn ezrss_nyaa_and_tbdev_description() {
+        let ez = r#"<rss xmlns:torrent="http://xmlns.ezrss.it/0.1/"><channel><item><title>A</title>
+            <link>magnet:?xt=urn:btih:aa</link><torrent:seeds>7</torrent:seeds><torrent:peers>2</torrent:peers>
+            <torrent:infoHash>AA</torrent:infoHash></item></channel></rss>"#;
+        let it = &parse(ez).unwrap()[0];
+        assert_eq!((it.seeders, it.leechers, it.infohash.as_str()), (Some(7), Some(2), "aa"));
+
+        let ny = r#"<rss xmlns:nyaa="https://nyaa.si/xmlns/nyaa"><channel><item><title>B</title>
+            <link>https://nyaa.example/download/1.torrent</link><nyaa:seeders>12</nyaa:seeders>
+            <nyaa:leechers>3</nyaa:leechers><nyaa:downloads>900</nyaa:downloads><nyaa:size>1.5 GiB</nyaa:size>
+            </item></channel></rss>"#;
+        let it = &parse(ny).unwrap()[0];
+        assert_eq!((it.seeders, it.leechers, it.grabs), (Some(12), Some(3), Some(900)));
+        assert_eq!(it.size, Some(1_610_612_736));
+
+        let tb = r#"<rss><channel><item><title>C</title><link>https://t.example/download.php?id=3</link>
+            <description>&lt;b&gt;Category:&lt;/b&gt; Music &lt;br&gt;Size: 400 MB&lt;br&gt;Seeders: 15 Leechers: 4 Snatched: 88 times &lt;br&gt;[FREELEECH]</description>
+            </item></channel></rss>"#;
+        let it = &parse(tb).unwrap()[0];
+        assert_eq!((it.seeders, it.leechers, it.grabs), (Some(15), Some(4), Some(88)));
+        assert_eq!(it.size, Some(419_430_400), "size read from the description");
+        assert!(it.freeleech);
+        assert!(it.description.starts_with("Category: Music"), "{}", it.description);
+        assert!(!it.description.contains('<'));
+    }
+
+    #[test]
+    fn human_sizes() {
+        assert_eq!(parse_size("700 MB"), Some(734_003_200));
+        assert_eq!(parse_size("4.5GB"), Some(4_831_838_208));
+        assert_eq!(parse_size("1,5 GiB"), Some(1_610_612_736));
+        assert_eq!(parse_size("12"), Some(12));
+        assert_eq!(parse_size("lots"), None);
     }
 
     #[test]

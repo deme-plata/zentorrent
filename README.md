@@ -64,6 +64,23 @@ Press **Details** on any torrent:
 | **Peers** | Everyone you're trading with: address, client (qBittorrent, Deluge, µTorrent…), TCP/uTP, and what you got from and sent to each. |
 | **Settings** | **This torrent's own download/upload limits**, applied instantly with no restart or re-check. Its own seed goal, labels, pause/resume. Plus limits for **all torrents**. Everything is remembered across restarts. |
 
+### RSS search and history *(new in 0.7.1)*
+
+<img src="docs/rss-search.png" alt="ZenTorrent's RSS tab: a search for trance over the feed history, sorted by most seeders, with seeders, leechers, grabs and freeleech on every item" width="100%">
+
+- **History:** feeds only list their newest items. Tick *Remember every item* and ZenTorrent keeps everything it has seen, so search reaches back to the day you switched it on. It's stored only on your computer.
+- **Seeders, leechers, grabs and freeleech** on every item, read from Torznab, ezRSS and Nyaa feeds, and from the "Seeders: 12" text that classic private trackers put in descriptions.
+- **Search** with typo tolerance (`tarnce` finds trance) and filters:
+
+| you type | finds |
+|---|---|
+| `trance` | the word anywhere; titles rank first |
+| `genre:trance` | genre or tag only (`cat:music`, `feed:torrentleech` too) |
+| `seeders>10` `size<2gb` `grabs>=100` | by the numbers |
+| `"group therapy"` · `-remix` · `free` | exact phrase · leave out · freeleech only |
+
+- **Sort** by best match, **most seeders**, **most active** (downloads per hour since first seen), newest, largest or name.
+
 ### Everything else
 
 - **Seeding & ratio ledger.** Lifetime upload per torrent survives restarts (librqbit's own counter resets every run). Stop seeding at a ratio or after N hours.
@@ -79,13 +96,13 @@ Grab a build from **[GitHub Releases](https://github.com/deme-plata/zentorrent/r
 
 | Platform | GitHub Releases | Mirror |
 |---|---|---|
-| Windows x64 | [`zentorrent-0.7.0-windows-x64.exe`](https://github.com/deme-plata/zentorrent/releases/download/v0.7.0/zentorrent-0.7.0-windows-x64.exe) | [quillon.xyz](https://quillon.xyz/downloads/zentorrent-0.7.0-windows-x64.exe) |
-| Linux x64 | [`zentorrent-0.7.0-linux-x64`](https://github.com/deme-plata/zentorrent/releases/download/v0.7.0/zentorrent-0.7.0-linux-x64) | [quillon.xyz](https://quillon.xyz/downloads/zentorrent-0.7.0-linux-x64) |
+| Windows x64 | [`zentorrent-0.7.1-windows-x64.exe`](https://github.com/deme-plata/zentorrent/releases/download/v0.7.1/zentorrent-0.7.1-windows-x64.exe) | [quillon.xyz](https://quillon.xyz/downloads/zentorrent-0.7.1-windows-x64.exe) |
+| Linux x64 | [`zentorrent-0.7.1-linux-x64`](https://github.com/deme-plata/zentorrent/releases/download/v0.7.1/zentorrent-0.7.1-linux-x64) | [quillon.xyz](https://quillon.xyz/downloads/zentorrent-0.7.1-linux-x64) |
 
 Both are byte-identical to what the in-app updater installs. Their BLAKE3 hashes are in the Ed25519-signed [`zentorrent-latest.json`](https://quillon.xyz/downloads/zentorrent-latest.json).
 
 ```bash
-chmod +x zentorrent-0.7.0-linux-x64 && ./zentorrent-0.7.0-linux-x64
+chmod +x zentorrent-0.7.1-linux-x64 && ./zentorrent-0.7.1-linux-x64
 ```
 
 ## 🛠 Build from source
@@ -134,7 +151,9 @@ flowchart LR
 | `src/sidebar.rs` | the faceted navigator: statuses, tracker → site grouping, labels, drag & drop, sparkline |
 | `src/details.rs` | the Details panel: speed graph, Status / Details / Files / Peers / Settings tabs |
 | `vendor/librqbit` | librqbit 9.0.1 plus **one** added getter, so a torrent's speed limits can change while it runs ([why](vendor/README-zentorrent.md)) |
-| `src/rss.rs` | feed parser (RSS 2.0 / Atom / Torznab), `.torrent` fetch + validation, tracker log-in |
+| `src/rss.rs` | feed parser (RSS 2.0 / Atom / Torznab / ezRSS / Nyaa, seeders + grabs + freeleech), `.torrent` fetch + validation, tracker log-in |
+| `src/history.rs` | every feed item ever seen, with seeders and grabs over time (history.json, 0600) |
+| `src/search.rs` | the RSS search: words, prefixes, typos, phrases, filters, six sort orders |
 | `src/meta.rs` | release-name → title/year guesser, OMDb lookups, poster cache, daily budget |
 | `src/seed.rs` | lifetime ratio ledger, seed goals, labels |
 | `src/update.rs` | signed self-updater |
@@ -152,7 +171,7 @@ flowchart LR
 
 - [x] Sidebar: status / tracker / label facets, drag & drop, per-tracker ratio *(0.6)*
 - [x] Details panel: speed graph, files, peers, per-torrent and global speed limits *(0.7)*
-- [ ] RSS search (genre, seeders, activity) and a history that remembers every feed item
+- [x] RSS search (genre, seeders, activity) and a history that remembers every feed item *(0.7.1)*
 - [ ] Opt-in, anonymous usage statistics *(0.8)*
 - [ ] **Flux MoE assistant tab**: ask about your feeds and history, let it sort a music folder by genre
 - [ ] **IronTunnel**: a built-in Rust VPN tunnel to bind torrent traffic to *(in progress)*

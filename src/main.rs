@@ -24,13 +24,13 @@ type ManagedTorrentHandle = Arc<ManagedTorrent>;
 const FEED_RETRY: Duration = Duration::from_secs(60);
 
 mod details;
+mod history;
 mod meta;
 mod rss;
+mod search;
 mod seed;
 mod sidebar;
-mod tunnel;
 mod update;
-mod vpn;
 
 fn main() -> eframe::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -50,8 +50,7 @@ fn main() -> eframe::Result<()> {
             std::process::exit(2);
         };
         let dir = args.get(3).map(PathBuf::from).unwrap_or(default_dir);
-        let vpn = vpn::Vpn::start(&rt, &vpn::VpnSettings::load());
-        if let Err(e) = rt.block_on(cli(link, dir, &vpn)) {
+        if let Err(e) = rt.block_on(cli(link, dir)) {
             eprintln!("error: {e:#}");
             std::process::exit(1);
         }
@@ -127,7 +126,11 @@ fn main() -> eframe::Result<()> {
                 for it in items {
                     let sz = it.size.map(human).unwrap_or_default();
                     let cat = if it.category.is_empty() { String::new() } else { format!("{{{}}}  ", it.category) };
-                    println!("  {}  [{sz}]  {cat}{}", it.title, it.link.chars().take(90).collect::<String>());
+                    let n = |v: Option<u32>| v.map(|v| v.to_string()).unwrap_or_else(|| "-".into());
+                    let swarm = format!("S{} L{} G{}{}", n(it.seeders), n(it.leechers), n(it.grabs), if it.freeleech { " FREE" } else { "" });
+                    let tags = if it.tags.is_empty() { String::new() } else { format!(" #{}", it.tags.join(" #")) };
+                    // The link is not printed: private feeds put the passkey in it.
+                    println!("  {}  [{sz}]  {cat}{swarm}{tags}", it.title);
                 }
             }
             Err(e) => {
@@ -152,19 +155,12 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-async fn cli(link: String, dir: PathBuf, vpn: &vpn::Vpn) -> anyhow::Result<()> {
-    let Some(session_opts) = vpn::session_options(SessionOptions::default(), vpn) else {
-        anyhow::bail!("VPN is on but the tunnel is down, so nothing is downloaded (kill switch): {}", vpn.failure().unwrap_or("?"));
-    };
-    if let vpn::Vpn::Up { relay, rtt, .. } = vpn {
-        println!("VPN on: relay {relay}, handshake {} ms — DHT, local discovery and udp:// trackers off", rtt.as_millis());
-    }
-    let session = Session::new_with_opts(dir.clone(), session_opts).await?;
-    let add = match (std::path::Path::new(&link).is_file(), vpn.is_up()) {
-        (true, true) => vpn::tunnel_bytes(std::fs::read(&link)?)?,
-        (true, false) => AddTorrent::from_bytes(std::fs::read(&link)?),
-        (false, true) => vpn::tunnel_link(&vpn.http(), &link).await?,
-        (false, false) => AddTorrent::from_url(link),
+async fn cli(link: String, dir: PathBuf) -> anyhow::Result<()> {
+    let session = Session::new_with_opts(dir.clone(), SessionOptions::default()).await?;
+    let add = if std::path::Path::new(&link).is_file() {
+        AddTorrent::from_bytes(std::fs::read(&link)?)
+    } else {
+        AddTorrent::from_url(link)
     };
     let opts = AddTorrentOptions {
         output_folder: Some(dir.to_string_lossy().into_owned()),
@@ -183,12 +179,8 @@ async fn cli(link: String, dir: PathBuf, vpn: &vpn::Vpn) -> anyhow::Result<()> {
             .as_ref()
             .map(|l| (speed(l.download_speed.mbps), l.snapshot.peer_stats.live))
             .unwrap_or_default();
-        let tunnel = vpn
-            .stats()
-            .map(|v| format!("  vpn ↑{} ↓{} conns {}", human(v.bytes_up), human(v.bytes_down), v.connections_active))
-            .unwrap_or_default();
         println!(
-            "{:5.1} %  {} / {}  ↓ {spd}  peers {peers}  [{}]{tunnel}",
+            "{:5.1} %  {} / {}  ↓ {spd}  peers {peers}  [{}]",
             if s.total_bytes > 0 { s.progress_bytes as f64 * 100.0 / s.total_bytes as f64 } else { 0.0 },
             human(s.progress_bytes),
             human(s.total_bytes),
@@ -227,8 +219,6 @@ struct Inbox {
     /// (imdb id, poster bytes or error)
     posters: Vec<(String, Result<Vec<u8>, String>)>,
     busy: usize,
-    /// Result of the VPN window's "Test relay" (handshake + ping, ms).
-    vpn_test: Option<Result<u128, String>>,
 }
 
 #[derive(Clone)]
@@ -256,7 +246,14 @@ struct FeedView {
     selected: Option<usize>,
     new_name: String,
     new_url: String,
-    filter: String,
+    /// The search box (see `search.rs` for the syntax).
+    query: String,
+    sort: search::Sort,
+    /// false = what the feeds list now, true = the whole history.
+    scope_history: bool,
+    /// Indexes into the history, best first, and what they were computed for.
+    results: Vec<usize>,
+    results_key: Option<(String, search::Sort, bool, u64, Option<String>, u64)>,
     in_flight: usize,
     last_refresh: Option<Instant>,
     /// A feed failed: re-read the failed ones at this time instead of
@@ -299,50 +296,34 @@ struct App {
     /// The open Details panel, if any.
     details: Option<details::Details>,
     /// Per-torrent (down, up) MiB/s, one sample a second, for the Details graph.
-    history: HashMap<String, std::collections::VecDeque<(f32, f32)>>,
-    vpn: vpn::Vpn,
-    /// Settings the running engine was started with / last saved / being edited.
-    vpn_running: vpn::VpnSettings,
-    vpn_settings: vpn::VpnSettings,
-    vpn_edit: vpn::VpnSettings,
-    vpn_open: bool,
-    vpn_note: Option<String>,
-    vpn_testing: bool,
-    /// This install's tunnel public key (hex), read when the VPN window opens.
-    vpn_pub: Option<Result<String, String>>,
+    speed_hist: HashMap<String, std::collections::VecDeque<(f32, f32)>>,
+    /// Every RSS item seen (the history behind RSS search).
+    feed_hist: history::History,
+    feed_hist_saved: Instant,
+    /// Bumped when OMDb answers arrive: search sees film genres from them.
+    meta_version: u64,
 }
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, rt: tokio::runtime::Runtime, folder: PathBuf) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
 
-        // The VPN comes first: when it is on, the engine may start only once the
-        // tunnel is up (kill switch), and with every non-tunnel path switched off.
-        let vpn_settings = vpn::VpnSettings::load();
-        let vpn = vpn::Vpn::start(&rt, &vpn_settings);
-        let engine_opts = SessionOptions {
+        let (session, session_error) =
             // Persistence: librqbit remembers every torrent (and where it got
             // to) in the data dir, so a restart resumes downloads and seeding.
-            persistence: Some(librqbit::SessionPersistenceConfig::Json {
-                folder: Some(seed::data_dir().join("session")),
-            }),
-            fastresume: true,
-            ..Default::default()
-        };
-        let (session, session_error) = match vpn::session_options(engine_opts, &vpn) {
-            None => (
-                None,
-                Some(format!(
-                    "VPN is on but the tunnel is down, so the torrent engine is stopped (kill switch): {}. \
-                     Fix the relay or turn the VPN off (VPN button, top right).",
-                    vpn.failure().unwrap_or("?")
-                )),
-            ),
-            Some(opts) => match rt.block_on(Session::new_with_opts(folder.clone(), opts)) {
+            match rt.block_on(Session::new_with_opts(
+                folder.clone(),
+                SessionOptions {
+                    persistence: Some(librqbit::SessionPersistenceConfig::Json {
+                        folder: Some(seed::data_dir().join("session")),
+                    }),
+                    fastresume: true,
+                    ..Default::default()
+                },
+            )) {
                 Ok(s) => (Some(s), None),
                 Err(e) => (None, Some(format!("could not start the torrent engine: {e:#}"))),
-            },
-        };
+            };
 
         let inbox = Arc::new(Mutex::new(Inbox::default()));
 
@@ -378,7 +359,7 @@ impl App {
             view: View::Downloads,
             store: rss::FeedStore::load(),
             fv: FeedView::default(),
-            http: vpn.http(),
+            http: rss::http(),
             upd: Upd::Checking,
             upd_checked: None,
             ledger,
@@ -393,15 +374,10 @@ impl App {
             sidebar: Default::default(),
             facts: Vec::new(),
             details: None,
-            history: HashMap::new(),
-            vpn,
-            vpn_running: vpn_settings.clone(),
-            vpn_edit: vpn_settings.clone(),
-            vpn_settings,
-            vpn_open: false,
-            vpn_note: None,
-            vpn_testing: false,
-            vpn_pub: None,
+            speed_hist: HashMap::new(),
+            feed_hist: history::History::load(),
+            feed_hist_saved: Instant::now(),
+            meta_version: 0,
         };
         app.apply_global_limits();
         app
@@ -441,7 +417,7 @@ impl App {
             return;
         };
         let hash = d.hash.clone();
-        let actions = details::show(ctx, &mut d, &self.transfers[i], &f, &mut self.ledger, self.history.get(&hash));
+        let actions = details::show(ctx, &mut d, &self.transfers[i], &f, &mut self.ledger, self.speed_hist.get(&hash));
         let mut keep = true;
         for a in actions {
             match a {
@@ -493,7 +469,7 @@ impl App {
                 sites.dedup();
                 // Trailing seconds with nothing arriving, from the per-second history.
                 let idle_secs = self
-                    .history
+                    .speed_hist
                     .get(&hash)
                     .map(|h| h.iter().rev().take_while(|(d, _)| (*d as f64) <= sidebar::ACTIVE_MIBS).count() as u32)
                     .unwrap_or(0);
@@ -587,7 +563,7 @@ impl App {
             let s = t.handle.stats();
             let hash = t.handle.info_hash().as_string();
             let (down, up) = s.live.as_ref().map(|l| (l.download_speed.mbps as f32, l.upload_speed.mbps as f32)).unwrap_or_default();
-            let h = self.history.entry(hash.clone()).or_default();
+            let h = self.speed_hist.entry(hash.clone()).or_default();
             h.push_back((down, up));
             while h.len() > details::HISTORY {
                 h.pop_front();
@@ -784,150 +760,6 @@ impl App {
         });
     }
 
-    /// Top-bar VPN state; a click opens the VPN window.
-    fn vpn_badge(&mut self, ui: &mut egui::Ui) {
-        let green = egui::Color32::from_rgb(90, 200, 120);
-        let (text, color, tip) = match &self.vpn {
-            vpn::Vpn::Off => (
-                "VPN off".to_string(),
-                None,
-                "Torrent traffic goes out directly from this computer. Click to set up the VPN.".to_string(),
-            ),
-            vpn::Vpn::Up { relay, rtt, .. } => {
-                let s = self.vpn.stats().unwrap_or_else(|| unreachable!());
-                (
-                    format!("🔒 VPN  ⬆ {}  ⬇ {}", human(s.bytes_up), human(s.bytes_down)),
-                    Some(green),
-                    format!(
-                        "Encrypted tunnel to {relay} (handshake {} ms), {} connections open.\n\
-                         DHT, local peer discovery and udp:// trackers are off; no incoming peers.",
-                        rtt.as_millis(),
-                        s.connections_active
-                    ),
-                )
-            }
-            vpn::Vpn::Failed(e) => (
-                "VPN DOWN".to_string(),
-                Some(egui::Color32::LIGHT_RED),
-                format!("Kill switch — the torrent engine is stopped until the tunnel is up.\n{e}"),
-            ),
-        };
-        let mut label = egui::RichText::new(text);
-        if let Some(c) = color {
-            label = label.color(c);
-        }
-        if ui.button(label).on_hover_text(tip).clicked() {
-            self.vpn_open = true;
-            self.vpn_edit = self.vpn_settings.clone();
-            self.vpn_note = None;
-            self.vpn_pub = Some(vpn::client_key().map(|k| k.public().to_hex()).map_err(|e| format!("{e:#}")));
-        }
-    }
-
-    fn vpn_window(&mut self, ctx: &egui::Context) {
-        if !self.vpn_open {
-            return;
-        }
-        let mut open = true;
-        egui::Window::new("VPN — IronTunnel")
-            .open(&mut open)
-            .resizable(false)
-            .default_width(540.0)
-            .show(ctx, |ui| {
-                ui.label(
-                    "Torrent traffic — peers, trackers and tracker websites — goes through an encrypted \
-                     tunnel to your relay, so they see the relay's address instead of yours.",
-                );
-                ui.add_space(6.0);
-                ui.checkbox(&mut self.vpn_edit.enabled, "Send torrent traffic through the VPN");
-                egui::Grid::new("vpn_grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
-                    ui.label("Relay");
-                    ui.add(egui::TextEdit::singleline(&mut self.vpn_edit.relay).hint_text("vpn.example.org:1195").desired_width(340.0));
-                    ui.end_row();
-                    ui.label("Relay key");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.vpn_edit.relay_key)
-                            .hint_text("64 hex characters from the relay operator")
-                            .desired_width(340.0),
-                    );
-                    ui.end_row();
-                    ui.label("Your key");
-                    match &self.vpn_pub {
-                        Some(Ok(hex)) => {
-                            ui.horizontal(|ui| {
-                                ui.monospace(format!("{}…{}", &hex[..12], &hex[52..]));
-                                if ui
-                                    .small_button("Copy")
-                                    .on_hover_text("Send this to the relay operator: it goes in the relay's authorized list")
-                                    .clicked()
-                                {
-                                    ui.ctx().copy_text(hex.clone());
-                                }
-                            });
-                        }
-                        Some(Err(e)) => {
-                            ui.colored_label(egui::Color32::LIGHT_RED, e);
-                        }
-                        None => {}
-                    }
-                    ui.end_row();
-                });
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    let valid = self.vpn_edit.check().is_ok();
-                    if ui.add_enabled(valid && !self.vpn_testing, egui::Button::new("Test relay")).clicked() {
-                        self.vpn_testing = true;
-                        let (s, inbox, ctx) = (self.vpn_edit.clone(), self.inbox.clone(), ctx.clone());
-                        self.rt.spawn(async move {
-                            let r = vpn::test(&s).await.map(|d| d.as_millis());
-                            inbox.lock().unwrap().vpn_test = Some(r);
-                            ctx.request_repaint();
-                        });
-                    }
-                    if self.vpn_testing {
-                        ui.spinner();
-                    }
-                    if ui.button("Save").clicked() {
-                        self.vpn_note = Some(match (self.vpn_edit.enabled, self.vpn_edit.check()) {
-                            (true, Err(e)) => e,
-                            _ => match self.vpn_edit.save() {
-                                Ok(()) => {
-                                    self.vpn_settings = self.vpn_edit.clone();
-                                    "Saved.".to_string()
-                                }
-                                Err(e) => format!("Could not save: {e:#}"),
-                            },
-                        });
-                    }
-                    if self.vpn_settings != self.vpn_running
-                        && ui.button("↻ Restart now").on_hover_text("The engine takes the VPN setting at start").clicked()
-                    {
-                        update::relaunch();
-                    }
-                });
-                if let Some(n) = &self.vpn_note {
-                    ui.label(n);
-                }
-                if self.vpn_settings != self.vpn_running {
-                    ui.label(egui::RichText::new("Saved settings apply after a restart.").weak());
-                }
-                ui.separator();
-                ui.label(
-                    egui::RichText::new(
-                        "While the VPN is on: DHT, local peer discovery and udp:// trackers are off (UDP cannot use \
-                         the tunnel), no incoming peers are accepted, and if the relay stops answering nothing is \
-                         downloaded at all. Torrents added with the VPN off are kept separately and return when you \
-                         turn it off. Ratings (OMDb) and update checks still go out directly.",
-                    )
-                    .weak()
-                    .small(),
-                );
-            });
-        if !open {
-            self.vpn_open = false;
-        }
-    }
-
     fn update_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             match self.upd.clone() {
@@ -1001,6 +833,13 @@ impl App {
         }
     }
 
+    fn save_feed_history(&mut self) {
+        self.feed_hist_saved = Instant::now();
+        if let Err(e) = self.feed_hist.save() {
+            self.errors.push(format!("could not save the RSS history: {e:#}"));
+        }
+    }
+
     fn save_feeds(&mut self) {
         if let Err(e) = self.store.save() {
             self.errors.push(format!("could not save feeds: {e:#}"));
@@ -1021,31 +860,21 @@ impl App {
         let inbox = self.inbox.clone();
         let ctx = ctx.clone();
         let http = self.http.clone();
-        // Through the VPN, every torrent loses its udp:// trackers before librqbit sees
-        // it (they would bypass the tunnel), and .torrent URLs are fetched through it.
-        let tunnelled = self.vpn.is_up();
         inbox.lock().unwrap().busy += 1;
         self.rt.spawn(async move {
-            let add = match (source, tunnelled) {
-                (Source::Link(s), false) => Ok(AddTorrent::from_url(s)),
-                (Source::Link(s), true) => vpn::tunnel_link(&http, &s).await,
-                (Source::Bytes(b), false) => Ok(AddTorrent::from_bytes(b)),
-                (Source::Bytes(b), true) => vpn::tunnel_bytes(b),
-                (Source::Fetch { url, cookie }, t) => match rss::fetch_torrent(&http, &url, Some(&cookie)).await {
-                    Ok(b) if t => vpn::tunnel_bytes(b),
-                    Ok(b) => Ok(AddTorrent::from_bytes(b)),
-                    Err(e) => Err(e),
+            let add = match source {
+                Source::Link(s) => AddTorrent::from_url(s),
+                Source::Bytes(b) => AddTorrent::from_bytes(b),
+                Source::Fetch { url, cookie } => match rss::fetch_torrent(&http, &url, Some(&cookie)).await {
+                    Ok(b) => AddTorrent::from_bytes(b),
+                    Err(e) => {
+                        let mut ib = inbox.lock().unwrap();
+                        ib.busy -= 1;
+                        ib.errors.push(format!("{label}: {e:#}"));
+                        ctx.request_repaint();
+                        return;
+                    }
                 },
-            };
-            let add = match add {
-                Ok(a) => a,
-                Err(e) => {
-                    let mut ib = inbox.lock().unwrap();
-                    ib.busy -= 1;
-                    ib.errors.push(format!("{label}: {e:#}"));
-                    ctx.request_repaint();
-                    return;
-                }
             };
             let opts = AddTorrentOptions {
                 output_folder: Some(folder.to_string_lossy().into_owned()),
@@ -1069,13 +898,6 @@ impl App {
     }
 
     fn drain_inbox(&mut self, ctx: &egui::Context) {
-        if let Some(r) = self.inbox.lock().unwrap().vpn_test.take() {
-            self.vpn_testing = false;
-            self.vpn_note = Some(match r {
-                Ok(ms) => format!("Relay answered: authenticated handshake + encrypted ping in {ms} ms."),
-                Err(e) => format!("Relay test failed: {e}"),
-            });
-        }
         let feed_results = std::mem::take(&mut self.inbox.lock().unwrap().feeds);
         let mut dirty = false;
         for (url, res) in feed_results {
@@ -1097,6 +919,9 @@ impl App {
                             *s = stamp.clone();
                         }
                     });
+                    if let Some(name) = self.store.feeds.iter().find(|f| f.url == url).map(|f| f.name.clone()) {
+                        self.feed_hist.absorb(&name, &url, &items, history::now());
+                    }
                     self.fv.items.insert(url, items);
                 }
                 Err(e) => {
@@ -1108,6 +933,10 @@ impl App {
         }
         if dirty {
             self.save_feeds();
+        }
+        // History can be tens of thousands of items: written at most once a minute (and on exit).
+        if self.feed_hist.dirty && self.feed_hist_saved.elapsed() >= Duration::from_secs(60) {
+            self.save_feed_history();
         }
 
         let mut ib = self.inbox.lock().unwrap();
@@ -1140,6 +969,7 @@ impl App {
         }
         if meta_dirty {
             self.meta_cache.save();
+            self.meta_version += 1;
         }
         for (id, res) in ib.posters.drain(..) {
             let tex = res.ok().and_then(|b| poster_texture(ctx, &id, &b));
@@ -1213,6 +1043,52 @@ fn spawn_meta_worker(
     tx
 }
 
+/// Rows drawn at most; past that the list says how many more matched.
+const MAX_ROWS: usize = 300;
+
+const SEARCH_HELP: &str = "Search your feeds:\n\
+    trance live         both words (title counts most)\n\
+    tran                beginnings of words: trance, transmission…\n\
+    tarnce              one typo is forgiven\n\
+    \"group therapy\"     exact phrase\n\
+    -remix              leave out\n\
+    genre:trance        genre or tag   (also cat:music, feed:torrentleech)\n\
+    seeders>10  size<2gb  grabs>=100\n\
+    free                freeleech only\n\
+    Sort by Most active = downloads per hour since ZenTorrent first saw it.";
+
+/// Swarm numbers after a feed item: seeders (coloured by health), leechers,
+/// grabs, activity and freeleech. Only what the feed actually reports.
+fn swarm(ui: &mut egui::Ui, e: &history::Entry, now: u64) {
+    if let Some(s) = e.seeders {
+        let col = if s >= 10 {
+            egui::Color32::from_rgb(90, 200, 120)
+        } else if s >= 1 {
+            egui::Color32::from_rgb(230, 190, 80)
+        } else {
+            egui::Color32::from_rgb(230, 110, 100)
+        };
+        ui.label(egui::RichText::new(format!("{s} seeders")).small().strong().color(col)).on_hover_text(format!(
+            "{s} seeders now{}",
+            if e.max_seeders > s { format!(" · peak {}", e.max_seeders) } else { String::new() }
+        ));
+    }
+    if let Some(l) = e.leechers {
+        ui.label(egui::RichText::new(format!("{l} leechers")).small().weak());
+    }
+    if let Some(g) = e.grabs {
+        ui.label(egui::RichText::new(format!("{g} grabs")).small().weak()).on_hover_text("times downloaded (grabs / snatched)");
+    }
+    if let Some(a) = e.activity(now).filter(|a| *a >= 0.5) {
+        ui.label(egui::RichText::new(format!("+{a:.0}/h")).small().strong().color(egui::Color32::from_rgb(240, 150, 60)))
+            .on_hover_text("downloads per hour since ZenTorrent first saw it");
+    }
+    if e.freeleech {
+        ui.label(egui::RichText::new(" FREE ").small().strong().color(egui::Color32::BLACK).background_color(egui::Color32::from_rgb(90, 200, 120)))
+            .on_hover_text("freeleech: downloading it doesn't count against your ratio");
+    }
+}
+
 /// Small chips after a feed item's title: the tracker's category
 /// ("Movies/HD", "Music/MP3") and, once OMDb knows the title, its genres
 /// ("Action, Sci-Fi" → two chips).
@@ -1235,7 +1111,7 @@ fn tags(ui: &mut egui::Ui, category: &str, genre: &str) {
         } else {
             (egui::Color32::from_rgb(214, 232, 252), egui::Color32::from_rgb(20, 60, 110))
         };
-        chip(ui, g, bg, fg).on_hover_text("genre (IMDb, via OMDb)");
+        chip(ui, g, bg, fg).on_hover_text("genre or tag (from the feed, or IMDb via OMDb)");
     }
 }
 
@@ -1269,7 +1145,6 @@ impl eframe::App for App {
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = &root.ctx().clone();
         self.drain_inbox(ctx);
-        self.vpn_window(ctx);
         let due = match self.fv.last_refresh {
             None => true,
             Some(t) => t.elapsed() >= Duration::from_secs(self.store.refresh_minutes.max(1) * 60),
@@ -1302,8 +1177,6 @@ impl eframe::App for App {
                 ui.selectable_value(&mut self.view, View::Downloads, format!("Downloads ({})", self.transfers.len()));
                 ui.selectable_value(&mut self.view, View::Seeding, "Seeding & ratio");
                 ui.selectable_value(&mut self.view, View::Feeds, format!("RSS feeds ({})", self.store.feeds.len()));
-                ui.add_space(8.0);
-                self.vpn_badge(ui);
                 self.update_ui(ui, ctx);
             });
             ui.add_space(4.0);
@@ -1468,7 +1341,7 @@ impl eframe::App for App {
             if let Some(i) = remove {
                 let t = self.transfers.remove(i);
                 self.ledger.entries.remove(&t.handle.info_hash().as_string());
-                self.history.remove(&t.handle.info_hash().as_string());
+                self.speed_hist.remove(&t.handle.info_hash().as_string());
                 self.save_ledger();
                 if let Some(s) = self.session.clone() {
                     self.rt.spawn(async move {
@@ -1485,6 +1358,9 @@ impl eframe::App for App {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.tick_ledger();
         let _ = self.ledger.save();
+        if self.feed_hist.dirty {
+            let _ = self.feed_hist.save();
+        }
     }
 }
 
@@ -1730,147 +1606,217 @@ impl App {
         }
         ui.separator();
 
-        // ── items ───────────────────────────────────────────────────
-        ui.horizontal(|ui| {
-            ui.label("Filter:");
+        // ── items: search over what the feeds list now, or the whole history ─
+        let live_n = self.feed_hist.entries.iter().filter(|e| e.in_feed).count();
+        let hist_n = self.feed_hist.entries.len();
+        let now = history::now();
+        ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(&mut self.fv.scope_history, false, format!("In the feeds ({live_n})"))
+                .on_hover_text("What your feeds list right now");
+            ui.selectable_value(&mut self.fv.scope_history, true, format!("History ({hist_n})"))
+                .on_hover_text("Everything ZenTorrent has seen in your feeds, also after it scrolled out of them");
+            ui.add_space(8.0);
             ui.add(
-                egui::TextEdit::singleline(&mut self.fv.filter)
-                    .hint_text("title, category or genre")
-                    .desired_width(240.0),
-            );
+                egui::TextEdit::singleline(&mut self.fv.query)
+                    .hint_text("search: trance   genre:trance   seeders>10   size<2gb   -remix   free")
+                    // Leave room for the sort menu in a narrow window.
+                    .desired_width((ui.available_width() - 150.0).clamp(160.0, 420.0)),
+            )
+            .on_hover_text(SEARCH_HELP);
+            egui::ComboBox::from_id_salt("rss-sort").selected_text(self.fv.sort.label()).show_ui(ui, |ui| {
+                for s in search::Sort::ALL {
+                    ui.selectable_value(&mut self.fv.sort, s, s.label());
+                }
+            });
+        });
+        ui.horizontal_wrapped(|ui| {
+            let mut on = self.feed_hist.enabled;
+            if ui
+                .checkbox(&mut on, "Remember every item (history)")
+                .on_hover_text(
+                    "Feeds only list their newest items. With this on, ZenTorrent keeps every item it has seen, \
+                     with its seeders and downloads over time, so search reaches back to the day you switched it on. \
+                     Stored only on this computer.",
+                )
+                .changed()
+            {
+                self.feed_hist.set_enabled(on);
+                self.save_feed_history();
+            }
+            if self.feed_hist.enabled {
+                if let Some(since) = self.feed_hist.since() {
+                    ui.label(
+                        egui::RichText::new(format!("{hist_n} items, collected over {}", history::ago(now.saturating_sub(since))))
+                            .weak()
+                            .small(),
+                    );
+                }
+                if hist_n > live_n && ui.small_button("Clear history").on_hover_text("Forget everything not in a feed right now").clicked() {
+                    self.feed_hist.clear();
+                    self.save_feed_history();
+                }
+            }
             ui.label(egui::RichText::new(format!("saving to {}", self.folder.display())).weak().small());
         });
-        let needle = self.fv.filter.to_lowercase();
-        let feeds: Vec<(String, String, String)> = match self.fv.selected.and_then(|i| self.store.feeds.get(i)) {
-            Some(f) => vec![(f.name.clone(), f.url.clone(), rss::feed_cookie(&f.cookie, &f.url))],
-            None => self
-                .store
-                .feeds
-                .iter()
-                .map(|f| (f.name.clone(), f.url.clone(), rss::feed_cookie(&f.cookie, &f.url)))
-                .collect(),
-        };
-        let mut pick: Option<(rss::Item, String, String)> = None;
+
+        // Search only runs again when something it depends on changed.
+        let sel_key = self.fv.selected.and_then(|i| self.store.feeds.get(i)).map(|f| history::feed_key(&f.url));
+        let key = (self.fv.query.clone(), self.fv.sort, self.fv.scope_history, self.feed_hist.version, sel_key.clone(), self.meta_version);
+        if self.fv.results_key.as_ref() != Some(&key) {
+            let (scope_hist, meta_cache) = (self.fv.scope_history, &self.meta_cache);
+            self.fv.results = search::run(
+                &self.feed_hist.entries,
+                |e| (scope_hist || e.in_feed) && sel_key.as_ref().is_none_or(|k| &e.feed_key == k),
+                &search::parse(&self.fv.query),
+                self.fv.sort,
+                // Films: OMDb's genre (once looked up) is searchable too.
+                |e| meta::guess(&e.title, &e.category).and_then(|q| meta_cache.get(&q.key()).flatten()).map(|i| i.genre).unwrap_or_default(),
+                now,
+            );
+            self.fv.results_key = Some(key);
+        }
+        let total = self.fv.results.len();
+        ui.label(
+            egui::RichText::new(if total > MAX_ROWS {
+                format!("{total} results · showing the first {MAX_ROWS}, narrow the search to see the rest")
+            } else {
+                format!("{total} result{}", if total == 1 { "" } else { "s" })
+            })
+            .weak()
+            .small(),
+        );
+
+        let many_feeds = self.store.feeds.len() > 1 || self.fv.scope_history;
+        let mut pick: Option<usize> = None;
         // Cached ratings always show; NEW lookups stop while the key is refused.
         let ratings_on = self.store.show_ratings && !self.store.omdb_key.trim().is_empty();
         let can_lookup = ratings_on && self.meta_error.is_none();
         let mut to_lookup: Vec<(String, meta::Query)> = Vec::new();
         let mut to_poster: Vec<(String, String)> = Vec::new();
         egui::ScrollArea::vertical().show(ui, |ui| {
-            let mut shown = 0;
-            for (name, url, cookie) in &feeds {
-                let Some(items) = self.fv.items.get(url) else { continue };
-                for it in items {
-                    // Genre is only known once OMDb has answered for this title.
-                    let genre = meta::guess(&it.title, &it.category)
-                        .and_then(|q| self.meta_cache.get(&q.key()).flatten())
-                        .map(|i| i.genre)
-                        .unwrap_or_default();
-                    if !needle.is_empty()
-                        && ![&it.title, &it.category, &genre].iter().any(|s| s.to_lowercase().contains(&needle))
-                    {
-                        continue;
-                    }
-                    shown += 1;
-                    let mut sub = String::new();
-                    if let Some(sz) = it.size {
-                        sub += &human(sz);
-                    }
-                    if !it.date.is_empty() {
-                        sub += &format!("  ·  {}", it.date);
-                    }
-                    if feeds.len() > 1 {
-                        sub += &format!("  ·  {name}");
-                    }
-                    // Ratings: cached answer, or queue a lookup.
-                    let info = match (ratings_on, meta::guess(&it.title, &it.category)) {
-                        (true, Some(q)) => {
-                            let k = q.key();
-                            match self.meta_cache.get(&k) {
-                                Some(found) => found,
-                                None => {
-                                    if can_lookup && !self.meta_pending.contains(&k) && to_lookup.len() < 40 {
-                                        to_lookup.push((k, q));
-                                    }
-                                    None
-                                }
-                            }
-                        }
-                        _ => None,
-                    };
-                    let Some(info) = info else {
-                        ui.horizontal(|ui| {
-                            if ui.small_button("⬇").on_hover_text("Download").clicked() {
-                                pick = Some((it.clone(), cookie.clone(), url.clone()));
-                            }
-                            ui.label(&it.title);
-                            tags(ui, &it.category, &genre);
-                            ui.label(egui::RichText::new(&sub).weak().small());
-                        });
-                        continue;
-                    };
-                    ui.horizontal(|ui| {
-                        if ui.small_button("⬇").on_hover_text("Download").clicked() {
-                            pick = Some((it.clone(), cookie.clone(), url.clone()));
-                        }
-                        let (w, h) = (46.0, 68.0);
-                        match self.textures.get(&info.imdb_id) {
-                            Some(Some(t)) => {
-                                ui.add(egui::Image::new(t).fit_to_exact_size(egui::vec2(w, h)).corner_radius(3.0));
-                            }
-                            other => {
-                                let (r, _) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
-                                ui.painter().rect_filled(r, 3.0, ui.visuals().faint_bg_color);
-                                if other.is_none() {
-                                    if let Some(p) = &info.poster {
-                                        to_poster.push((info.imdb_id.clone(), p.clone()));
-                                    }
-                                }
-                            }
-                        }
-                        ui.vertical(|ui| {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.strong(format!("{} ({})", info.title, info.year));
-                                tags(ui, &it.category, &info.genre);
-                            });
-                            ui.horizontal_wrapped(|ui| {
-                                if let Some(r) = info.imdb_rating {
-                                    ui.label(
-                                        egui::RichText::new(format!(" IMDb {r:.1} "))
-                                            .strong()
-                                            .color(egui::Color32::BLACK)
-                                            .background_color(egui::Color32::from_rgb(245, 197, 24)),
-                                    )
-                                    .on_hover_text(format!("{} votes", info.imdb_votes));
-                                }
-                                if let Some(t) = info.rotten {
-                                    let (bg, word) = if t >= 60 {
-                                        (egui::Color32::from_rgb(250, 80, 50), "Fresh")
-                                    } else {
-                                        (egui::Color32::from_rgb(110, 170, 60), "Rotten")
-                                    };
-                                    ui.label(
-                                        egui::RichText::new(format!(" Rotten Tomatoes {t}% "))
-                                            .strong()
-                                            .color(egui::Color32::WHITE)
-                                            .background_color(bg),
-                                    )
-                                    .on_hover_text(format!("Tomatometer: {word}"));
-                                }
-                                if let Some(m) = info.metascore {
-                                    ui.label(egui::RichText::new(format!("Metascore {m}")).small());
-                                }
-                                ui.hyperlink_to("IMDb page", info.imdb_url());
-                            });
-                            ui.label(egui::RichText::new(format!("{}   {sub}", it.title)).weak().small())
-                                .on_hover_text(if info.plot.is_empty() { "—".to_string() } else { info.plot.clone() });
-                        });
-                    });
-                    ui.add_space(2.0);
+            for &i in self.fv.results.iter().take(MAX_ROWS) {
+                let e = &self.feed_hist.entries[i];
+                // Genre is only known once OMDb has answered for this title; feed tags show next to it.
+                let omdb_genre = meta::guess(&e.title, &e.category)
+                    .and_then(|q| self.meta_cache.get(&q.key()).flatten())
+                    .map(|i| i.genre)
+                    .unwrap_or_default();
+                let genre = [omdb_genre, e.tags.iter().take(4).cloned().collect::<Vec<_>>().join(", ")]
+                    .into_iter()
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let mut sub = String::new();
+                if let Some(sz) = e.size {
+                    sub += &human(sz);
                 }
+                if !e.date.is_empty() {
+                    sub += &format!("  ·  {}", e.date);
+                } else {
+                    sub += &format!("  ·  seen {} ago", history::ago(now.saturating_sub(e.first_seen)));
+                }
+                if many_feeds {
+                    sub += &format!("  ·  {}", e.feed);
+                }
+                // Ratings: cached answer, or queue a lookup.
+                let info = match (ratings_on, meta::guess(&e.title, &e.category)) {
+                    (true, Some(q)) => {
+                        let k = q.key();
+                        match self.meta_cache.get(&k) {
+                            Some(found) => found,
+                            None => {
+                                if can_lookup && !self.meta_pending.contains(&k) && to_lookup.len() < 40 {
+                                    to_lookup.push((k, q));
+                                }
+                                None
+                            }
+                        }
+                    }
+                    _ => None,
+                };
+                let Some(info) = info else {
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.small_button("⬇").on_hover_text("Download").clicked() {
+                            pick = Some(i);
+                        }
+                        ui.label(&e.title).on_hover_text(if e.description.is_empty() { "—" } else { e.description.as_str() });
+                        tags(ui, &e.category, &genre);
+                        swarm(ui, e, now);
+                        ui.label(egui::RichText::new(&sub).weak().small());
+                    });
+                    continue;
+                };
+                ui.horizontal(|ui| {
+                    if ui.small_button("⬇").on_hover_text("Download").clicked() {
+                        pick = Some(i);
+                    }
+                    let (w, h) = (46.0, 68.0);
+                    match self.textures.get(&info.imdb_id) {
+                        Some(Some(t)) => {
+                            ui.add(egui::Image::new(t).fit_to_exact_size(egui::vec2(w, h)).corner_radius(3.0));
+                        }
+                        other => {
+                            let (r, _) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
+                            ui.painter().rect_filled(r, 3.0, ui.visuals().faint_bg_color);
+                            if other.is_none() {
+                                if let Some(p) = &info.poster {
+                                    to_poster.push((info.imdb_id.clone(), p.clone()));
+                                }
+                            }
+                        }
+                    }
+                    ui.vertical(|ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.strong(format!("{} ({})", info.title, info.year));
+                            tags(ui, &e.category, &genre);
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            if let Some(r) = info.imdb_rating {
+                                ui.label(
+                                    egui::RichText::new(format!(" IMDb {r:.1} "))
+                                        .strong()
+                                        .color(egui::Color32::BLACK)
+                                        .background_color(egui::Color32::from_rgb(245, 197, 24)),
+                                )
+                                .on_hover_text(format!("{} votes", info.imdb_votes));
+                            }
+                            if let Some(t) = info.rotten {
+                                let (bg, word) = if t >= 60 {
+                                    (egui::Color32::from_rgb(250, 80, 50), "Fresh")
+                                } else {
+                                    (egui::Color32::from_rgb(110, 170, 60), "Rotten")
+                                };
+                                ui.label(
+                                    egui::RichText::new(format!(" Rotten Tomatoes {t}% "))
+                                        .strong()
+                                        .color(egui::Color32::WHITE)
+                                        .background_color(bg),
+                                )
+                                .on_hover_text(format!("Tomatometer: {word}"));
+                            }
+                            if let Some(m) = info.metascore {
+                                ui.label(egui::RichText::new(format!("Metascore {m}")).small());
+                            }
+                            ui.hyperlink_to("IMDb page", info.imdb_url());
+                            swarm(ui, e, now);
+                        });
+                        ui.label(egui::RichText::new(format!("{}   {sub}", e.title)).weak().small())
+                            .on_hover_text(if info.plot.is_empty() { "—".to_string() } else { info.plot.clone() });
+                    });
+                });
+                ui.add_space(2.0);
             }
-            if shown == 0 {
-                ui.label(egui::RichText::new(if self.fv.in_flight > 0 { "Reading feeds…" } else { "No items." }).weak());
+            if total == 0 {
+                let msg = if self.fv.in_flight > 0 && live_n == 0 {
+                    "Reading feeds…".to_string()
+                } else if !self.fv.query.trim().is_empty() {
+                    format!("Nothing matches “{}”.", self.fv.query.trim())
+                } else if self.fv.scope_history && !self.feed_hist.enabled {
+                    "History is off: tick “Remember every item” to start collecting.".to_string()
+                } else {
+                    "No items.".to_string()
+                };
+                ui.label(egui::RichText::new(msg).weak());
             }
         });
         let mut spent = false;
@@ -1893,10 +1839,18 @@ impl App {
             self.textures.insert(imdb_id.clone(), None);
             let _ = self.meta_jobs.send(MetaJob::Poster { imdb_id, url });
         }
-        if let Some((it, cookie, url)) = pick {
-            self.fv.last_pick = Some(url);
-            self.fv.status.insert(self.fv.last_pick.clone().unwrap(), format!("starting “{}” — see Downloads", it.title));
-            self.start(ctx, it.title.clone(), Source::from_feed(it.link, &cookie));
+        if let Some(i) = pick {
+            // The feed's log-in cookie; a feed removed since has none.
+            let e = &self.feed_hist.entries[i];
+            let feed = self.store.feeds.iter().find(|f| history::feed_key(&f.url) == e.feed_key);
+            let cookie = feed.map(|f| rss::feed_cookie(&f.cookie, &f.url)).unwrap_or_default();
+            let feed_url = feed.map(|f| f.url.clone());
+            let (title, link) = (e.title.clone(), e.link.clone());
+            if let Some(u) = feed_url {
+                self.fv.status.insert(u.clone(), format!("starting “{title}” — see Downloads"));
+                self.fv.last_pick = Some(u);
+            }
+            self.start(ctx, title, Source::from_feed(link, &cookie));
         }
     }
 }
