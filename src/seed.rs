@@ -24,6 +24,9 @@ pub struct Entry {
     /// a second time, so a manual Resume sticks.
     #[serde(default)]
     pub goal_reached: bool,
+    /// The user's labels on this torrent (sidebar → Labels).
+    #[serde(default)]
+    pub labels: Vec<String>,
     /// librqbit's per-run counter as last seen (not saved: a new run starts at 0).
     #[serde(skip)]
     pub seen: u64,
@@ -56,11 +59,15 @@ pub struct Ledger {
     pub hours_goal: f64,
     #[serde(default)]
     pub entries: HashMap<String, Entry>,
+    /// Every label the user made, in the order they made them (kept even
+    /// when no torrent carries it yet).
+    #[serde(default)]
+    pub labels: Vec<String>,
 }
 
 impl Default for Ledger {
     fn default() -> Self {
-        Self { ratio_goal: 0.0, hours_goal: 0.0, entries: HashMap::new() }
+        Self { ratio_goal: 0.0, hours_goal: 0.0, entries: HashMap::new(), labels: Vec::new() }
     }
 }
 
@@ -91,7 +98,36 @@ impl Ledger {
 
     /// The goal settings without the entries (cheap copy for borrow-free checks).
     pub fn clone_goals(&self) -> Ledger {
-        Ledger { ratio_goal: self.ratio_goal, hours_goal: self.hours_goal, entries: HashMap::new() }
+        Ledger { ratio_goal: self.ratio_goal, hours_goal: self.hours_goal, ..Default::default() }
+    }
+
+    /// The ratio below which a finished private torrent "needs seeding":
+    /// the user's ratio goal, or 1.0 when no goal is set.
+    pub fn ratio_floor(&self) -> f64 {
+        if self.ratio_goal > 0.0 { self.ratio_goal } else { 1.0 }
+    }
+
+    /// Tag or un-tag a torrent; tagging also registers the label.
+    pub fn set_label(&mut self, hash: &str, label: &str, on: bool) {
+        if on && !self.labels.iter().any(|l| l == label) {
+            self.labels.push(label.to_string());
+        }
+        let e = self.entries.entry(hash.to_string()).or_default();
+        if on {
+            if !e.labels.iter().any(|l| l == label) {
+                e.labels.push(label.to_string());
+            }
+        } else {
+            e.labels.retain(|l| l != label);
+        }
+    }
+
+    /// Delete a label everywhere.
+    pub fn delete_label(&mut self, label: &str) {
+        self.labels.retain(|l| l != label);
+        for e in self.entries.values_mut() {
+            e.labels.retain(|l| l != label);
+        }
     }
 
     /// Has this finished torrent met the seed goal?
@@ -158,5 +194,25 @@ mod tests {
         assert_eq!(back.entries["ab"].uploaded, 5);
         assert_eq!(back.entries["ab"].seen, 0);
         assert_eq!(duration(90061), "1d 1h");
+    }
+
+    #[test]
+    fn labels_round_trip_and_old_ledgers_still_load() {
+        // A ratio.json written by 0.5.x has no labels anywhere.
+        let old = br#"{"ratio_goal":0.0,"hours_goal":0.0,"entries":{"ab":{"name":"x","folder":"/d","size":10,"uploaded":1,"seed_secs":0,"private":true}}}"#;
+        let mut l: Ledger = serde_json::from_slice(old).unwrap();
+        assert!(l.labels.is_empty() && l.entries["ab"].labels.is_empty());
+        l.set_label("ab", "film", true);
+        l.set_label("ab", "film", true);
+        assert_eq!(l.entries["ab"].labels, ["film"]);
+        assert_eq!(l.labels, ["film"]);
+        let back: Ledger = serde_json::from_slice(&serde_json::to_vec(&l).unwrap()).unwrap();
+        assert_eq!(back.entries["ab"].labels, ["film"]);
+        l.set_label("ab", "film", false);
+        assert!(l.entries["ab"].labels.is_empty() && l.labels == ["film"], "un-tag keeps the label");
+        l.set_label("ab", "film", true);
+        l.delete_label("film");
+        assert!(l.labels.is_empty() && l.entries["ab"].labels.is_empty());
+        assert_eq!(l.ratio_floor(), 1.0);
     }
 }

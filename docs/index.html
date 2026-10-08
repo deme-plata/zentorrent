@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ZenTorrent</title>
+<meta name="description" content="ZenTorrent — a fast, ad-free desktop BitTorrent client in Rust (egui + librqbit). The swarm, live in three.js.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #05070b;
+    --fg: #e8eef7;
+    --muted: #8b98ab;
+    --down: #4682dc;
+    --up: #3caa5a;
+    --priv: #aa78e6;
+    --card: rgba(14, 19, 28, 0.72);
+    --line: rgba(140, 160, 190, 0.18);
+  }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) { --bg: #05070b; }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); overflow: hidden; }
+  body { font-family: "Space Grotesk", system-ui, sans-serif; }
+  canvas { display: block; position: fixed; inset: 0; }
+  .vignette { position: fixed; inset: 0; pointer-events: none;
+    background: radial-gradient(ellipse 60% 45% at 12% 8%, rgba(5,7,11,.85), transparent 70%),
+                radial-gradient(ellipse 60% 35% at 10% 100%, rgba(5,7,11,.8), transparent 70%); }
+  .hud { position: fixed; inset: 0; pointer-events: none; display: flex; flex-direction: column; justify-content: space-between; padding: clamp(16px, 4vw, 48px); }
+  .brand { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
+  .brand h1 { margin: 0; font-size: clamp(34px, 7vw, 76px); font-weight: 700; letter-spacing: -0.03em; line-height: 1;
+    background: linear-gradient(100deg, #fff 0%, #9cc3ff 45%, #8ef0b0 100%); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .brand .bolt { font-size: clamp(30px, 6vw, 64px); filter: drop-shadow(0 0 18px rgba(255, 210, 90, .6)); }
+  .tag { margin: 10px 0 0; color: var(--muted); font-size: clamp(14px, 2vw, 19px); max-width: 560px; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; pointer-events: auto; }
+  .btn { font: 600 14px "Space Grotesk", sans-serif; color: var(--fg); text-decoration: none; padding: 10px 16px; border-radius: 10px;
+    border: 1px solid var(--line); background: var(--card); backdrop-filter: blur(8px); transition: transform .15s, border-color .15s; }
+  .btn:hover { transform: translateY(-1px); border-color: rgba(156, 195, 255, .6); }
+  .btn.primary { background: linear-gradient(100deg, rgba(70,130,220,.9), rgba(60,170,90,.9)); border-color: transparent; }
+  .legend { display: flex; gap: 16px; flex-wrap: wrap; font: 400 12px "JetBrains Mono", monospace; color: var(--muted); }
+  .legend i { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; vertical-align: 0; }
+  .stats { font: 600 13px "JetBrains Mono", monospace; display: flex; gap: 18px; flex-wrap: wrap; }
+  .stats .d { color: #7fb0ff; } .stats .u { color: #74d896; }
+  body.capture .row, body.capture .legend { display: none; }
+</style>
+</head>
+<body>
+<div class="vignette"></div>
+<div class="hud">
+  <div>
+    <div class="brand"><span class="bolt">⚡</span><h1>ZenTorrent</h1></div>
+    <p class="tag">A fast, ad-free desktop BitTorrent client in Rust. Built on the Flux toolchain.</p>
+  </div>
+  <div>
+    <div class="stats" id="stats"><span class="d">⬇ 0.0 MB/s</span><span class="u">⬆ 0.0 MB/s</span><span id="peers">peers 0</span></div>
+    <div style="height:12px"></div>
+    <div class="legend"><span><i style="background:var(--up)"></i>seeders</span><span><i style="background:var(--down)"></i>leechers</span><span><i style="background:var(--priv)"></i>private tracker</span><span><i style="background:#ffd25a"></i>you</span></div>
+    <div style="height:14px"></div>
+    <div class="row">
+      <a class="btn primary" href="https://github.com/deme-plata/zentorrent#install">Download</a>
+      <a class="btn" href="https://github.com/deme-plata/zentorrent">Source on GitHub</a>
+    </div>
+  </div>
+</div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+<script type="module">
+import * as THREE from "three";
+import { EffectComposer } from "three/addons/postprocessing/EffectComposer.js";
+import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
+import { UnrealBloomPass } from "three/addons/postprocessing/UnrealBloomPass.js";
+import { OutputPass } from "three/addons/postprocessing/OutputPass.js";
+
+// ?t=<seconds> renders one frame at that time (used to render the README GIF).
+const q = new URLSearchParams(location.search);
+const FIXED_T = q.has("t") ? parseFloat(q.get("t")) : null;
+if (FIXED_T !== null) document.body.classList.add("capture");
+const PERIOD = 8; // seconds — every motion is periodic in this, so the loop is seamless
+const TAU = Math.PI * 2;
+
+// Seeded RNG: the swarm looks the same on every load and every captured frame.
+let seed = 0x5eed2026;
+const rnd = () => { seed |= 0; seed = (seed + 0x6d2b79f5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+  t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: FIXED_T !== null });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+document.body.prepend(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.fog = new THREE.FogExp2(0x05070b, 0.035);
+const camera = new THREE.PerspectiveCamera(48, innerWidth / innerHeight, 0.1, 200);
+
+const COL = { down: new THREE.Color(0x4682dc), up: new THREE.Color(0x3caa5a), priv: new THREE.Color(0xaa78e6), you: new THREE.Color(0xffd25a) };
+
+// ── the core: you ────────────────────────────────────────────────
+const world = new THREE.Group();
+scene.add(world);
+const core = new THREE.Mesh(new THREE.IcosahedronGeometry(0.9, 1),
+  new THREE.MeshBasicMaterial({ color: 0xffd25a, wireframe: true, transparent: true, opacity: 0.9 }));
+const coreGlow = new THREE.Mesh(new THREE.SphereGeometry(0.55, 32, 32), new THREE.MeshBasicMaterial({ color: 0xfff1c4 }));
+world.add(core, coreGlow);
+
+// ── piece map ring: 96 pieces shimmering as they verify ──────────
+const PIECES = 96;
+const pieceGeo = new THREE.BoxGeometry(0.11, 0.05, 0.22);
+const pieceMat = new THREE.MeshBasicMaterial({ vertexColors: false });
+const ring = new THREE.InstancedMesh(pieceGeo, pieceMat, PIECES);
+const pieceSeed = Array.from({ length: PIECES }, () => rnd());
+const dummy = new THREE.Object3D();
+for (let i = 0; i < PIECES; i++) {
+  const a = (i / PIECES) * TAU;
+  dummy.position.set(Math.cos(a) * 1.9, 0, Math.sin(a) * 1.9);
+  dummy.rotation.set(0, -a, 0);
+  dummy.updateMatrix();
+  ring.setMatrixAt(i, dummy.matrix);
+  ring.setColorAt(i, new THREE.Color(0x1a2333));
+}
+ring.rotation.x = 0.35;
+world.add(ring);
+
+// ── peers on a shell ─────────────────────────────────────────────
+const N = 160;
+const peers = [];
+const peerGeo = new THREE.SphereGeometry(1, 12, 12);
+for (let i = 0; i < N; i++) {
+  // Fibonacci sphere + jitter, flattened a little into a galaxy-ish disc.
+  const y = 1 - (i / (N - 1)) * 2, r = Math.sqrt(1 - y * y), th = i * 2.399963 + rnd() * 0.4;
+  const R = 5.2 + rnd() * 3.2;
+  const p = new THREE.Vector3(Math.cos(th) * r * R, y * R * 0.55, Math.sin(th) * r * R);
+  const kind = rnd() < 0.18 ? "priv" : rnd() < 0.55 ? "up" : "down";
+  const size = 0.03 + rnd() * 0.05;
+  const m = new THREE.Mesh(peerGeo, new THREE.MeshBasicMaterial({ color: COL[kind] }));
+  m.scale.setScalar(size);
+  m.position.copy(p);
+  world.add(m);
+  peers.push({ p, kind, size, m, phase: rnd() });
+}
+
+// Faint links from the core to the peers you are talking to.
+const active = peers.filter((_, i) => i % 3 === 0);
+const linkPos = new Float32Array(active.length * 6);
+active.forEach((pe, i) => linkPos.set([0, 0, 0, pe.p.x, pe.p.y, pe.p.z], i * 6));
+const linkGeo = new THREE.BufferGeometry();
+linkGeo.setAttribute("position", new THREE.BufferAttribute(linkPos, 3));
+world.add(new THREE.LineSegments(linkGeo, new THREE.LineBasicMaterial({ color: 0x3a4a66, transparent: true, opacity: 0.35 })));
+
+// ── pieces in flight: blue in (download), green out (upload) ─────
+const FLIGHTS = 220;
+const flights = [];
+const fGeo = new THREE.BufferGeometry();
+const fPos = new Float32Array(FLIGHTS * 3), fCol = new Float32Array(FLIGHTS * 3);
+for (let i = 0; i < FLIGHTS; i++) {
+  const pe = active[Math.floor(rnd() * active.length)];
+  const incoming = pe.kind !== "down" ? rnd() < 0.72 : rnd() < 0.2;
+  const mid = pe.p.clone().multiplyScalar(0.5).add(new THREE.Vector3((rnd() - .5) * 2.4, 1.2 + rnd() * 1.6, (rnd() - .5) * 2.4));
+  const curve = incoming ? new THREE.QuadraticBezierCurve3(pe.p, mid, new THREE.Vector3()) : new THREE.QuadraticBezierCurve3(new THREE.Vector3(), mid, pe.p);
+  // Integer laps per period keeps the loop seamless.
+  flights.push({ curve, laps: 1 + Math.floor(rnd() * 2), off: rnd(), col: incoming ? COL.down : (pe.kind === "priv" ? COL.priv : COL.up), incoming });
+}
+fGeo.setAttribute("position", new THREE.BufferAttribute(fPos, 3));
+fGeo.setAttribute("color", new THREE.BufferAttribute(fCol, 3));
+const dotTex = (() => { const c = document.createElement("canvas"); c.width = c.height = 64; const g = c.getContext("2d");
+  const gr = g.createRadialGradient(32, 32, 0, 32, 32, 32); gr.addColorStop(0, "rgba(255,255,255,1)"); gr.addColorStop(0.35, "rgba(255,255,255,.55)"); gr.addColorStop(1, "rgba(255,255,255,0)");
+  g.fillStyle = gr; g.fillRect(0, 0, 64, 64); return new THREE.CanvasTexture(c); })();
+world.add(new THREE.Points(fGeo, new THREE.PointsMaterial({ size: 0.22, map: dotTex, vertexColors: true, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending })));
+
+// ── starfield ────────────────────────────────────────────────────
+const stars = new THREE.BufferGeometry();
+const sp = new Float32Array(1400 * 3);
+for (let i = 0; i < 1400; i++) { const v = new THREE.Vector3(rnd() - .5, rnd() - .5, rnd() - .5).normalize().multiplyScalar(40 + rnd() * 50); sp.set([v.x, v.y, v.z], i * 3); }
+stars.setAttribute("position", new THREE.BufferAttribute(sp, 3));
+scene.add(new THREE.Points(stars, new THREE.PointsMaterial({ size: 0.12, color: 0x6c7a94, transparent: true, opacity: .7 })));
+
+// ── post: bloom ──────────────────────────────────────────────────
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.85, 0.5, 0.18);
+composer.addPass(bloom);
+composer.addPass(new OutputPass());
+
+let mx = 0, my = 0;
+addEventListener("pointermove", e => { mx = e.clientX / innerWidth - .5; my = e.clientY / innerHeight - .5; });
+addEventListener("resize", () => { camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); composer.setSize(innerWidth, innerHeight); });
+
+const statsEl = document.getElementById("stats");
+const tmp = new THREE.Vector3(), tmpC = new THREE.Color();
+
+function frame(t) {
+  const ph = (t % PERIOD) / PERIOD;            // 0..1 over one loop
+  const ang = ph * TAU;
+  // The camera drifts around the swarm once per period (plus mouse parallax live).
+  const cr = 17;
+  camera.position.set(Math.sin(ang) * 2.5 + mx * 3, 3.2 + Math.sin(ang) * 0.6 - my * 2, cr);
+  // In the wide README banner the swarm sits right of the wordmark.
+  camera.lookAt(FIXED_T !== null ? -4.2 : 0, FIXED_T !== null ? 0.4 : -0.3, 0);
+  // The swarm has no symmetry, so a seamless loop needs exactly one full turn per period.
+  world.rotation.y = ang;
+  core.rotation.set(ang, ang * 2, 0);
+  const pulse = 1 + 0.08 * Math.sin(ang * 3);
+  coreGlow.scale.setScalar(pulse);
+
+  // Piece map: each piece lights blue → green in a wave, periodic.
+  for (let i = 0; i < PIECES; i++) {
+    const w = 0.5 + 0.5 * Math.sin(ang * 2 - (i / PIECES) * TAU * 2 + pieceSeed[i] * 1.5);
+    tmpC.copy(COL.down).lerp(COL.up, w).multiplyScalar(0.35 + 0.9 * w * w);
+    ring.setColorAt(i, tmpC);
+  }
+  ring.instanceColor.needsUpdate = true;
+
+  // Peers breathe.
+  for (const pe of peers) pe.m.scale.setScalar(pe.size * (1 + 0.35 * Math.sin(ang * 2 + pe.phase * TAU)));
+
+  // Pieces in flight.
+  let down = 0, up = 0;
+  flights.forEach((f, i) => {
+    const s = (ph * f.laps + f.off) % 1;
+    f.curve.getPoint(s, tmp);
+    fPos.set([tmp.x, tmp.y, tmp.z], i * 3);
+    const fade = Math.sin(s * Math.PI);
+    fCol.set([f.col.r * fade, f.col.g * fade, f.col.b * fade], i * 3);
+    if (f.incoming) down += fade; else up += fade;
+  });
+  fGeo.attributes.position.needsUpdate = true;
+  fGeo.attributes.color.needsUpdate = true;
+
+  statsEl.innerHTML = `<span class="d">⬇ ${(down * 0.31).toFixed(1)} MB/s</span><span class="u">⬆ ${(up * 0.22).toFixed(1)} MB/s</span><span>peers ${active.length} / ${N}</span>`;
+  composer.render();
+}
+
+if (FIXED_T !== null) {
+  // Keep presenting the same instant: a headless compositor may skip a lone first frame.
+  renderer.setAnimationLoop(() => frame(FIXED_T));
+  document.title = "ready";
+} else {
+  const t0 = performance.now();
+  renderer.setAnimationLoop(() => frame((performance.now() - t0) / 1000));
+}
+</script>
+</body>
+</html>

@@ -2,8 +2,7 @@
 //!
 //! egui for the window, librqbit for the BitTorrent engine (DHT, trackers,
 //! peers, piece verification), rfd for the native file/folder pickers.
-//! A Linux catalog resolves the *current* official release torrents at
-//! startup, so the list never goes stale.
+//! The left sidebar (`sidebar.rs`) filters the list by status, tracker and label.
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
@@ -24,12 +23,11 @@ type ManagedTorrentHandle = Arc<ManagedTorrent>;
 /// How soon a feed that failed to load is tried again.
 const FEED_RETRY: Duration = Duration::from_secs(60);
 
-mod catalog;
 mod meta;
 mod rss;
 mod seed;
+mod sidebar;
 mod update;
-use catalog::CatalogEntry;
 
 fn main() -> eframe::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -204,7 +202,6 @@ struct Transfer {
 struct Inbox {
     added: Vec<Transfer>,
     errors: Vec<String>,
-    catalog: Option<Vec<CatalogEntry>>,
     /// (feed url, items or error)
     feeds: Vec<(String, Result<Vec<rss::Item>, String>)>,
     update: Option<Upd>,
@@ -261,8 +258,6 @@ struct App {
     session_error: Option<String>,
     inbox: Arc<Mutex<Inbox>>,
     transfers: Vec<Transfer>,
-    catalog: Vec<CatalogEntry>,
-    catalog_loading: bool,
     folder: PathBuf,
     link: String,
     errors: Vec<String>,
@@ -281,6 +276,9 @@ struct App {
     textures: HashMap<String, Option<egui::TextureHandle>>,
     last_tick: Instant,
     last_ledger_save: Instant,
+    sidebar: sidebar::Sidebar,
+    /// Per-transfer facts for this frame, same order as `transfers`.
+    facts: Vec<sidebar::Facts>,
 }
 
 impl App {
@@ -305,15 +303,6 @@ impl App {
             };
 
         let inbox = Arc::new(Mutex::new(Inbox::default()));
-        {
-            let inbox = inbox.clone();
-            let ctx = cc.egui_ctx.clone();
-            rt.spawn(async move {
-                let entries = catalog::resolve_all().await;
-                inbox.lock().unwrap().catalog = Some(entries);
-                ctx.request_repaint();
-            });
-        }
 
         // Torrents restored from the previous run.
         let ledger = seed::Ledger::load();
@@ -341,8 +330,6 @@ impl App {
             session_error,
             inbox,
             transfers,
-            catalog: Vec::new(),
-            catalog_loading: true,
             folder,
             link: String::new(),
             errors: Vec::new(),
@@ -361,7 +348,98 @@ impl App {
             textures: HashMap::new(),
             last_tick: Instant::now(),
             last_ledger_save: Instant::now(),
+            sidebar: Default::default(),
+            facts: Vec::new(),
         }
+    }
+
+    /// What the sidebar needs to know about every transfer, read once per frame.
+    fn collect_facts(&self) -> Vec<sidebar::Facts> {
+        self.transfers
+            .iter()
+            .map(|t| {
+                let s = t.handle.stats();
+                let hash = t.handle.info_hash().as_string();
+                let e = self.ledger.entries.get(&hash);
+                let (down, up) = s.live.as_ref().map(|l| (l.download_speed.mbps, l.upload_speed.mbps)).unwrap_or_default();
+                // Hosts only: private announce URLs carry the passkey.
+                let mut sites: Vec<String> =
+                    t.handle.shared().trackers.iter().filter_map(|u| u.host_str().map(sidebar::site)).collect();
+                sites.sort();
+                sites.dedup();
+                sidebar::Facts {
+                    name: t.name.clone(),
+                    finished: s.finished,
+                    paused: t.handle.is_paused(),
+                    error: s.error.is_some(),
+                    live: s.live.is_some(),
+                    down_mibs: down,
+                    up_mibs: up,
+                    private: e.is_some_and(|e| e.private),
+                    ratio: e.map(|e| e.ratio()).unwrap_or(0.0),
+                    uploaded: e.map(|e| e.uploaded).unwrap_or(0),
+                    size: s.total_bytes.max(e.map(|e| e.size).unwrap_or(0)),
+                    sites,
+                    labels: e.map(|e| e.labels.clone()).unwrap_or_default(),
+                    hash,
+                }
+            })
+            .collect()
+    }
+
+    /// Is transfer `i` shown under the sidebar's current filter?
+    fn visible(&self, i: usize) -> bool {
+        let floor = self.ledger.ratio_floor();
+        self.facts.get(i).is_none_or(|f| self.sidebar.filter.matches(f, floor))
+    }
+
+    fn sidebar_actions(&mut self, actions: Vec<sidebar::Action>) {
+        use sidebar::Action;
+        let mut save = false;
+        for a in actions {
+            match a {
+                Action::Show => {
+                    if self.view == View::Feeds {
+                        self.view = View::Downloads;
+                    }
+                }
+                Action::Pause(hash) => self.set_paused(&hash, true),
+                Action::Resume(hash) => self.set_paused(&hash, false),
+                Action::Tag(hash, label) => {
+                    self.ledger.set_label(&hash, &label, true);
+                    save = true;
+                }
+                Action::NewLabel(label) => {
+                    if !self.ledger.labels.contains(&label) {
+                        self.ledger.labels.push(label);
+                        save = true;
+                    }
+                }
+                Action::DeleteLabel(label) => {
+                    self.ledger.delete_label(&label);
+                    if self.sidebar.filter.label.as_ref() == Some(&label) {
+                        self.sidebar.filter.label = None;
+                    }
+                    save = true;
+                }
+            }
+        }
+        if save {
+            self.save_ledger();
+        }
+    }
+
+    /// Pause or resume one torrent by info-hash (from a sidebar drop).
+    fn set_paused(&self, hash: &str, pause: bool) {
+        let Some(sess) = self.session.clone() else { return };
+        let Some(t) = self.transfers.iter().find(|t| t.handle.info_hash().as_string() == hash) else { return };
+        if t.handle.is_paused() == pause {
+            return;
+        }
+        let h = t.handle.clone();
+        self.rt.spawn(async move {
+            let _ = if pause { sess.pause(&h).await } else { sess.unpause(&h).await };
+        });
     }
 
     /// Once a second: fold upload counters into the ledger, count seed
@@ -484,7 +562,10 @@ impl App {
                     ui.strong(h);
                 }
                 ui.end_row();
-                for t in &self.transfers {
+                for (i, t) in self.transfers.iter().enumerate() {
+                    if !self.visible(i) {
+                        continue;
+                    }
                     let s = t.handle.stats();
                     let hash = t.handle.info_hash().as_string();
                     let e = self.ledger.entries.get(&hash).cloned().unwrap_or_default();
@@ -644,8 +725,14 @@ impl App {
 
     /// Start a torrent in the background. `source` is a magnet link, an
     /// http(s) URL to a .torrent file, or the raw bytes of a .torrent file.
-    fn start(&self, ctx: &egui::Context, label: String, source: Source) {
-        let Some(session) = self.session.clone() else { return };
+    fn start(&mut self, ctx: &egui::Context, label: String, source: Source) {
+        // Never a silent no-op: if the engine did not start, every Download
+        // button would otherwise do nothing at all.
+        let Some(session) = self.session.clone() else {
+            let why = self.session_error.clone().unwrap_or_else(|| "the torrent engine is not running".into());
+            self.errors.push(format!("{label}: can't start — {why}"));
+            return;
+        };
         let folder = self.folder.clone();
         let inbox = self.inbox.clone();
         let ctx = ctx.clone();
@@ -783,10 +870,6 @@ impl App {
             }
         }
         self.errors.extend(ib.errors.drain(..));
-        if let Some(c) = ib.catalog.take() {
-            self.catalog = c;
-            self.catalog_loading = false;
-        }
     }
 }
 
@@ -968,32 +1051,18 @@ impl eframe::App for App {
             ui.add_space(6.0);
         });
 
-        egui::Panel::left("catalog").resizable(false).exact_size(250.0).show(root, |ui| {
-            ui.add_space(6.0);
-            ui.strong("🐧 Linux downloads");
-            ui.label(egui::RichText::new("Official release torrents, resolved live").weak().small());
-            ui.separator();
-            if self.catalog_loading {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label("Looking up current releases…");
-                });
-            }
-            let mut pick = None;
-            for e in &self.catalog {
-                ui.group(|ui| {
-                    ui.set_width(ui.available_width());
-                    ui.strong(&e.distro);
-                    ui.label(egui::RichText::new(&e.version).small());
-                    if ui.button("⬇ Download").clicked() {
-                        pick = Some(e.clone());
-                    }
-                });
-            }
-            if let Some(e) = pick {
-                self.start(ctx, format!("{} {}", e.distro, e.version), Source::Link(e.link));
-            }
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F)) {
+            self.sidebar.focus_search = true;
+        }
+        self.facts = self.collect_facts();
+        let mut actions = Vec::new();
+        egui::Panel::left("sidebar").resizable(true).default_size(250.0).size_range(210.0..=400.0).show(root, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                let floor = self.ledger.ratio_floor();
+                actions = self.sidebar.ui(ui, &self.facts, &self.ledger.labels, floor);
+            });
         });
+        self.sidebar_actions(actions);
 
         self.tick_ledger();
         if self.view == View::Seeding {
@@ -1039,17 +1108,53 @@ impl eframe::App for App {
                 ui.add_space(40.0);
                 ui.vertical_centered(|ui| {
                     ui.label(egui::RichText::new("No downloads yet").size(18.0));
-                    ui.label("Pick a Linux release on the left, paste a magnet link, or open a .torrent file.");
+                    ui.label("Paste a magnet link above, open a .torrent file, or add an RSS feed.");
                 });
             }
 
+            let shown = (0..self.transfers.len()).filter(|&i| self.visible(i)).count();
+            if self.sidebar.filter.is_active() && !self.transfers.is_empty() {
+                let mut clear = false;
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Showing {shown} of {}  ·  {}",
+                            self.transfers.len(),
+                            self.sidebar.filter.describe()
+                        ))
+                        .weak(),
+                    );
+                    clear = ui.small_button("Show all").clicked();
+                });
+                if clear {
+                    self.sidebar.filter = Default::default();
+                }
+            }
             let mut remove = None;
+            let mut relabel: Vec<(String, String, bool)> = Vec::new();
+            let labels = self.ledger.labels.clone();
             egui::ScrollArea::vertical().show(ui, |ui| {
                 for (i, t) in self.transfers.iter().enumerate() {
-                    transfer_row(ui, &self.rt, self.session.as_ref(), t, || remove = Some(i));
+                    if !self.visible(i) {
+                        continue;
+                    }
+                    let Some(f) = self.facts.get(i) else { continue };
+                    transfer_row(ui, &self.rt, self.session.as_ref(), t, f, &labels, &mut relabel, || remove = Some(i));
                     ui.add_space(4.0);
                 }
+                if shown == 0 && !self.transfers.is_empty() {
+                    ui.add_space(30.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(egui::RichText::new("Nothing matches this filter").size(16.0));
+                    });
+                }
             });
+            if !relabel.is_empty() {
+                for (hash, label, on) in relabel {
+                    self.ledger.set_label(&hash, &label, on);
+                }
+                self.save_ledger();
+            }
             if let Some(i) = remove {
                 let t = self.transfers.remove(i);
                 self.ledger.entries.remove(&t.handle.info_hash().as_string());
@@ -1494,11 +1599,20 @@ fn clock() -> String {
     format!("{:02}:{:02} UTC", s / 3600 % 24, s / 60 % 60)
 }
 
+/// A small coloured chip (label or tracker) after a torrent's name.
+fn chip(ui: &mut egui::Ui, text: &str, col: egui::Color32) -> egui::Response {
+    ui.label(egui::RichText::new(format!(" {text} ")).small().color(egui::Color32::BLACK).background_color(col))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn transfer_row(
     ui: &mut egui::Ui,
     rt: &tokio::runtime::Runtime,
     session: Option<&Arc<Session>>,
     t: &Transfer,
+    f: &sidebar::Facts,
+    all_labels: &[String],
+    relabel: &mut Vec<(String, String, bool)>,
     mut on_remove: impl FnMut(),
 ) {
     let s = t.handle.stats();
@@ -1508,11 +1622,36 @@ fn transfer_row(
     ui.group(|ui| {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
-            ui.strong(&t.name);
+            // The name is the drag handle: drop it on a sidebar entry.
+            ui.dnd_drag_source(egui::Id::new(("zt-drag", &f.hash)), sidebar::Dragged(f.hash.clone()), |ui| {
+                ui.strong(&t.name);
+            })
+            .response
+            .on_hover_text("Drag onto a label to tag it, or onto Paused / Downloading to pause or resume");
+            for l in &f.labels {
+                chip(ui, l, sidebar::tint(l)).on_hover_text("label");
+            }
+            // Private trackers are the ones worth naming on the row.
+            if f.private {
+                for site in &f.sites {
+                    chip(ui, &format!("{} 🔒", sidebar::pretty(site)), egui::Color32::from_gray(170)).on_hover_text("private tracker");
+                }
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.small_button("Remove").on_hover_text("Stop and remove from list (keeps files)").clicked() {
                     on_remove();
                 }
+                ui.menu_button("Labels", |ui| {
+                    if all_labels.is_empty() {
+                        ui.label(egui::RichText::new("Make one in the sidebar under Labels").weak());
+                    }
+                    for l in all_labels {
+                        let mut on = f.labels.contains(l);
+                        if ui.checkbox(&mut on, l.as_str()).changed() {
+                            relabel.push((f.hash.clone(), l.clone(), on));
+                        }
+                    }
+                });
                 if ui.small_button("Open folder").clicked() {
                     let _ = open_folder(&t.folder);
                 }
