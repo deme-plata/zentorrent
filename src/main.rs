@@ -1302,8 +1302,9 @@ impl eframe::App for App {
                 ui.selectable_value(&mut self.view, View::Downloads, format!("Downloads ({})", self.transfers.len()));
                 ui.selectable_value(&mut self.view, View::Seeding, "Seeding & ratio");
                 ui.selectable_value(&mut self.view, View::Feeds, format!("RSS feeds ({})", self.store.feeds.len()));
-                self.update_ui(ui, ctx);
+                ui.add_space(8.0);
                 self.vpn_badge(ui);
+                self.update_ui(ui, ctx);
             });
             ui.add_space(4.0);
 
