@@ -60,12 +60,14 @@ everything in it exists because someone needed it on a real private tracker.
 
 ## 📦 Install
 
-Grab a build from the release channel. After that, the **Update** button in the top-right corner keeps you current:
+Grab a build from **[GitHub Releases](https://github.com/deme-plata/zentorrent/releases/latest)**. After that, the **Update** button in the top-right corner keeps you current:
 
-| Platform | Download |
-|---|---|
-| Linux x64 | [`zentorrent-0.6.0-linux-x64`](https://quillon.xyz/downloads/zentorrent-0.6.0-linux-x64) |
-| Windows x64 | [`zentorrent-0.6.0-windows-x64.exe`](https://quillon.xyz/downloads/zentorrent-0.6.0-windows-x64.exe) |
+| Platform | GitHub Releases | Mirror |
+|---|---|---|
+| Windows x64 | [`zentorrent-0.6.0-windows-x64.exe`](https://github.com/deme-plata/zentorrent/releases/download/v0.6.0/zentorrent-0.6.0-windows-x64.exe) | [quillon.xyz](https://quillon.xyz/downloads/zentorrent-0.6.0-windows-x64.exe) |
+| Linux x64 | [`zentorrent-0.6.0-linux-x64`](https://github.com/deme-plata/zentorrent/releases/download/v0.6.0/zentorrent-0.6.0-linux-x64) | [quillon.xyz](https://quillon.xyz/downloads/zentorrent-0.6.0-linux-x64) |
+
+Both are byte-identical to what the in-app updater installs. Their BLAKE3 hashes are in the Ed25519-signed [`zentorrent-latest.json`](https://quillon.xyz/downloads/zentorrent-latest.json).
 
 ```bash
 chmod +x zentorrent-0.6.0-linux-x64 && ./zentorrent-0.6.0-linux-x64
