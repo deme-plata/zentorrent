@@ -1,0 +1,5 @@
+# One line ending in the repo, whatever the editor: a CRLF whole-file copy once
+# turned main.rs into a 4,000-line diff and hid a lost feature (2026-10-08).
+* text=auto eol=lf
+*.png binary
+*.ico binary
