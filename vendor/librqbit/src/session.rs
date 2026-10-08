@@ -705,7 +705,10 @@ impl Session {
 
             let reqwest_client = {
                 let builder = if let Some(proxy_url) = proxy_url {
-                    let proxy = reqwest::Proxy::all(proxy_url)
+                    // ZenTorrent patch: `socks5h` makes the proxy resolve tracker host
+                    // names. With plain `socks5` reqwest looks them up locally, so the
+                    // DNS server sees every tracker a VPN user talks to.
+                    let proxy = reqwest::Proxy::all(proxy_url.replacen("socks5://", "socks5h://", 1))
                         .context("error creating socks5 proxy for HTTP")?;
                     reqwest::Client::builder().proxy(proxy)
                 } else {

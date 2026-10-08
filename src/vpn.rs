@@ -7,7 +7,9 @@
 //!   local IronTunnel proxy. librqbit never falls back to a direct connection when a
 //!   proxy is set, so a dead relay means no traffic, not leaked traffic.
 //! - **tracker websites** (feeds, .torrent downloads, log-in) use a client that goes
-//!   through the same proxy, with names resolved on the relay (`socks5h`).
+//!   through the same proxy, with names resolved on the relay (`socks5h`). librqbit's own
+//!   tracker client is patched to `socks5h` too (vendor/README-zentorrent.md), so no
+//!   tracker name is looked up locally either.
 //! - **UDP cannot ride the tunnel**, so everything UDP is switched off: DHT, local peer
 //!   discovery, and `udp://` trackers (librqbit would contact those directly, proxy or
 //!   not, so they are removed from every magnet and .torrent before it is added).
@@ -17,8 +19,7 @@
 //!   mode resumes from its own session folder (`session-vpn`); switch the VPN off and
 //!   the direct-mode torrents come back.
 //!
-//! Not covered (said in the UI): OMDb ratings and the update check stay direct; tracker
-//! host names inside librqbit are resolved locally (its `socks5://` proxy mode).
+//! Not covered (said in the UI): OMDb ratings and the update check stay direct.
 
 use crate::tunnel::proxy::{probe, start_proxy, ProxyConfig, ProxyHandle, ProxySnapshot};
 use crate::tunnel::secure::{PublicKey, StaticKeypair};

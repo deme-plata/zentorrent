@@ -796,7 +796,7 @@ impl App {
             vpn::Vpn::Up { relay, rtt, .. } => {
                 let s = self.vpn.stats().unwrap_or_else(|| unreachable!());
                 (
-                    format!("🔒 VPN  ↑{}  ↓{}", human(s.bytes_up), human(s.bytes_down)),
+                    format!("🔒 VPN  ⬆ {}  ⬇ {}", human(s.bytes_up), human(s.bytes_down)),
                     Some(green),
                     format!(
                         "Encrypted tunnel to {relay} (handshake {} ms), {} connections open.\n\
@@ -807,9 +807,9 @@ impl App {
                 )
             }
             vpn::Vpn::Failed(e) => (
-                "VPN DOWN — engine stopped".to_string(),
+                "VPN DOWN".to_string(),
                 Some(egui::Color32::LIGHT_RED),
-                format!("Kill switch: {e}"),
+                format!("Kill switch — the torrent engine is stopped until the tunnel is up.\n{e}"),
             ),
         };
         let mut label = egui::RichText::new(text);
