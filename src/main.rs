@@ -28,7 +28,9 @@ mod meta;
 mod rss;
 mod seed;
 mod sidebar;
+mod tunnel;
 mod update;
+mod vpn;
 
 fn main() -> eframe::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -48,7 +50,8 @@ fn main() -> eframe::Result<()> {
             std::process::exit(2);
         };
         let dir = args.get(3).map(PathBuf::from).unwrap_or(default_dir);
-        if let Err(e) = rt.block_on(cli(link, dir)) {
+        let vpn = vpn::Vpn::start(&rt, &vpn::VpnSettings::load());
+        if let Err(e) = rt.block_on(cli(link, dir, &vpn)) {
             eprintln!("error: {e:#}");
             std::process::exit(1);
         }
@@ -149,12 +152,19 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-async fn cli(link: String, dir: PathBuf) -> anyhow::Result<()> {
-    let session = Session::new_with_opts(dir.clone(), SessionOptions::default()).await?;
-    let add = if std::path::Path::new(&link).is_file() {
-        AddTorrent::from_bytes(std::fs::read(&link)?)
-    } else {
-        AddTorrent::from_url(link)
+async fn cli(link: String, dir: PathBuf, vpn: &vpn::Vpn) -> anyhow::Result<()> {
+    let Some(session_opts) = vpn::session_options(SessionOptions::default(), vpn) else {
+        anyhow::bail!("VPN is on but the tunnel is down, so nothing is downloaded (kill switch): {}", vpn.failure().unwrap_or("?"));
+    };
+    if let vpn::Vpn::Up { relay, rtt, .. } = vpn {
+        println!("VPN on: relay {relay}, handshake {} ms — DHT, local discovery and udp:// trackers off", rtt.as_millis());
+    }
+    let session = Session::new_with_opts(dir.clone(), session_opts).await?;
+    let add = match (std::path::Path::new(&link).is_file(), vpn.is_up()) {
+        (true, true) => vpn::tunnel_bytes(std::fs::read(&link)?)?,
+        (true, false) => AddTorrent::from_bytes(std::fs::read(&link)?),
+        (false, true) => vpn::tunnel_link(&vpn.http(), &link).await?,
+        (false, false) => AddTorrent::from_url(link),
     };
     let opts = AddTorrentOptions {
         output_folder: Some(dir.to_string_lossy().into_owned()),
@@ -173,8 +183,12 @@ async fn cli(link: String, dir: PathBuf) -> anyhow::Result<()> {
             .as_ref()
             .map(|l| (speed(l.download_speed.mbps), l.snapshot.peer_stats.live))
             .unwrap_or_default();
+        let tunnel = vpn
+            .stats()
+            .map(|v| format!("  vpn ↑{} ↓{} conns {}", human(v.bytes_up), human(v.bytes_down), v.connections_active))
+            .unwrap_or_default();
         println!(
-            "{:5.1} %  {} / {}  ↓ {spd}  peers {peers}  [{}]",
+            "{:5.1} %  {} / {}  ↓ {spd}  peers {peers}  [{}]{tunnel}",
             if s.total_bytes > 0 { s.progress_bytes as f64 * 100.0 / s.total_bytes as f64 } else { 0.0 },
             human(s.progress_bytes),
             human(s.total_bytes),
@@ -213,6 +227,8 @@ struct Inbox {
     /// (imdb id, poster bytes or error)
     posters: Vec<(String, Result<Vec<u8>, String>)>,
     busy: usize,
+    /// Result of the VPN window's "Test relay" (handshake + ping, ms).
+    vpn_test: Option<Result<u128, String>>,
 }
 
 #[derive(Clone)]
@@ -284,28 +300,49 @@ struct App {
     details: Option<details::Details>,
     /// Per-torrent (down, up) MiB/s, one sample a second, for the Details graph.
     history: HashMap<String, std::collections::VecDeque<(f32, f32)>>,
+    vpn: vpn::Vpn,
+    /// Settings the running engine was started with / last saved / being edited.
+    vpn_running: vpn::VpnSettings,
+    vpn_settings: vpn::VpnSettings,
+    vpn_edit: vpn::VpnSettings,
+    vpn_open: bool,
+    vpn_note: Option<String>,
+    vpn_testing: bool,
+    /// This install's tunnel public key (hex), read when the VPN window opens.
+    vpn_pub: Option<Result<String, String>>,
 }
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, rt: tokio::runtime::Runtime, folder: PathBuf) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
 
-        let (session, session_error) =
+        // The VPN comes first: when it is on, the engine may start only once the
+        // tunnel is up (kill switch), and with every non-tunnel path switched off.
+        let vpn_settings = vpn::VpnSettings::load();
+        let vpn = vpn::Vpn::start(&rt, &vpn_settings);
+        let engine_opts = SessionOptions {
             // Persistence: librqbit remembers every torrent (and where it got
             // to) in the data dir, so a restart resumes downloads and seeding.
-            match rt.block_on(Session::new_with_opts(
-                folder.clone(),
-                SessionOptions {
-                    persistence: Some(librqbit::SessionPersistenceConfig::Json {
-                        folder: Some(seed::data_dir().join("session")),
-                    }),
-                    fastresume: true,
-                    ..Default::default()
-                },
-            )) {
+            persistence: Some(librqbit::SessionPersistenceConfig::Json {
+                folder: Some(seed::data_dir().join("session")),
+            }),
+            fastresume: true,
+            ..Default::default()
+        };
+        let (session, session_error) = match vpn::session_options(engine_opts, &vpn) {
+            None => (
+                None,
+                Some(format!(
+                    "VPN is on but the tunnel is down, so the torrent engine is stopped (kill switch): {}. \
+                     Fix the relay or turn the VPN off (VPN button, top right).",
+                    vpn.failure().unwrap_or("?")
+                )),
+            ),
+            Some(opts) => match rt.block_on(Session::new_with_opts(folder.clone(), opts)) {
                 Ok(s) => (Some(s), None),
                 Err(e) => (None, Some(format!("could not start the torrent engine: {e:#}"))),
-            };
+            },
+        };
 
         let inbox = Arc::new(Mutex::new(Inbox::default()));
 
@@ -341,7 +378,7 @@ impl App {
             view: View::Downloads,
             store: rss::FeedStore::load(),
             fv: FeedView::default(),
-            http: rss::http(),
+            http: vpn.http(),
             upd: Upd::Checking,
             upd_checked: None,
             ledger,
@@ -357,6 +394,14 @@ impl App {
             facts: Vec::new(),
             details: None,
             history: HashMap::new(),
+            vpn,
+            vpn_running: vpn_settings.clone(),
+            vpn_edit: vpn_settings.clone(),
+            vpn_settings,
+            vpn_open: false,
+            vpn_note: None,
+            vpn_testing: false,
+            vpn_pub: None,
         };
         app.apply_global_limits();
         app
@@ -739,6 +784,150 @@ impl App {
         });
     }
 
+    /// Top-bar VPN state; a click opens the VPN window.
+    fn vpn_badge(&mut self, ui: &mut egui::Ui) {
+        let green = egui::Color32::from_rgb(90, 200, 120);
+        let (text, color, tip) = match &self.vpn {
+            vpn::Vpn::Off => (
+                "VPN off".to_string(),
+                None,
+                "Torrent traffic goes out directly from this computer. Click to set up the VPN.".to_string(),
+            ),
+            vpn::Vpn::Up { relay, rtt, .. } => {
+                let s = self.vpn.stats().unwrap_or_else(|| unreachable!());
+                (
+                    format!("🔒 VPN  ↑{}  ↓{}", human(s.bytes_up), human(s.bytes_down)),
+                    Some(green),
+                    format!(
+                        "Encrypted tunnel to {relay} (handshake {} ms), {} connections open.\n\
+                         DHT, local peer discovery and udp:// trackers are off; no incoming peers.",
+                        rtt.as_millis(),
+                        s.connections_active
+                    ),
+                )
+            }
+            vpn::Vpn::Failed(e) => (
+                "VPN DOWN — engine stopped".to_string(),
+                Some(egui::Color32::LIGHT_RED),
+                format!("Kill switch: {e}"),
+            ),
+        };
+        let mut label = egui::RichText::new(text);
+        if let Some(c) = color {
+            label = label.color(c);
+        }
+        if ui.button(label).on_hover_text(tip).clicked() {
+            self.vpn_open = true;
+            self.vpn_edit = self.vpn_settings.clone();
+            self.vpn_note = None;
+            self.vpn_pub = Some(vpn::client_key().map(|k| k.public().to_hex()).map_err(|e| format!("{e:#}")));
+        }
+    }
+
+    fn vpn_window(&mut self, ctx: &egui::Context) {
+        if !self.vpn_open {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("VPN — IronTunnel")
+            .open(&mut open)
+            .resizable(false)
+            .default_width(540.0)
+            .show(ctx, |ui| {
+                ui.label(
+                    "Torrent traffic — peers, trackers and tracker websites — goes through an encrypted \
+                     tunnel to your relay, so they see the relay's address instead of yours.",
+                );
+                ui.add_space(6.0);
+                ui.checkbox(&mut self.vpn_edit.enabled, "Send torrent traffic through the VPN");
+                egui::Grid::new("vpn_grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                    ui.label("Relay");
+                    ui.add(egui::TextEdit::singleline(&mut self.vpn_edit.relay).hint_text("vpn.example.org:1195").desired_width(340.0));
+                    ui.end_row();
+                    ui.label("Relay key");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.vpn_edit.relay_key)
+                            .hint_text("64 hex characters from the relay operator")
+                            .desired_width(340.0),
+                    );
+                    ui.end_row();
+                    ui.label("Your key");
+                    match &self.vpn_pub {
+                        Some(Ok(hex)) => {
+                            ui.horizontal(|ui| {
+                                ui.monospace(format!("{}…{}", &hex[..12], &hex[52..]));
+                                if ui
+                                    .small_button("Copy")
+                                    .on_hover_text("Send this to the relay operator: it goes in the relay's authorized list")
+                                    .clicked()
+                                {
+                                    ui.ctx().copy_text(hex.clone());
+                                }
+                            });
+                        }
+                        Some(Err(e)) => {
+                            ui.colored_label(egui::Color32::LIGHT_RED, e);
+                        }
+                        None => {}
+                    }
+                    ui.end_row();
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let valid = self.vpn_edit.check().is_ok();
+                    if ui.add_enabled(valid && !self.vpn_testing, egui::Button::new("Test relay")).clicked() {
+                        self.vpn_testing = true;
+                        let (s, inbox, ctx) = (self.vpn_edit.clone(), self.inbox.clone(), ctx.clone());
+                        self.rt.spawn(async move {
+                            let r = vpn::test(&s).await.map(|d| d.as_millis());
+                            inbox.lock().unwrap().vpn_test = Some(r);
+                            ctx.request_repaint();
+                        });
+                    }
+                    if self.vpn_testing {
+                        ui.spinner();
+                    }
+                    if ui.button("Save").clicked() {
+                        self.vpn_note = Some(match (self.vpn_edit.enabled, self.vpn_edit.check()) {
+                            (true, Err(e)) => e,
+                            _ => match self.vpn_edit.save() {
+                                Ok(()) => {
+                                    self.vpn_settings = self.vpn_edit.clone();
+                                    "Saved.".to_string()
+                                }
+                                Err(e) => format!("Could not save: {e:#}"),
+                            },
+                        });
+                    }
+                    if self.vpn_settings != self.vpn_running
+                        && ui.button("↻ Restart now").on_hover_text("The engine takes the VPN setting at start").clicked()
+                    {
+                        update::relaunch();
+                    }
+                });
+                if let Some(n) = &self.vpn_note {
+                    ui.label(n);
+                }
+                if self.vpn_settings != self.vpn_running {
+                    ui.label(egui::RichText::new("Saved settings apply after a restart.").weak());
+                }
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(
+                        "While the VPN is on: DHT, local peer discovery and udp:// trackers are off (UDP cannot use \
+                         the tunnel), no incoming peers are accepted, and if the relay stops answering nothing is \
+                         downloaded at all. Torrents added with the VPN off are kept separately and return when you \
+                         turn it off. Ratings (OMDb) and update checks still go out directly.",
+                    )
+                    .weak()
+                    .small(),
+                );
+            });
+        if !open {
+            self.vpn_open = false;
+        }
+    }
+
     fn update_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             match self.upd.clone() {
@@ -832,21 +1021,31 @@ impl App {
         let inbox = self.inbox.clone();
         let ctx = ctx.clone();
         let http = self.http.clone();
+        // Through the VPN, every torrent loses its udp:// trackers before librqbit sees
+        // it (they would bypass the tunnel), and .torrent URLs are fetched through it.
+        let tunnelled = self.vpn.is_up();
         inbox.lock().unwrap().busy += 1;
         self.rt.spawn(async move {
-            let add = match source {
-                Source::Link(s) => AddTorrent::from_url(s),
-                Source::Bytes(b) => AddTorrent::from_bytes(b),
-                Source::Fetch { url, cookie } => match rss::fetch_torrent(&http, &url, Some(&cookie)).await {
-                    Ok(b) => AddTorrent::from_bytes(b),
-                    Err(e) => {
-                        let mut ib = inbox.lock().unwrap();
-                        ib.busy -= 1;
-                        ib.errors.push(format!("{label}: {e:#}"));
-                        ctx.request_repaint();
-                        return;
-                    }
+            let add = match (source, tunnelled) {
+                (Source::Link(s), false) => Ok(AddTorrent::from_url(s)),
+                (Source::Link(s), true) => vpn::tunnel_link(&http, &s).await,
+                (Source::Bytes(b), false) => Ok(AddTorrent::from_bytes(b)),
+                (Source::Bytes(b), true) => vpn::tunnel_bytes(b),
+                (Source::Fetch { url, cookie }, t) => match rss::fetch_torrent(&http, &url, Some(&cookie)).await {
+                    Ok(b) if t => vpn::tunnel_bytes(b),
+                    Ok(b) => Ok(AddTorrent::from_bytes(b)),
+                    Err(e) => Err(e),
                 },
+            };
+            let add = match add {
+                Ok(a) => a,
+                Err(e) => {
+                    let mut ib = inbox.lock().unwrap();
+                    ib.busy -= 1;
+                    ib.errors.push(format!("{label}: {e:#}"));
+                    ctx.request_repaint();
+                    return;
+                }
             };
             let opts = AddTorrentOptions {
                 output_folder: Some(folder.to_string_lossy().into_owned()),
@@ -870,6 +1069,13 @@ impl App {
     }
 
     fn drain_inbox(&mut self, ctx: &egui::Context) {
+        if let Some(r) = self.inbox.lock().unwrap().vpn_test.take() {
+            self.vpn_testing = false;
+            self.vpn_note = Some(match r {
+                Ok(ms) => format!("Relay answered: authenticated handshake + encrypted ping in {ms} ms."),
+                Err(e) => format!("Relay test failed: {e}"),
+            });
+        }
         let feed_results = std::mem::take(&mut self.inbox.lock().unwrap().feeds);
         let mut dirty = false;
         for (url, res) in feed_results {
@@ -1063,6 +1269,7 @@ impl eframe::App for App {
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = &root.ctx().clone();
         self.drain_inbox(ctx);
+        self.vpn_window(ctx);
         let due = match self.fv.last_refresh {
             None => true,
             Some(t) => t.elapsed() >= Duration::from_secs(self.store.refresh_minutes.max(1) * 60),
@@ -1096,6 +1303,7 @@ impl eframe::App for App {
                 ui.selectable_value(&mut self.view, View::Seeding, "Seeding & ratio");
                 ui.selectable_value(&mut self.view, View::Feeds, format!("RSS feeds ({})", self.store.feeds.len()));
                 self.update_ui(ui, ctx);
+                self.vpn_badge(ui);
             });
             ui.add_space(4.0);
 
