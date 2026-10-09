@@ -1,16 +1,17 @@
 //! libmpv, loaded at run time.
 //!
 //! ZenTorrent does not link libmpv: it opens the shared library when the
-//! player is first used (`libmpv.so.2` on Linux, `libmpv-2.dll` next to the
-//! exe on Windows). Without it the app runs normally and the player says
-//! what is missing. This keeps ZenTorrent's own MIT/Apache licence clean (the
+//! player is first used (`libmpv.so.2` on Linux; on Windows `libmpv-2.dll`
+//! next to the exe, else ZenTorrent's own build fetched on the first Play —
+//! see `engine`). Without it the app runs normally and the player says what
+//! is missing. This keeps ZenTorrent's own MIT/Apache licence clean (the
 //! Rust binding crates are LGPL) and the libmpv build swappable.
 //!
 //! Only the handful of client-API calls the player uses are bound, with the
 //! layouts from mpv's client.h / stream_cb.h (client API 2.x, mpv ≥ 0.35).
 
 use std::ffi::{c_char, c_double, c_int, c_void, CStr, CString};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 #[repr(C)]
 pub struct Handle {
@@ -111,6 +112,8 @@ fn candidates() -> Vec<std::path::PathBuf> {
             out.push(dir.join("libmpv-2.dll"));
             out.push(dir.join("mpv-2.dll"));
         }
+        // ZenTorrent's own build, fetched on the first Play (`engine`).
+        out.push(super::engine::path());
         out.push("libmpv-2.dll".into());
         out.push("mpv-2.dll".into());
     }
@@ -122,11 +125,21 @@ fn candidates() -> Vec<std::path::PathBuf> {
     out
 }
 
-static API: OnceLock<Result<Api, String>> = OnceLock::new();
+static API: OnceLock<Api> = OnceLock::new();
+static LOADING: Mutex<()> = Mutex::new(());
 
-/// Load libmpv once; later calls return the same result.
-pub fn api() -> Result<&'static Api, &'static str> {
-    API.get_or_init(load).as_ref().map_err(|e| e.as_str())
+/// Load libmpv; once it loads, later calls return it. A failure is not remembered,
+/// so the engine can be installed while ZenTorrent runs (first Play on Windows).
+pub fn api() -> Result<&'static Api, String> {
+    if let Some(a) = API.get() {
+        return Ok(a);
+    }
+    let _one_at_a_time = LOADING.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(a) = API.get() {
+        return Ok(a);
+    }
+    let a = load()?;
+    Ok(API.get_or_init(|| a))
 }
 
 fn load() -> Result<Api, String> {
@@ -139,7 +152,7 @@ fn load() -> Result<Api, String> {
         }
     }
     Err(if cfg!(windows) {
-        "the player engine (libmpv-2.dll) is not installed next to ZenTorrent".to_string()
+        "the player engine (libmpv-2.dll) is not installed".to_string()
     } else {
         "the player engine libmpv is not installed (Debian/Ubuntu: sudo apt install libmpv2)".to_string()
     } + &format!(" — tried {}", tried.join(", ")))

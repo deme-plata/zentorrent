@@ -1,12 +1,14 @@
 //! ZenTorrent's built-in player (libmpv, loaded at run time).
 //!
 //! * `ffi`      — the libmpv entry points, opened when the player is first used
+//! * `engine`   — Windows: ZenTorrent's own LGPL libmpv-2.dll, fetched on the first Play
 //! * `stream`   — `zt://` streaming: mpv reads files that are still downloading
 //! * `playlist` — a torrent's files (and its .m3u playlists) → what plays, in order
 //! * `audio`    — the engine: queue, gapless playback, sound settings
 //! * `ui`       — the now-playing bar, the playlist panel and the Sound window
 
 pub mod audio;
+pub mod engine;
 pub mod ffi;
 pub mod playlist;
 pub mod stream;

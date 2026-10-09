@@ -45,6 +45,9 @@ fn main() -> eframe::Result<()> {
         .or_else(dirs::home_dir)
         .unwrap_or_else(|| PathBuf::from("."));
 
+    // Leftovers of the previous update (the replaced program, set aside while it ran).
+    update::clean_up();
+
     // Headless mode: `zentorrent --cli <magnet|url|file.torrent> [folder]`.
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("--cli") {
@@ -76,6 +79,26 @@ fn main() -> eframe::Result<()> {
                     }
                 }
             }
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+
+    // `zentorrent --get-player-engine`: what the first Play does on Windows, by hand.
+    if args.get(1).map(String::as_str) == Some("--get-player-engine") {
+        if player::ffi::api().is_err() && !player::engine::path().exists() {
+            let got = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            if let Err(e) = rt.block_on(player::engine::fetch(None, got)) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+            println!("downloaded and verified: {}", player::engine::path().display());
+        }
+        match player::ffi::api() {
+            Ok(_) => println!("player engine loads"),
             Err(e) => {
                 eprintln!("error: {e}");
                 std::process::exit(1);
@@ -346,6 +369,8 @@ struct App {
     /// The built-in player (libmpv is loaded on the first Play).
     player: Option<player::Player>,
     pui: player::ui::PlayerUi,
+    /// Bytes of the player engine downloaded so far, while the first Play fetches it.
+    engine_got: Option<Arc<std::sync::atomic::AtomicU64>>,
     vpn: vpn::Vpn,
     /// Settings the running engine was started with / last saved / being edited.
     vpn_running: vpn::VpnSettings,
@@ -465,6 +490,7 @@ impl App {
             meta_version: 0,
             player: None,
             pui: Default::default(),
+            engine_got: None,
             vpn,
             vpn_running: vpn_settings.clone(),
             vpn_edit: vpn_settings.clone(),
@@ -1029,9 +1055,16 @@ impl App {
                     }
                 }
                 Upd::Failed(e) => {
-                    if ui.small_button("Retry update check").on_hover_text(e).clicked() {
+                    if ui.small_button("Retry update").on_hover_text(&e).clicked() {
                         self.check_update(ctx);
                     }
+                    // Said out loud, not only on hover: "it says retry" told nobody why.
+                    let short: String = e.chars().take(90).collect();
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(format!("⚠ update failed: {short}")).color(egui::Color32::from_rgb(230, 160, 60)).small())
+                            .truncate(),
+                    )
+                    .on_hover_text(&e);
                 }
             }
             ui.label(egui::RichText::new(format!("v{}", update::VERSION)).weak());
@@ -1199,8 +1232,26 @@ impl App {
         let p = self.player.as_mut().unwrap();
         p.registry.torrents.lock().unwrap().insert(hash.clone(), handle.clone());
         p.error = Some("preparing the playlist…".into());
+        // Windows, first Play: fetch the player engine first (through the tunnel when
+        // the VPN is up, like everything else the user asked for).
+        if self.engine_got.is_some() {
+            return; // already fetching; that Play continues by itself
+        }
+        let got = player::engine::needed().then(|| Arc::new(std::sync::atomic::AtomicU64::new(0)));
+        self.engine_got = got.clone();
+        let proxy = match &self.vpn {
+            vpn::Vpn::Up { proxy, .. } => Some(format!("socks5h://{}", proxy.local_addr())),
+            _ => None,
+        };
         let (inbox, ctx) = (self.inbox.clone(), ctx.clone());
         self.rt.spawn(async move {
+            if let Some(got) = got {
+                if let Err(e) = player::engine::fetch(proxy, got).await {
+                    inbox.lock().unwrap().tracks.push((hash, name, Err(e)));
+                    ctx.request_repaint();
+                    return;
+                }
+            }
             let r = player::load_tracks(handle).await;
             inbox.lock().unwrap().tracks.push((hash, name, r));
             ctx.request_repaint();
@@ -1216,7 +1267,18 @@ impl App {
         p.tick(&|f| files.complete(f));
         if !p.active() {
             // Not playing yet (or the engine is missing): just say why.
-            let msg = p.error.clone().unwrap_or_default();
+            let msg = match &self.engine_got {
+                Some(got) => {
+                    ctx.request_repaint_after(Duration::from_millis(250));
+                    let mb = |b: u64| b as f64 / 1_048_576.0;
+                    format!(
+                        "Getting the player engine (libmpv, LGPL) — {:.1} of {:.1} MB, only this once…",
+                        mb(got.load(std::sync::atomic::Ordering::Relaxed)),
+                        mb(player::engine::SIZE)
+                    )
+                }
+                None => p.error.clone().unwrap_or_default(),
+            };
             egui::Panel::bottom("player").show(root, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new(msg).weak());
@@ -1243,6 +1305,9 @@ impl App {
 
     fn drain_inbox(&mut self, ctx: &egui::Context) {
         let ready = std::mem::take(&mut self.inbox.lock().unwrap().tracks);
+        if !ready.is_empty() {
+            self.engine_got = None; // the engine fetch (if any) is over, either way
+        }
         for (hash, name, r) in ready {
             match r {
                 Ok((tracks, folder)) => {

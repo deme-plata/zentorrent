@@ -105,21 +105,92 @@ pub async fn install(m: &Manifest) -> Result<(), String> {
         .await
         .map_err(|e| e.to_string())?;
     check_artifact(&bytes, a)?;
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let staged = exe.with_file_name(format!(
-        "zentorrent-{}-staged{}",
-        m.version,
-        if cfg!(windows) { ".exe" } else { "" }
-    ));
-    std::fs::write(&staged, &bytes).map_err(|e| format!("write {}: {e}", staged.display()))?;
+    let exe = program().ok_or("cannot tell where the program file is")?;
+    tokio::task::spawn_blocking(move || replace_file(&exe, &bytes)).await.map_err(|e| e.to_string())?
+}
+
+/// How long to keep retrying a file operation. Antivirus scanners (Avast, Defender…)
+/// open a freshly written .exe for several seconds and can refuse all other access
+/// meanwhile; that is what broke 0.8.2 → 0.8.3 on Windows with Avast.
+const AV_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn patiently<T>(what: &str, mut f: impl FnMut() -> std::io::Result<T>) -> Result<T, String> {
+    let start = std::time::Instant::now();
+    loop {
+        match f() {
+            Ok(v) => return Ok(v),
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound && start.elapsed() < AV_WAIT => {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            Err(e) => return Err(format!("could not {what}: {e}")),
+        }
+    }
+}
+
+/// `.<program name>.<tag>`, next to the program.
+fn beside(exe: &std::path::Path, tag: &str) -> std::path::PathBuf {
+    let name = exe.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "zentorrent".into());
+    exe.with_file_name(format!(".{name}.{tag}"))
+}
+
+/// Put `bytes` in place of the program at `exe` without ever leaving that path empty:
+/// write the new version beside it and check it reads back intact, move the running
+/// one aside (Windows allows renaming a running .exe, not deleting it), move the new
+/// one in, and if that last step fails, move the old one back. The set-aside file is
+/// removed on the next start (`clean_up`).
+pub fn replace_file(exe: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    let new = beside(exe, "new");
+    let _ = std::fs::remove_file(&new);
+    std::fs::write(&new, bytes).map_err(|e| format!("could not write {}: {e}", new.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
+        std::fs::set_permissions(&new, std::fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
     }
-    let res = self_replace::self_replace(&staged).map_err(|e| format!("could not replace the program file: {e}"));
-    let _ = std::fs::remove_file(&staged);
-    res
+    let fail = |msg: String| {
+        let _ = std::fs::remove_file(&new);
+        Err(msg)
+    };
+    match patiently("read back the new version", || std::fs::read(&new)) {
+        Ok(b) if b == bytes => {}
+        Ok(_) => return fail("the new version changed on disk right after it was written (antivirus?); nothing was replaced".into()),
+        Err(e) => return fail(format!("{e} — an antivirus may have blocked or removed it; nothing was replaced")),
+    }
+    // An earlier update's set-aside file may still be running (no restart since):
+    // then it cannot be removed, so take the next free name.
+    let Some(old) = (0..10).map(|i| beside(exe, &format!("old{i}"))).find(|p| {
+        let _ = std::fs::remove_file(p);
+        !p.exists()
+    }) else {
+        return fail("too many earlier versions are still running; restart ZenTorrent and try again".into());
+    };
+    if let Err(e) = patiently("move the running version aside", || std::fs::rename(exe, &old)) {
+        return fail(format!("{e}; nothing was replaced"));
+    }
+    if let Err(e) = patiently("move the new version in", || std::fs::rename(&new, exe)) {
+        return match patiently("put the old version back", || std::fs::rename(&old, exe)) {
+            Ok(()) => fail(format!("{e}; the current version was kept")),
+            Err(u) => fail(format!("{e}; {u} — your ZenTorrent program is now at {}", old.display())),
+        };
+    }
+    Ok(())
+}
+
+/// Remove what earlier updates left next to the program: set-aside versions and, from
+/// before 0.8.4, `zentorrent-<version>-staged` files. Called once at start.
+pub fn clean_up() {
+    let Some(exe) = program() else { return };
+    let (Some(dir), Some(name)) = (exe.parent(), exe.file_name()) else { return };
+    let mine = format!(".{}.", name.to_string_lossy());
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        let n = e.file_name().to_string_lossy().into_owned();
+        let set_aside = n.strip_prefix(&mine).is_some_and(|t| t == "new" || t.starts_with("old"));
+        let staged = n.starts_with("zentorrent-") && n.trim_end_matches(".exe").ends_with("-staged");
+        if set_aside || staged {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
 }
 
 pub fn check_artifact(bytes: &[u8], a: &Artifact) -> Result<(), String> {
@@ -133,9 +204,17 @@ pub fn check_artifact(bytes: &[u8], a: &Artifact) -> Result<(), String> {
     Ok(())
 }
 
+/// The program file as it was at start. Asked once: after an update has moved the
+/// running file aside, `current_exe()` names the set-aside copy (Linux follows the
+/// rename), and the restart must start the file at the original path.
+pub fn program() -> Option<std::path::PathBuf> {
+    static EXE: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    EXE.get_or_init(|| std::env::current_exe().ok()).clone()
+}
+
 /// Start the freshly installed binary and leave.
 pub fn relaunch() -> ! {
-    if let Ok(exe) = std::env::current_exe() {
+    if let Some(exe) = program() {
         let _ = std::process::Command::new(exe).args(std::env::args().skip(1)).spawn();
     }
     std::process::exit(0)
@@ -171,5 +250,33 @@ mod tests {
         assert!(check_artifact(body, &a).is_ok());
         assert!(check_artifact(b"binarY", &a).unwrap_err().contains("hash"));
         assert!(check_artifact(b"bin", &a).unwrap_err().contains("bytes"));
+    }
+
+    #[test]
+    fn replace_swaps_the_file_and_leaves_the_old_one_beside_it() {
+        let dir = std::env::temp_dir().join(format!("zt-replace-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("zentorrent.exe");
+        std::fs::write(&exe, b"old version").unwrap();
+        replace_file(&exe, b"new version").unwrap();
+        assert_eq!(std::fs::read(&exe).unwrap(), b"new version");
+        assert_eq!(std::fs::read(dir.join(".zentorrent.exe.old0")).unwrap(), b"old version");
+        assert!(!dir.join(".zentorrent.exe.new").exists());
+        // A second update while the first set-aside file is still there.
+        replace_file(&exe, b"newer").unwrap();
+        assert_eq!(std::fs::read(&exe).unwrap(), b"newer");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_replace_keeps_the_program() {
+        let dir = std::env::temp_dir().join(format!("zt-replace-fail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // The program path is missing: nothing may be left behind, and it says so.
+        let exe = dir.join("zentorrent.exe");
+        let e = replace_file(&exe, b"new").unwrap_err();
+        assert!(e.contains("nothing was replaced"), "{e}");
+        assert!(!dir.join(".zentorrent.exe.new").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

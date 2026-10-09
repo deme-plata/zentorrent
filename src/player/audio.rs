@@ -244,7 +244,7 @@ unsafe impl Send for Mpv {}
 
 impl Mpv {
     fn new(reg: &'static Registry, live: Arc<Mutex<Live>>, repaint: Arc<dyn Fn() + Send + Sync>) -> Result<Mpv, String> {
-        let api = ffi::api().map_err(str::to_string)?;
+        let api = ffi::api()?;
         let h = unsafe { (api.create)() };
         if h.is_null() {
             return Err("libmpv could not create a player".into());
