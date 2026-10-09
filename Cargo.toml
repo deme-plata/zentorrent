@@ -16,6 +16,9 @@ serde = { version = "1", features = ["derive"] }
 quick-xml = "0.41"
 ed25519-dalek = "2.2"
 blake3 = "1"
+# Flux MoE: Ollama installers are checked against Ollama's own SHA-256; music tags for organizing.
+sha2 = "0.10"
+lofty = "0.22"
 hex = "0.4"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 regex = "1"

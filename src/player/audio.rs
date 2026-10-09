@@ -421,7 +421,10 @@ impl Player {
     /// Where mpv reads a track: the file on disk once complete, else the stream.
     /// Archive members are always read through the stream (mpv can't open archives).
     fn source(&self, track: &Track, complete: bool) -> String {
-        if let Some((archive, member)) = track.archive {
+        if self.queue.hash.is_empty() {
+            // A playlist of files on disk (Flux MoE): the path is the whole story.
+            track.path.clone()
+        } else if let Some((archive, member)) = track.archive {
             stream::member_url(&self.queue.hash, archive, member)
         } else if complete {
             self.queue.folder.join(&track.path).to_string_lossy().into_owned()

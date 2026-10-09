@@ -26,6 +26,7 @@ const FEED_RETRY: Duration = Duration::from_secs(60);
 mod details;
 mod history;
 mod meta;
+mod moe;
 mod player;
 mod rss;
 mod search;
@@ -103,6 +104,22 @@ fn main() -> eframe::Result<()> {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
+        }
+        return Ok(());
+    }
+
+    // `zentorrent --ask "<question>" [folder] [--cpu]`: one Flux MoE turn in the terminal
+    // (the real local model, your feeds and that folder; actions are printed, not done).
+    if args.get(1).map(String::as_str) == Some("--ask") {
+        let Some(question) = args.get(2) else {
+            eprintln!("usage: zentorrent --ask \"<question>\" [folder] [--cpu]");
+            std::process::exit(2);
+        };
+        let folder = args.get(3).filter(|a| !a.starts_with("--")).map(PathBuf::from).unwrap_or(default_dir);
+        let lib = moe::skills::Library { folder, torrents: Vec::new(), feeds: history::History::load().entries };
+        if let Err(e) = rt.block_on(moe::ask(question, lib, args.iter().any(|a| a == "--cpu"))) {
+            eprintln!("error: {e}");
+            std::process::exit(1);
         }
         return Ok(());
     }
@@ -300,6 +317,7 @@ enum View {
     Downloads,
     Seeding,
     Feeds,
+    Moe,
 }
 
 /// RSS state that lives only in memory (the feed list itself is in `rss::FeedStore`).
@@ -368,6 +386,10 @@ struct App {
     meta_version: u64,
     /// The built-in player (libmpv is loaded on the first Play).
     player: Option<player::Player>,
+    /// Flux MoE asked to start at this track (matched when the play order arrives).
+    play_from: Option<String>,
+    /// The ✨ Flux MoE tab.
+    moe: moe::Moe,
     pui: player::ui::PlayerUi,
     /// Bytes of the player engine downloaded so far, while the first Play fetches it.
     engine_got: Option<Arc<std::sync::atomic::AtomicU64>>,
@@ -489,6 +511,8 @@ impl App {
             feed_hist_saved: Instant::now(),
             meta_version: 0,
             player: None,
+            play_from: None,
+            moe: moe::Moe::default(),
             pui: Default::default(),
             engine_got: None,
             vpn,
@@ -1259,6 +1283,104 @@ impl App {
         });
     }
 
+    /// Play files on disk (a Flux MoE playlist): a queue with no torrent behind it.
+    fn play_files(&mut self, ctx: &egui::Context, name: String, files: Vec<PathBuf>) {
+        if self.player.is_none() {
+            let c = ctx.clone();
+            self.player = Some(player::Player::new(self.rt.handle().clone(), Arc::new(move || c.request_repaint())));
+        }
+        self.player.as_mut().unwrap().error = Some("preparing the playlist…".into());
+        if self.engine_got.is_some() {
+            return;
+        }
+        let tracks: Vec<player::playlist::Track> = files
+            .iter()
+            .enumerate()
+            .filter_map(|(i, f)| {
+                let p = f.to_string_lossy();
+                Some(player::playlist::Track::file(i, &p, player::playlist::title_from_path(&p), None, player::playlist::kind_of(&p)?))
+            })
+            .collect();
+        let got = player::engine::needed().then(|| Arc::new(std::sync::atomic::AtomicU64::new(0)));
+        self.engine_got = got.clone();
+        let proxy = match &self.vpn {
+            vpn::Vpn::Up { proxy, .. } => Some(format!("socks5h://{}", proxy.local_addr())),
+            _ => None,
+        };
+        let (inbox, ctx) = (self.inbox.clone(), ctx.clone());
+        self.rt.spawn(async move {
+            let r = match got {
+                Some(got) => player::engine::fetch(proxy, got).await.map(|_| (tracks, PathBuf::new())),
+                None => Ok((tracks, PathBuf::new())),
+            };
+            inbox.lock().unwrap().tracks.push((String::new(), name, r));
+            ctx.request_repaint();
+        });
+    }
+
+    /// What Flux MoE's skills see: the torrents, their files, and the feed items.
+    fn moe_library(&self) -> moe::skills::Library {
+        let facts = self.collect_facts();
+        let torrents = self
+            .transfers
+            .iter()
+            .zip(facts)
+            .map(|(t, f)| {
+                let s = t.handle.stats();
+                let state = if f.error {
+                    "error"
+                } else if f.paused {
+                    "paused"
+                } else if f.finished {
+                    "complete, seeding"
+                } else {
+                    "downloading"
+                };
+                moe::skills::Torrent {
+                    hash: f.hash,
+                    name: f.name,
+                    state: state.into(),
+                    progress: if s.total_bytes > 0 { s.progress_bytes as f64 / s.total_bytes as f64 } else { 0.0 },
+                    size: f.size,
+                    labels: f.labels,
+                    sites: f.sites,
+                    files: t
+                        .handle
+                        .with_metadata(|m| m.file_infos.iter().map(|i| (i.relative_filename.to_string_lossy().replace('\\', "/"), i.len)).collect())
+                        .unwrap_or_default(),
+                    root: t.handle.output_folder().to_path_buf(),
+                }
+            })
+            .collect();
+        moe::skills::Library { folder: self.folder.clone(), torrents, feeds: self.feed_hist.entries.clone() }
+    }
+
+    /// Carry out what Flux MoE asked for (downloads only after the user's OK in the tab).
+    fn moe_actions(&mut self, ctx: &egui::Context, actions: Vec<moe::skills::Action>) {
+        use moe::skills::Action;
+        for a in actions {
+            match a {
+                Action::Play { hash, track } => {
+                    self.play_from = track;
+                    self.play_torrent(ctx, hash);
+                }
+                Action::PlayFiles { name, files } => self.play_files(ctx, name, files),
+                Action::Download { title, link, feed_key } => {
+                    let cookie = self
+                        .store
+                        .feeds
+                        .iter()
+                        .find(|f| history::feed_key(&f.url) == feed_key)
+                        .map(|f| rss::feed_cookie(&f.cookie, &f.url))
+                        .unwrap_or_default();
+                    self.start(ctx, title, Source::from_feed(link, &cookie));
+                }
+                // Moves are done by the tab itself (files only, after Apply).
+                Action::Moves { .. } => {}
+            }
+        }
+    }
+
     /// The now-playing bar, the playlist panel and the Sound window.
     fn player_ui(&mut self, root: &mut egui::Ui, ctx: &egui::Context) {
         let Some(hash) = self.player.as_ref().filter(|p| p.active() || p.error.is_some()).map(|p| p.queue.hash.clone()) else { return };
@@ -1326,7 +1448,12 @@ impl App {
                         repeat: p.queue.repeat,
                     };
                     p.error = None;
-                    p.start(queue, 0, &|f| files.complete(f));
+                    // Flux MoE may have asked for a particular track.
+                    let at = self.play_from.take().and_then(|want| {
+                        let w = want.to_lowercase();
+                        queue.tracks.iter().position(|t| t.title.to_lowercase().contains(&w) || t.path.to_lowercase().contains(&w))
+                    });
+                    p.start(queue, at.unwrap_or(0), &|f| files.complete(f));
                     self.pui.show_playlist = true;
                 }
                 Err(e) => {
@@ -1682,6 +1809,7 @@ impl eframe::App for App {
                 ui.selectable_value(&mut self.view, View::Downloads, format!("Downloads ({})", self.transfers.len()));
                 ui.selectable_value(&mut self.view, View::Seeding, "Seeding & ratio");
                 ui.selectable_value(&mut self.view, View::Feeds, format!("RSS feeds ({})", self.store.feeds.len()));
+                ui.selectable_value(&mut self.view, View::Moe, "✨ Flux MoE").on_hover_text("Your media assistant: overview, feed search, play, playlists, tidy folders — runs on this computer");
                 ui.add_space(8.0);
                 self.vpn_badge(ui);
                 self.update_ui(ui, ctx);
@@ -1760,6 +1888,16 @@ impl eframe::App for App {
         if self.view == View::Feeds {
             egui::CentralPanel::default().show(root, |ui| self.feeds_ui(ui, ctx));
             ctx.request_repaint_after(Duration::from_millis(500));
+            return;
+        }
+        if self.view == View::Moe {
+            let mut actions = Vec::new();
+            egui::CentralPanel::default().show(root, |ui| actions = self.moe.ui(ui, ctx, &self.rt));
+            if let Some(text) = self.moe.take_pending() {
+                let lib = self.moe_library();
+                self.moe.send(text, &self.rt, ctx, lib);
+            }
+            self.moe_actions(ctx, actions);
             return;
         }
 
