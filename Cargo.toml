@@ -22,6 +22,8 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 regex = "1"
 anyhow = "1"
 url = "2"
+# The player opens libmpv at run time (no link-time dependency, no LGPL crate).
+libloading = "0.8"
 dirs = "6"
 # VPN: vendored IronTunnel v1 client (src/tunnel/, scripts/vendor-irontunnel.sh)
 snow = "0.9"

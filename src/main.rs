@@ -26,6 +26,7 @@ const FEED_RETRY: Duration = Duration::from_secs(60);
 mod details;
 mod history;
 mod meta;
+mod player;
 mod rss;
 mod search;
 mod seed;
@@ -147,7 +148,8 @@ fn main() -> eframe::Result<()> {
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("ZenTorrent")
-            .with_inner_size([860.0, 620.0])
+            // Room for the sidebar, the list and the player's playlist side by side.
+            .with_inner_size([1180.0, 720.0])
             .with_min_inner_size([560.0, 420.0]),
         ..Default::default()
     };
@@ -156,6 +158,27 @@ fn main() -> eframe::Result<()> {
         opts,
         Box::new(move |cc| Ok(Box::new(App::new(cc, rt, default_dir)))),
     )
+}
+
+/// Incoming peer connections. Without a listener ZenTorrent can only dial out: two such
+/// clients never find each other, and seeding reaches only peers that listen themselves.
+/// UPnP asks the router to forward the port. Never used with the VPN on (see `vpn`).
+fn listener(port: u16) -> librqbit::ListenerOptions {
+    librqbit::ListenerOptions {
+        listen_addr: (std::net::Ipv6Addr::UNSPECIFIED, port).into(),
+        enable_upnp_port_forwarding: true,
+        ..Default::default()
+    }
+}
+
+/// A port in 20000–59999 picked from the data folder: the same on every start (so a
+/// router rule keeps working), different for two installs on one machine.
+fn listen_port() -> u16 {
+    let h = seed::data_dir()
+        .to_string_lossy()
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
+    20_000 + (h % 40_000) as u16
 }
 
 async fn cli(link: String, dir: PathBuf, vpn: &vpn::Vpn) -> anyhow::Result<()> {
@@ -235,6 +258,8 @@ struct Inbox {
     busy: usize,
     /// Result of the VPN window's "Test relay" (handshake + ping, ms).
     vpn_test: Option<Result<u128, String>>,
+    /// (info-hash, torrent name, play order + folder, or why not) after a Play click.
+    tracks: Vec<(String, String, Result<(Vec<player::playlist::Track>, PathBuf), String>)>,
 }
 
 #[derive(Clone)]
@@ -318,6 +343,9 @@ struct App {
     feed_hist_saved: Instant,
     /// Bumped when OMDb answers arrive: search sees film genres from them.
     meta_version: u64,
+    /// The built-in player (libmpv is loaded on the first Play).
+    player: Option<player::Player>,
+    pui: player::ui::PlayerUi,
     vpn: vpn::Vpn,
     /// Settings the running engine was started with / last saved / being edited.
     vpn_running: vpn::VpnSettings,
@@ -338,16 +366,17 @@ impl App {
         // tunnel is up (kill switch), and with every non-tunnel path switched off.
         let vpn_settings = vpn::VpnSettings::load();
         let vpn = vpn::Vpn::start(&rt, &vpn_settings);
-        let engine_opts = SessionOptions {
+        let engine_opts = |listen: Option<librqbit::ListenerOptions>| SessionOptions {
             // Persistence: librqbit remembers every torrent (and where it got
             // to) in the data dir, so a restart resumes downloads and seeding.
             persistence: Some(librqbit::SessionPersistenceConfig::Json {
                 folder: Some(seed::data_dir().join("session")),
             }),
             fastresume: true,
+            listen,
             ..Default::default()
         };
-        let (session, session_error) = match vpn::session_options(engine_opts, &vpn) {
+        let (session, session_error) = match vpn::session_options(engine_opts(None), &vpn) {
             None => (
                 None,
                 Some(format!(
@@ -356,10 +385,29 @@ impl App {
                     vpn.failure().unwrap_or("?")
                 )),
             ),
-            Some(opts) => match rt.block_on(Session::new_with_opts(folder.clone(), opts)) {
+            // The VPN tunnel only carries outgoing connections, so no listener there.
+            Some(opts) if vpn.is_up() => match rt.block_on(Session::new_with_opts(folder.clone(), opts)) {
                 Ok(s) => (Some(s), None),
                 Err(e) => (None, Some(format!("could not start the torrent engine: {e:#}"))),
             },
+            // Direct: listen on this install's port, else any free port, else not at all.
+            Some(_) => {
+                let mut last = None;
+                let mut started = None;
+                for listen in [Some(listener(listen_port())), Some(listener(0)), None] {
+                    match rt.block_on(Session::new_with_opts(folder.clone(), engine_opts(listen))) {
+                        Ok(s) => {
+                            started = Some(s);
+                            break;
+                        }
+                        Err(e) => last = Some(e),
+                    }
+                }
+                match started {
+                    Some(s) => (Some(s), None),
+                    None => (None, last.map(|e| format!("could not start the torrent engine: {e:#}"))),
+                }
+            }
         };
 
         let inbox = Arc::new(Mutex::new(Inbox::default()));
@@ -415,6 +463,8 @@ impl App {
             feed_hist: history::History::load(),
             feed_hist_saved: Instant::now(),
             meta_version: 0,
+            player: None,
+            pui: Default::default(),
             vpn,
             vpn_running: vpn_settings.clone(),
             vpn_edit: vpn_settings.clone(),
@@ -1130,7 +1180,96 @@ impl App {
         });
     }
 
+    /// Bytes done and sizes of every file of one torrent (empty before metadata).
+    fn file_state(&self, hash: &str) -> (Vec<u64>, Vec<u64>) {
+        let Some(t) = self.transfers.iter().find(|t| t.handle.info_hash().as_string() == hash) else { return Default::default() };
+        let lens = t.handle.with_metadata(|m| m.file_infos.iter().map(|f| f.len).collect()).unwrap_or_default();
+        (t.handle.stats().file_progress, lens)
+    }
+
+    /// Play click: build the play order in the background (reading the torrent's
+    /// .m3u playlists, through the stream if they aren't downloaded yet).
+    fn play_torrent(&mut self, ctx: &egui::Context, hash: String) {
+        let Some(t) = self.transfers.iter().find(|t| t.handle.info_hash().as_string() == hash) else { return };
+        let (handle, name) = (t.handle.clone(), t.name.clone());
+        if self.player.is_none() {
+            let c = ctx.clone();
+            self.player = Some(player::Player::new(self.rt.handle().clone(), Arc::new(move || c.request_repaint())));
+        }
+        let p = self.player.as_mut().unwrap();
+        p.registry.torrents.lock().unwrap().insert(hash.clone(), handle.clone());
+        p.error = Some("preparing the playlist…".into());
+        let (inbox, ctx) = (self.inbox.clone(), ctx.clone());
+        self.rt.spawn(async move {
+            let r = player::load_tracks(handle).await;
+            inbox.lock().unwrap().tracks.push((hash, name, r));
+            ctx.request_repaint();
+        });
+    }
+
+    /// The now-playing bar, the playlist panel and the Sound window.
+    fn player_ui(&mut self, root: &mut egui::Ui, ctx: &egui::Context) {
+        let Some(hash) = self.player.as_ref().filter(|p| p.active() || p.error.is_some()).map(|p| p.queue.hash.clone()) else { return };
+        let (done, len) = self.file_state(&hash);
+        let files = player::ui::Files { done: &done, len: &len };
+        let p = self.player.as_mut().unwrap();
+        p.tick(&|f| files.complete(f));
+        if !p.active() {
+            // Not playing yet (or the engine is missing): just say why.
+            let msg = p.error.clone().unwrap_or_default();
+            egui::Panel::bottom("player").show(root, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(msg).weak());
+                    if ui.small_button("x").clicked() {
+                        p.error = None;
+                    }
+                });
+            });
+            return;
+        }
+        let pui = &mut self.pui;
+        egui::Panel::bottom("player").show(root, |ui| player::ui::bar(ui, p, pui, &files));
+        if pui.show_playlist {
+            egui::Panel::right("playlist").resizable(true).default_size(300.0).size_range(220.0..=520.0).show(root, |ui| {
+                player::ui::playlist(ui, p, &files)
+            });
+        }
+        if pui.show_sound {
+            let mut open = true;
+            player::ui::sound(ctx, p, &mut open);
+            pui.show_sound = open;
+        }
+    }
+
     fn drain_inbox(&mut self, ctx: &egui::Context) {
+        let ready = std::mem::take(&mut self.inbox.lock().unwrap().tracks);
+        for (hash, name, r) in ready {
+            match r {
+                Ok((tracks, folder)) => {
+                    let (done, len) = self.file_state(&hash);
+                    let files = player::ui::Files { done: &done, len: &len };
+                    let p = self.player.as_mut().unwrap();
+                    let queue = player::audio::Queue {
+                        hash,
+                        torrent: name,
+                        folder,
+                        order: (0..tracks.len()).collect(),
+                        tracks,
+                        pos: None,
+                        shuffle: p.queue.shuffle,
+                        repeat: p.queue.repeat,
+                    };
+                    p.error = None;
+                    p.start(queue, 0, &|f| files.complete(f));
+                    self.pui.show_playlist = true;
+                }
+                Err(e) => {
+                    if let Some(p) = self.player.as_mut() {
+                        p.error = Some(format!("{name}: {e}"));
+                    }
+                }
+            }
+        }
         if let Some(r) = self.inbox.lock().unwrap().vpn_test.take() {
             self.vpn_testing = false;
             self.vpn_note = Some(match r {
@@ -1542,6 +1681,7 @@ impl eframe::App for App {
             });
         });
         self.sidebar_actions(actions);
+        self.player_ui(root, ctx);
 
         self.tick_ledger();
         // Drawn before the central panels; as a modal it sits above all of them.
@@ -1614,6 +1754,7 @@ impl eframe::App for App {
             let mut remove = None;
             let mut relabel: Vec<(String, String, bool)> = Vec::new();
             let mut open_details: Option<String> = None;
+            let mut play_req: Option<String> = None;
             let labels = self.ledger.labels.clone();
             egui::ScrollArea::vertical().show(ui, |ui| {
                 for (i, t) in self.transfers.iter().enumerate() {
@@ -1621,7 +1762,7 @@ impl eframe::App for App {
                         continue;
                     }
                     let Some(f) = self.facts.get(i) else { continue };
-                    transfer_row(ui, &self.rt, self.session.as_ref(), t, f, &labels, &mut relabel, &mut open_details, || remove = Some(i));
+                    transfer_row(ui, &self.rt, self.session.as_ref(), t, f, &labels, &mut relabel, &mut open_details, &mut play_req, || remove = Some(i));
                     ui.add_space(4.0);
                 }
                 if shown == 0 && !self.transfers.is_empty() {
@@ -1636,6 +1777,9 @@ impl eframe::App for App {
                     self.ledger.set_label(&hash, &label, on);
                 }
                 self.save_ledger();
+            }
+            if let Some(hash) = play_req {
+                self.play_torrent(ctx, hash);
             }
             if let Some(hash) = open_details {
                 self.details = Some(details::Details::new(hash));
@@ -2181,6 +2325,7 @@ fn transfer_row(
     all_labels: &[String],
     relabel: &mut Vec<(String, String, bool)>,
     open_details: &mut Option<String>,
+    play: &mut Option<String>,
     mut on_remove: impl FnMut(),
 ) {
     let s = t.handle.stats();
@@ -2190,21 +2335,8 @@ fn transfer_row(
     ui.group(|ui| {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
-            // The name is the drag handle: drop it on a sidebar entry.
-            ui.dnd_drag_source(egui::Id::new(("zt-drag", &f.hash)), sidebar::Dragged(f.hash.clone()), |ui| {
-                ui.strong(&t.name);
-            })
-            .response
-            .on_hover_text("Drag onto a label to tag it, or onto Paused / Downloading to pause or resume");
-            for l in &f.labels {
-                chip(ui, l, sidebar::tint(l)).on_hover_text("label");
-            }
-            // Private trackers are the ones worth naming on the row.
-            if f.private {
-                for site in &f.sites {
-                    chip(ui, &format!("{} 🔒", sidebar::pretty(site)), egui::Color32::from_gray(170)).on_hover_text("private tracker");
-                }
-            }
+            // Buttons are laid out first (right to left) so they always fit; the
+            // name and chips then get the width that's left, truncated if need be.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.small_button("Remove").on_hover_text("Stop and remove from list (keeps files)").clicked() {
                     on_remove();
@@ -2227,6 +2359,14 @@ fn transfer_row(
                 {
                     *open_details = Some(f.hash.clone());
                 }
+                if player::has_media(&t.handle)
+                    && ui
+                        .small_button("▶ Play")
+                        .on_hover_text("Auto-play: starts right away and streams what hasn't downloaded yet. Uses the torrent's .m3u playlist if it has one.")
+                        .clicked()
+                {
+                    *play = Some(f.hash.clone());
+                }
                 if ui.small_button("Open folder").clicked() {
                     let _ = open_folder(&t.folder);
                 }
@@ -2241,6 +2381,23 @@ fn transfer_row(
                         }
                     }
                 }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    // The name is the drag handle: drop it on a sidebar entry.
+                    ui.dnd_drag_source(egui::Id::new(("zt-drag", &f.hash)), sidebar::Dragged(f.hash.clone()), |ui| {
+                        ui.add(egui::Label::new(egui::RichText::new(&t.name).strong()).truncate());
+                    })
+                    .response
+                    .on_hover_text(format!("{}\n\nDrag onto a label to tag it, or onto Paused / Downloading to pause or resume", t.name));
+                    for l in &f.labels {
+                        chip(ui, l, sidebar::tint(l)).on_hover_text("label");
+                    }
+                    // Private trackers are the ones worth naming on the row.
+                    if f.private {
+                        for site in &f.sites {
+                            chip(ui, &format!("{} 🔒", sidebar::pretty(site)), egui::Color32::from_gray(170)).on_hover_text("private tracker");
+                        }
+                    }
+                });
             });
         });
 

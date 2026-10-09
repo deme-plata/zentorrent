@@ -5969,6 +5969,7 @@ dependencies = [
  "eframe",
  "hex",
  "image",
+ "libloading",
  "librqbit",
  "quick-xml",
  "regex",
