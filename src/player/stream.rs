@@ -1,4 +1,6 @@
 //! `zt://<info-hash>/<file index>`: mpv reads a file that is still downloading.
+//! `zt://<info-hash>/a/<archive>/<member>`: the same for a film inside an archive
+//! (see `archive`), read across the archive's volume files.
 //!
 //! mpv calls these C callbacks on its own demuxer thread. Each read goes to
 //! librqbit's `FileStream`, which asks the swarm for the pieces just ahead of
@@ -14,6 +16,7 @@ use std::sync::{Arc, Mutex};
 use librqbit::ManagedTorrent;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
+use super::archive;
 use super::ffi::{self, StreamCbInfo};
 
 pub const SCHEME: &str = "zt";
@@ -23,29 +26,89 @@ pub fn url(info_hash: &str, file_index: usize) -> String {
     format!("{SCHEME}://{info_hash}/{file_index}")
 }
 
-/// `zt://<hash>/<idx>` → (hash, idx).
-pub fn parse(uri: &str) -> Option<(String, usize)> {
-    let rest = uri.strip_prefix(SCHEME)?.strip_prefix("://")?;
-    let (hash, idx) = rest.split_once('/')?;
-    (!hash.is_empty() && hash.chars().all(|c| c.is_ascii_hexdigit())).then_some(())?;
-    Some((hash.to_ascii_lowercase(), idx.parse().ok()?))
+/// The URL mpv is given for a member of an archive. `archive` = the index of the
+/// archive's first volume file, `member` = its place in the archive's file list.
+pub fn member_url(info_hash: &str, archive: usize, member: usize) -> String {
+    format!("{SCHEME}://{info_hash}/a/{archive}/{member}")
 }
 
-/// What the open callback needs: the torrents it may stream from, and a runtime.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Target {
+    File { hash: String, file: usize },
+    Member { hash: String, archive: usize, member: usize },
+}
+
+/// `zt://<hash>/<idx>` or `zt://<hash>/a/<archive>/<member>`.
+pub fn parse(uri: &str) -> Option<Target> {
+    let rest = uri.strip_prefix(SCHEME)?.strip_prefix("://")?;
+    let (hash, path) = rest.split_once('/')?;
+    (!hash.is_empty() && hash.chars().all(|c| c.is_ascii_hexdigit())).then_some(())?;
+    let hash = hash.to_ascii_lowercase();
+    match path.strip_prefix("a/") {
+        Some(m) => {
+            let (a, m) = m.split_once('/')?;
+            Some(Target::Member { hash, archive: a.parse().ok()?, member: m.parse().ok()? })
+        }
+        None => Some(Target::File { hash, file: path.parse().ok()? }),
+    }
+}
+
+/// What the open callback needs: the torrents it may stream from, their indexed
+/// archives (by info hash + first volume), and a runtime.
 pub struct Registry {
     pub rt: tokio::runtime::Handle,
     pub torrents: Mutex<HashMap<String, Arc<ManagedTorrent>>>,
+    pub archives: Mutex<HashMap<(String, usize), Arc<archive::Indexed>>>,
 }
 
 /// librqbit's `FileStream` is not exported by name; it is used through these traits.
 trait ReadSeek: tokio::io::AsyncRead + tokio::io::AsyncSeek + Unpin + Send {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncSeek + Unpin + Send> ReadSeek for T {}
 
+/// The torrent's files as an `archive::Source`. It keeps the last file's stream
+/// open, so reading a volume front to back is one stream (librqbit's read-ahead
+/// keeps fetching the pieces just after the read position).
+pub struct TorrentSource {
+    handle: Arc<ManagedTorrent>,
+    open: tokio::sync::Mutex<Option<(usize, Box<dyn ReadSeek>, u64)>>,
+}
+
+impl TorrentSource {
+    pub fn new(handle: Arc<ManagedTorrent>) -> Self {
+        TorrentSource { handle, open: tokio::sync::Mutex::new(None) }
+    }
+}
+
+impl archive::Source for TorrentSource {
+    fn read_into<'a>(&'a self, file: usize, off: u64, buf: &'a mut [u8]) -> impl std::future::Future<Output = std::io::Result<usize>> + Send + 'a {
+        async move {
+            let mut open = self.open.lock().await;
+            if !matches!(&*open, Some((f, _, _)) if *f == file) {
+                let s = self.handle.clone().stream(file).await.map_err(|e| std::io::Error::other(e.to_string()))?;
+                *open = Some((file, Box::new(s), 0));
+            }
+            let (_, s, at) = open.as_mut().unwrap();
+            if *at != off {
+                s.seek(std::io::SeekFrom::Start(off)).await?;
+                *at = off;
+            }
+            let n = s.read(buf).await?;
+            *at += n as u64;
+            Ok(n)
+        }
+    }
+}
+
+enum Reader {
+    File(Box<dyn ReadSeek>),
+    Member(archive::Cursor<TorrentSource>),
+}
+
 /// Per open file. Callbacks only ever take `&Cookie` (cancel arrives on another
-/// thread while a read waits), so the stream itself sits behind a mutex.
+/// thread while a read waits), so the reader itself sits behind a mutex.
 struct Cookie {
     rt: tokio::runtime::Handle,
-    stream: Mutex<Box<dyn ReadSeek>>,
+    stream: Mutex<Reader>,
     len: u64,
     cancelled: AtomicBool,
     wake: tokio::sync::Notify,
@@ -64,16 +127,33 @@ pub fn register(api: &ffi::Api, h: *mut ffi::Handle, reg: &'static Registry) -> 
 unsafe extern "C" fn open(user: *mut c_void, uri: *mut c_char, info: *mut StreamCbInfo) -> c_int {
     let reg = &*(user as *const Registry);
     let uri = CStr::from_ptr(uri).to_string_lossy();
-    let Some((hash, idx)) = parse(&uri) else { return ffi::ERROR_LOADING_FAILED };
+    let Some(target) = parse(&uri) else { return ffi::ERROR_LOADING_FAILED };
+    let hash = match &target {
+        Target::File { hash, .. } | Target::Member { hash, .. } => hash.clone(),
+    };
     let Some(handle) = reg.torrents.lock().unwrap().get(&hash).cloned() else { return ffi::ERROR_LOADING_FAILED };
-    let stream = match reg.rt.block_on(handle.stream(idx)) {
-        Ok(s) => s,
-        Err(_) => return ffi::ERROR_LOADING_FAILED,
+    let (reader, len) = match target {
+        Target::File { file, .. } => match reg.rt.block_on(handle.stream(file)) {
+            Ok(s) => {
+                let len = s.len();
+                (Reader::File(Box::new(s)), len)
+            }
+            Err(_) => return ffi::ERROR_LOADING_FAILED,
+        },
+        Target::Member { archive, member, .. } => {
+            let Some(a) = reg.archives.lock().unwrap().get(&(hash, archive)).cloned() else { return ffi::ERROR_LOADING_FAILED };
+            if a.members.get(member).is_none_or(|m| m.why_not.is_some()) {
+                return ffi::ERROR_LOADING_FAILED;
+            }
+            let c = archive::Cursor { src: TorrentSource::new(handle), archive: a, member, pos: 0 };
+            let len = c.len();
+            (Reader::Member(c), len)
+        }
     };
     let cookie = Box::new(Cookie {
         rt: reg.rt.clone(),
-        len: stream.len(),
-        stream: Mutex::new(Box::new(stream)),
+        len,
+        stream: Mutex::new(reader),
         cancelled: AtomicBool::new(false),
         wake: tokio::sync::Notify::new(),
     });
@@ -94,10 +174,16 @@ unsafe extern "C" fn read(cookie: *mut c_void, buf: *mut c_char, n: u64) -> i64 
         return ffi::ERROR_GENERIC;
     }
     let out = std::slice::from_raw_parts_mut(buf as *mut u8, n.min(1 << 20) as usize);
-    let mut stream = c.stream.lock().unwrap();
+    let mut reader = c.stream.lock().unwrap();
     let r = c.rt.block_on(async {
+        let read = async {
+            match &mut *reader {
+                Reader::File(s) => s.read(out).await,
+                Reader::Member(m) => m.read(out).await,
+            }
+        };
         tokio::select! {
-            r = stream.read(out) => Some(r),
+            r = read => Some(r),
             // notify_one leaves a permit, so a cancel that lands just before
             // this wait still wakes it.
             _ = c.wake.notified() => None,
@@ -114,10 +200,18 @@ unsafe extern "C" fn seek(cookie: *mut c_void, offset: i64) -> i64 {
     if offset < 0 || c.cancelled.load(Ordering::Acquire) {
         return ffi::ERROR_UNSUPPORTED;
     }
-    let mut stream = c.stream.lock().unwrap();
-    match c.rt.block_on(stream.seek(std::io::SeekFrom::Start(offset as u64))) {
-        Ok(p) => p as i64,
-        Err(_) => ffi::ERROR_UNSUPPORTED,
+    let mut reader = c.stream.lock().unwrap();
+    match &mut *reader {
+        Reader::File(s) => match c.rt.block_on(s.seek(std::io::SeekFrom::Start(offset as u64))) {
+            Ok(p) => p as i64,
+            Err(_) => ffi::ERROR_UNSUPPORTED,
+        },
+        // Positions are mapped onto the volumes at the next read.
+        Reader::Member(m) if offset as u64 <= c.len => {
+            m.pos = offset as u64;
+            offset
+        }
+        Reader::Member(_) => ffi::ERROR_UNSUPPORTED,
     }
 }
 
@@ -142,12 +236,15 @@ mod tests {
 
     #[test]
     fn urls_round_trip() {
-        let u = url("5b1e0d988fc7a0c9e99bd852071681a59974b39f", 3);
+        let h = "5b1e0d988fc7a0c9e99bd852071681a59974b39f";
+        let u = url(h, 3);
         assert_eq!(u, "zt://5b1e0d988fc7a0c9e99bd852071681a59974b39f/3");
-        assert_eq!(parse(&u), Some(("5b1e0d988fc7a0c9e99bd852071681a59974b39f".into(), 3)));
-        assert_eq!(parse("zt://ABCDEF/0"), Some(("abcdef".into(), 0)));
+        assert_eq!(parse(&u), Some(Target::File { hash: h.into(), file: 3 }));
+        assert_eq!(parse(&member_url(h, 12, 1)), Some(Target::Member { hash: h.into(), archive: 12, member: 1 }));
+        assert_eq!(parse("zt://ABCDEF/0"), Some(Target::File { hash: "abcdef".into(), file: 0 }));
         assert_eq!(parse("zt://../etc/passwd"), None);
         assert_eq!(parse("http://abc/1"), None);
         assert_eq!(parse("zt://abc/x"), None);
+        assert_eq!(parse("zt://abc/a/1"), None);
     }
 }

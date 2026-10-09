@@ -3,3 +3,5 @@
 * text=auto eol=lf
 *.png binary
 *.ico binary
+# Test archives are byte-exact recordings of real tools: never touch their bytes.
+tests/fixtures/** binary

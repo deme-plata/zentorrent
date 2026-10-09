@@ -260,7 +260,10 @@ impl Mpv {
             // Music: cover art does not open a video window.
             ("audio-display", "no"),
             // Video files open mpv's own window for now, with the high-quality renderer.
-            ("vo", "gpu-next"),
+            // The trailing comma lets mpv fall back to its other outputs when no GPU
+            // renderer starts (old or software-only drivers): mpv sets video up before
+            // audio, so a failed video output would otherwise end the whole file.
+            ("vo", "gpu-next,gpu,"),
             ("profile", "high-quality"),
             ("scale", "ewa_lanczossharp"),
             ("cscale", "ewa_lanczossharp"),
@@ -276,6 +279,13 @@ impl Mpv {
         }
         if !ao.is_empty() {
             m.opt("ao", &ao); // tests on a machine without sound use ao=null
+        }
+        // Diagnostics: mpv's own full log (what to ask for when a file won't play),
+        // and the video output (a machine without a GPU: vo=null).
+        for (var, opt) in [("ZENTORRENT_MPV_LOG", "log-file"), ("ZENTORRENT_MPV_VO", "vo")] {
+            if let Ok(v) = std::env::var(var).map(|v| v.trim().to_string()).and_then(|v| if v.is_empty() { Err(std::env::VarError::NotPresent) } else { Ok(v) }) {
+                m.opt(opt, &v);
+            }
         }
         let rc = unsafe { (api.initialize)(h) };
         if rc < 0 {
@@ -390,7 +400,8 @@ pub struct Player {
 impl Player {
     pub fn new(rt: tokio::runtime::Handle, repaint: Arc<dyn Fn() + Send + Sync>) -> Player {
         // Lives as long as the process: mpv's stream callbacks point at it.
-        let registry: &'static Registry = Box::leak(Box::new(Registry { rt, torrents: Mutex::new(Default::default()) }));
+        let registry: &'static Registry =
+            Box::leak(Box::new(Registry { rt, torrents: Mutex::new(Default::default()), archives: Mutex::new(Default::default()) }));
         Player { mpv: None, registry, live: Default::default(), queue: Queue::default(), sound: Sound::load(), in_mpv: Vec::new(), error: None, repaint }
     }
 
@@ -408,8 +419,11 @@ impl Player {
     }
 
     /// Where mpv reads a track: the file on disk once complete, else the stream.
+    /// Archive members are always read through the stream (mpv can't open archives).
     fn source(&self, track: &Track, complete: bool) -> String {
-        if complete {
+        if let Some((archive, member)) = track.archive {
+            stream::member_url(&self.queue.hash, archive, member)
+        } else if complete {
             self.queue.folder.join(&track.path).to_string_lossy().into_owned()
         } else {
             stream::url(&self.queue.hash, track.file)
@@ -553,7 +567,7 @@ mod tests {
 
     fn queue(n: usize) -> Queue {
         let tracks = (0..n)
-            .map(|i| Track { file: i, path: format!("A/{i}.flac"), title: format!("T{i}"), duration: None, kind: Kind::Audio })
+            .map(|i| Track::file(i, &format!("A/{i}.flac"), format!("T{i}"), None, Kind::Audio))
             .collect();
         Queue { tracks, order: (0..n).collect(), pos: Some(0), ..Default::default() }
     }

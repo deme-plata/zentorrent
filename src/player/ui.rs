@@ -4,6 +4,7 @@
 use eframe::egui::{self, Color32, RichText};
 
 use super::audio::{Player, Repeat, BANDS, EQ_RANGE, PRESETS};
+use super::playlist::Track;
 
 #[derive(Default)]
 pub struct PlayerUi {
@@ -25,11 +26,11 @@ impl Files<'_> {
     pub fn complete(&self, f: usize) -> bool {
         matches!((self.done.get(f), self.len.get(f)), (Some(d), Some(l)) if d >= l)
     }
-    fn percent(&self, f: usize) -> Option<u64> {
-        match (self.done.get(f), self.len.get(f)) {
-            (Some(&d), Some(&l)) if l > 0 && d < l => Some(d * 100 / l),
-            _ => None,
-        }
+    /// How much of a still-downloading track is here (an archive track: all its volumes).
+    pub fn track_percent(&self, t: &Track) -> Option<u64> {
+        let parts = if t.parts.is_empty() { std::slice::from_ref(&t.file) } else { &t.parts[..] };
+        let (d, l) = parts.iter().fold((0u64, 0u64), |(d, l), &f| (d + self.done.get(f).copied().unwrap_or(0), l + self.len.get(f).copied().unwrap_or(0)));
+        (l > 0 && d < l).then(|| d * 100 / l)
     }
 }
 
@@ -65,15 +66,15 @@ pub fn bar(ui: &mut egui::Ui, p: &mut Player, pu: &mut PlayerUi, files: &Files) 
         let title_w = (ui.available_width() * 0.28).clamp(120.0, 300.0);
         ui.vertical(|ui| {
             ui.set_width(title_w);
-            // While streaming, mpv only knows the zt:// URL, whose last part is the file index.
-            let from_url = live.title.contains("zt://") || live.title == track.file.to_string();
+            // While streaming, mpv only knows the zt:// URL, whose last part is a number.
+            let from_url = live.title.contains("zt://") || live.title.bytes().all(|c| c.is_ascii_digit());
             let title = if live.title.is_empty() || from_url { track.title.clone() } else { live.title.clone() };
             ui.add(egui::Label::new(RichText::new(title).strong()).truncate()).on_hover_text(&track.path);
             let mut sub = p.queue.torrent.clone();
             if !live.artist.is_empty() {
                 sub = format!("{} · {sub}", live.artist);
             }
-            if let Some(pc) = files.percent(track.file) {
+            if let Some(pc) = files.track_percent(&track) {
                 sub = format!("streaming, {pc} % downloaded · {sub}");
             }
             ui.add(egui::Label::new(RichText::new(sub).small().weak()).truncate());
@@ -170,7 +171,7 @@ pub fn playlist(ui: &mut egui::Ui, p: &mut Player, files: &Files) {
                         if !current && ui.small_button("x").on_hover_text("Remove from the playlist").clicked() {
                             remove = Some(pos);
                         }
-                        if let Some(pc) = files.percent(t.file) {
+                        if let Some(pc) = files.track_percent(t) {
                             ui.label(RichText::new(format!("{pc} %")).small().color(Color32::from_rgb(230, 190, 80)))
                                 .on_hover_text("still downloading: plays as a stream");
                         }

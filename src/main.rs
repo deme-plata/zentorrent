@@ -1232,6 +1232,7 @@ impl App {
         let p = self.player.as_mut().unwrap();
         p.registry.torrents.lock().unwrap().insert(hash.clone(), handle.clone());
         p.error = Some("preparing the playlist…".into());
+        let reg = p.registry;
         // Windows, first Play: fetch the player engine first (through the tunnel when
         // the VPN is up, like everything else the user asked for).
         if self.engine_got.is_some() {
@@ -1252,7 +1253,7 @@ impl App {
                     return;
                 }
             }
-            let r = player::load_tracks(handle).await;
+            let r = player::load_tracks(handle, reg).await;
             inbox.lock().unwrap().tracks.push((hash, name, r));
             ctx.request_repaint();
         });
@@ -2427,7 +2428,7 @@ fn transfer_row(
                 if player::has_media(&t.handle)
                     && ui
                         .small_button("▶ Play")
-                        .on_hover_text("Auto-play: starts right away and streams what hasn't downloaded yet. Uses the torrent's .m3u playlist if it has one.")
+                        .on_hover_text("Auto-play: starts right away and streams what hasn't downloaded yet — also films packed in RAR/ZIP/TAR archives (stored, as scene releases are). Uses the torrent's .m3u playlist if it has one.")
                         .clicked()
                 {
                     *play = Some(f.hash.clone());

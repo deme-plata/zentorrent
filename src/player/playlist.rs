@@ -42,6 +42,31 @@ pub struct Track {
     /// Seconds, from #EXTINF (or later from the player).
     pub duration: Option<f64>,
     pub kind: Kind,
+    /// Inside an archive: (first volume's file index, member number). Then
+    /// `file` is the first volume and `path` is "<archive folder>/<member>".
+    pub archive: Option<(usize, usize)>,
+    /// The archive's volume files (for download progress); empty otherwise.
+    pub parts: Vec<usize>,
+}
+
+impl Track {
+    pub fn file(file: usize, path: &str, title: String, duration: Option<f64>, kind: Kind) -> Track {
+        Track { file, path: path.to_string(), title, duration, kind, archive: None, parts: Vec::new() }
+    }
+}
+
+/// Scene releases put a short preview in "Sample/" or "…-sample.mkv"; it plays last.
+pub fn is_sample(path: &str) -> bool {
+    let l = path.to_ascii_lowercase();
+    let mut parts = l.split('/');
+    let name = parts.next_back().unwrap_or("");
+    let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name);
+    parts.any(|d| d == "sample" || d == "samples") || stem == "sample" || stem.ends_with("-sample") || stem.ends_with(".sample") || stem.ends_with("_sample")
+}
+
+/// Natural path order, samples last.
+pub fn order(tracks: &mut [Track]) {
+    tracks.sort_by(|a, b| is_sample(&a.path).cmp(&is_sample(&b.path)).then_with(|| natural_cmp(&a.path, &b.path)));
 }
 
 /// "Album/CD1/03 - Song.flac" → "03 - Song".
@@ -161,17 +186,16 @@ pub fn build(files: &[(String, usize)], m3us: &[(String, String)]) -> Vec<Track>
             let Some((path, idx)) = hit else { continue };
             let Some(kind) = kind_of(path) else { continue };
             if seen.insert(*idx) {
-                out.push(Track { file: *idx, path: path.clone(), title: e.title.unwrap_or_else(|| title_from_path(path)), duration: e.duration, kind });
+                out.push(Track::file(*idx, path, e.title.unwrap_or_else(|| title_from_path(path)), e.duration, kind));
             }
         }
     }
     if out.is_empty() {
-        let mut media: Vec<&(String, usize)> = files.iter().filter(|(p, _)| kind_of(p).is_some()).collect();
-        media.sort_by(|a, b| natural_cmp(&a.0, &b.0));
-        out = media
-            .into_iter()
-            .map(|(p, i)| Track { file: *i, path: p.clone(), title: title_from_path(p), duration: None, kind: kind_of(p).unwrap() })
+        out = files
+            .iter()
+            .filter_map(|(p, i)| Some(Track::file(*i, p, title_from_path(p), None, kind_of(p)?)))
             .collect();
+        order(&mut out);
     }
     out
 }
@@ -217,6 +241,15 @@ mod tests {
         let t = build(&f, &[("Box/CD2/cd2.m3u".into(), "b.flac\n".into()), ("Box/CD1/cd1.m3u".into(), "a.flac\n../CD2/b.flac\n".into())]);
         assert_eq!(t.iter().map(|t| t.path.as_str()).collect::<Vec<_>>(), ["Box/CD1/a.flac", "Box/CD2/b.flac"], "disc order, no duplicates");
         assert_eq!(join("A", "../../x"), None, "never above the torrent root");
+    }
+
+    #[test]
+    fn samples_play_last() {
+        let f = files(&["Show/Sample/show-sample.mkv", "Show/show.s01e02.mkv", "Show/show.s01e01.mkv", "Film/film.sample.mkv"]);
+        let t = build(&f, &[]);
+        let got: Vec<_> = t.iter().map(|t| t.path.as_str()).collect();
+        assert_eq!(got, ["Show/show.s01e01.mkv", "Show/show.s01e02.mkv", "Film/film.sample.mkv", "Show/Sample/show-sample.mkv"]);
+        assert!(!is_sample("Samples of Life/01 - Intro.flac"), "a folder only counts when it is just 'sample(s)'");
     }
 
     #[test]
