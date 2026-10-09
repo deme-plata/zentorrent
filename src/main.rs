@@ -1075,9 +1075,43 @@ impl App {
                     return;
                 }
             };
+            // Where it goes: a torrent with several files (an album, a season) gets its own
+            // folder named after it, a single file goes straight into the download folder
+            // (qBittorrent's default). librqbit only makes that folder itself when no
+            // output_folder is given, and ZenTorrent always gives the chosen "Save to" — so
+            // every album used to spill its files loose into Downloads. First list the files,
+            // then add from the same bytes (no second metadata fetch for magnets).
+            let listed = session
+                .add_torrent(add, Some(AddTorrentOptions { list_only: true, ..Default::default() }))
+                .await;
+            let (add, folder, peers) = match listed {
+                Ok(AddTorrentResponse::ListOnly(l)) => {
+                    let files = l.info.iter_file_details().count();
+                    let dest = torrent_folder(&folder, files, l.info.name().as_deref());
+                    (AddTorrent::from_bytes(l.torrent_bytes), dest, l.seen_peers)
+                }
+                Ok(AddTorrentResponse::Added(_, handle)) | Ok(AddTorrentResponse::AlreadyManaged(_, handle)) => {
+                    // Already in the list (or added anyway): nothing more to do.
+                    let mut ib = inbox.lock().unwrap();
+                    ib.busy -= 1;
+                    let name = handle.name().unwrap_or(label);
+                    let folder = handle.output_folder().to_path_buf();
+                    ib.added.push(Transfer { name, folder, handle });
+                    ctx.request_repaint();
+                    return;
+                }
+                Err(e) => {
+                    let mut ib = inbox.lock().unwrap();
+                    ib.busy -= 1;
+                    ib.errors.push(format!("{label}: {e:#}"));
+                    ctx.request_repaint();
+                    return;
+                }
+            };
             let opts = AddTorrentOptions {
                 output_folder: Some(folder.to_string_lossy().into_owned()),
                 overwrite: true,
+                initial_peers: (!peers.is_empty()).then_some(peers),
                 ..Default::default()
             };
             let res = session.add_torrent(add, Some(opts)).await;
@@ -1247,6 +1281,65 @@ fn spawn_meta_worker(
         }
     });
     tx
+}
+
+/// The folder a torrent's files go in: its own folder (named after the
+/// torrent) when it has more than one file, else the download folder itself.
+fn torrent_folder(base: &std::path::Path, files: usize, name: Option<&str>) -> PathBuf {
+    match name.map(safe_folder_name) {
+        Some(n) if files > 1 && !n.is_empty() => base.join(n),
+        _ => base.to_path_buf(),
+    }
+}
+
+/// A torrent name as a folder name that is safe on Windows and Linux: no path
+/// separators or `..`, no characters Windows forbids, no trailing dots/spaces,
+/// not a reserved device name, and not absurdly long.
+fn safe_folder_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| if c.is_control() || r#"<>:"/\|?*"#.contains(c) { '_' } else { c })
+        .take(150)
+        .collect();
+    let trimmed = cleaned.trim().trim_end_matches(['.', ' ']).to_string();
+    let upper = trimmed.split('.').next().unwrap_or("").to_ascii_uppercase();
+    const RESERVED: [&str; 22] = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2",
+        "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    if trimmed.is_empty() || trimmed.chars().all(|c| c == '.' || c == '_') {
+        String::new()
+    } else if RESERVED.contains(&upper.as_str()) {
+        format!("_{trimmed}")
+    } else {
+        trimmed
+    }
+}
+
+#[cfg(test)]
+mod folder_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn albums_get_their_own_folder_single_files_do_not() {
+        let base = Path::new("/home/v/Downloads");
+        assert_eq!(torrent_folder(base, 12, Some("Some Artist - Album (2024) [FLAC]")), base.join("Some Artist - Album (2024) [FLAC]"));
+        assert_eq!(torrent_folder(base, 1, Some("debian-13.7.0-amd64-netinst.iso")), base, "one file: straight into Downloads");
+        assert_eq!(torrent_folder(base, 5, None), base, "no name: fall back to the download folder");
+    }
+
+    #[test]
+    fn names_are_safe_folder_names() {
+        assert_eq!(safe_folder_name("A/B\\C:D*E?F\"G<H>I|J"), "A_B_C_D_E_F_G_H_I_J");
+        assert_eq!(safe_folder_name("../../etc"), ".._.._etc", "no path traversal: separators are gone");
+        assert_eq!(safe_folder_name("Album.  "), "Album", "Windows strips trailing dots/spaces");
+        assert_eq!(safe_folder_name(".."), "");
+        assert_eq!(safe_folder_name("con"), "_con", "reserved device name");
+        assert_eq!(safe_folder_name("CON.flac"), "_CON.flac");
+        assert_eq!(safe_folder_name(&"x".repeat(400)).len(), 150);
+        assert_eq!(torrent_folder(Path::new("/d"), 3, Some("..")), Path::new("/d"), "an unusable name stays in the base");
+    }
 }
 
 /// Rows drawn at most; past that the list says how many more matched.
