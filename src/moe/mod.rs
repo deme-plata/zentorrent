@@ -8,12 +8,16 @@
 //! * `ollama`   — the local model: start/install, pick a model, streamed chat
 //! * `skills`   — the system prompt, the tools, and what each tool does
 //! * `organize` — folder summaries, checked moves, the undo journal
+//! * `gauge`    — live GPU / VRAM / CPU load while an answer is generated
 
+pub mod gauge;
 pub mod ollama;
 pub mod organize;
 pub mod skills;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use eframe::egui::{self, Color32, RichText};
 use serde_json::{json, Value};
@@ -31,6 +35,8 @@ enum Line {
     Tool(String),
     Note(String),
     Error(String),
+    /// How an answer went: tokens, speed, where the model ran.
+    Stats(String),
     /// A proposal waiting for the user (index into `Moe::cards`).
     Card(usize),
 }
@@ -54,6 +60,10 @@ enum Ev {
     /// Ollama is not installed; wait for the user's click before downloading it.
     NeedsSetup,
     Text(String),
+    /// Ollama's numbers for one model step.
+    Stats(ollama::Stats),
+    /// How much of the model is in graphics memory: (total, in VRAM) bytes.
+    Residency(u64, u64),
     Tool(String),
     Action(Action),
     /// The turn is over: the messages to remember (assistant + tool), or an error.
@@ -82,6 +92,58 @@ fn settings_path() -> std::path::PathBuf {
     crate::seed::data_dir().join("flux-moe.json")
 }
 
+/// One answer being generated: what the progress line shows. Dropping it stops
+/// the load sampler and the residency poll.
+struct Run {
+    model: String,
+    started: Instant,
+    first_text: Option<Instant>,
+    /// Streamed text pieces (about one token each) — live, before Ollama's own count.
+    pieces: u64,
+    stats: ollama::Stats,
+    load: Arc<Mutex<gauge::Load>>,
+    residency: Option<(u64, u64)>,
+    /// Rough size of what the model reads first (≈ 4 characters a token).
+    prompt_tokens: usize,
+    stop: Arc<AtomicBool>,
+}
+
+impl Drop for Run {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+fn gb(b: u64) -> f64 {
+    b as f64 / (1u64 << 30) as f64
+}
+
+/// "3.5 GB, all on the GPU" / "62 % on the GPU, the rest on the CPU" / "on the CPU".
+fn placement(total: u64, vram: u64) -> String {
+    let pct = if total == 0 { 0 } else { (vram * 100 / total) as u32 };
+    match pct {
+        99.. => format!("model {:.1} GB, all on the GPU", gb(total)),
+        0 => format!("model {:.1} GB, on the CPU", gb(total)),
+        p => format!("model {:.1} GB, {p} % on the GPU (the rest on the CPU — slower)", gb(total)),
+    }
+}
+
+/// The line under an answer.
+fn summary(model: &str, s: &ollama::Stats, wall_s: f64, residency: Option<(u64, u64)>) -> String {
+    let mut out = format!("{model} · {} tokens · {:.1} tok/s", s.eval_count, s.rate());
+    if s.prompt_count > 0 {
+        out += &format!(" · read {} tokens in {:.1} s", s.prompt_count, s.prompt_ns as f64 / 1e9);
+    }
+    if s.load_ns > 500_000_000 {
+        out += &format!(" · model loaded in {:.1} s", s.load_ns as f64 / 1e9);
+    }
+    out += &format!(" · {wall_s:.1} s in all");
+    if let Some((t, v)) = residency {
+        out += &format!(" · {}", placement(t, v));
+    }
+    out
+}
+
 pub struct Moe {
     status: Status,
     lines: Vec<Line>,
@@ -100,6 +162,9 @@ pub struct Moe {
     pending: Option<String>,
     /// The running answer, so Stop can end it (and the generation in Ollama with it).
     task: Option<tokio::task::JoinHandle<()>>,
+    run: Option<Run>,
+    /// Typical answer length in tokens (for the progress bar's estimate).
+    avg_tokens: f64,
 }
 
 impl Default for Moe {
@@ -120,6 +185,8 @@ impl Default for Moe {
             can_undo: organize::can_undo(),
             pending: None,
             task: None,
+            run: None,
+            avg_tokens: 0.0,
         }
     }
 }
@@ -171,6 +238,29 @@ impl Moe {
         messages.extend(self.history[start..].iter().cloned());
         messages.push(json!({"role": "user", "content": text}));
         self.history.push(json!({"role": "user", "content": text}));
+        // Progress: load sampled each second, and where the model sits (Ollama's /api/ps).
+        let run = Run {
+            model: model.clone(),
+            started: Instant::now(),
+            first_text: None,
+            pieces: 0,
+            stats: ollama::Stats::default(),
+            load: Default::default(),
+            residency: None,
+            prompt_tokens: (messages.iter().map(|m| m.to_string().len()).sum::<usize>() + skills::tools().to_string().len()) / 4,
+            stop: Arc::new(AtomicBool::new(false)),
+        };
+        gauge::start(run.load.clone(), run.stop.clone());
+        let (events, ctx2, stop, m) = (self.events.clone(), ctx.clone(), run.stop.clone(), model.clone());
+        rt.spawn(async move {
+            while !stop.load(Ordering::Relaxed) {
+                if let Some((t, v)) = ollama::residency(&m).await {
+                    Moe::push(&events, &ctx2, Ev::Residency(t, v));
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        });
+        self.run = Some(run);
         let (events, ctx, memory, cpu) = (self.events.clone(), ctx.clone(), self.memory.clone(), self.settings.cpu_only);
         self.task = Some(rt.spawn(async move {
             let on = |e: Ev| Moe::push(&events, &ctx, e);
@@ -191,7 +281,23 @@ impl Moe {
                     self.status = Status::Ready(m);
                 }
                 Ev::Setup(ollama::Setup::Failed(e)) => self.status = Status::Failed(e),
-                Ev::Text(t) => self.live.push_str(&t),
+                Ev::Text(t) => {
+                    self.live.push_str(&t);
+                    if let Some(r) = &mut self.run {
+                        r.pieces += 1;
+                        r.first_text.get_or_insert_with(Instant::now);
+                    }
+                }
+                Ev::Stats(s) => {
+                    if let Some(r) = &mut self.run {
+                        r.stats.add(&s);
+                    }
+                }
+                Ev::Residency(t, v) => {
+                    if let Some(r) = &mut self.run {
+                        r.residency = Some((t, v));
+                    }
+                }
                 Ev::Tool(r) => {
                     self.flush_live();
                     self.lines.push(Line::Tool(r));
@@ -217,6 +323,15 @@ impl Moe {
                         Err(e) => {
                             self.flush_live();
                             self.lines.push(Line::Error(e));
+                        }
+                    }
+                    if let Some(r) = self.run.take() {
+                        let wall = r.started.elapsed().as_secs_f64();
+                        self.lines.push(Line::Stats(summary(&r.model, &r.stats, wall, r.residency)));
+                        if r.stats.eval_count > 0 {
+                            // The bar's estimate: a running average of answer lengths.
+                            let n = r.stats.eval_count as f64;
+                            self.avg_tokens = if self.avg_tokens == 0.0 { n } else { 0.7 * self.avg_tokens + 0.3 * n };
                         }
                     }
                 }
@@ -297,7 +412,12 @@ impl Moe {
                     }
                     self.busy = false;
                     self.flush_live();
-                    self.lines.push(Line::Note("Stopped.".into()));
+                    if let Some(r) = self.run.take() {
+                        let wall = r.started.elapsed().as_secs_f64();
+                        self.lines.push(Line::Stats(format!("stopped after {wall:.0} s · {}", summary(&r.model, &r.stats, wall, r.residency))));
+                    } else {
+                        self.lines.push(Line::Note("Stopped.".into()));
+                    }
                 }
                 if self.talked() && !self.busy && ui.button("New chat").clicked() {
                     self.lines.clear();
@@ -380,6 +500,10 @@ impl Moe {
                     Line::Error(t) => {
                         ui.colored_label(Color32::from_rgb(230, 120, 100), t);
                     }
+                    Line::Stats(t) => {
+                        ui.label(RichText::new(t).small().color(Color32::from_rgb(120, 140, 160)));
+                        ui.add_space(4.0);
+                    }
                     Line::Card(i) => {
                         if let Some(c) = self.cards.get(*i) {
                             if let Some(ok) = card_ui(ui, *i, c) {
@@ -391,11 +515,9 @@ impl Moe {
             }
             if !self.live.is_empty() {
                 bubble(ui, &ollama::strip_thinking(&self.live), Color32::from_rgb(38, 38, 44), false);
-            } else if self.busy {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(RichText::new("thinking…").weak());
-                });
+            }
+            if let Some(r) = &self.run {
+                progress_ui(ui, r, self.avg_tokens);
             }
         });
 
@@ -419,6 +541,67 @@ impl Moe {
         }
         actions
     }
+}
+
+/// The live panel while an answer is generated (as in sigil-top): what it waits
+/// for or how fast it writes, an estimated bar, and the machine's load.
+fn progress_ui(ui: &mut egui::Ui, r: &Run, avg_tokens: f64) {
+    let elapsed = r.started.elapsed().as_secs_f64();
+    egui::Frame::new().fill(Color32::from_rgb(30, 34, 40)).corner_radius(6.0).inner_margin(egui::Margin::same(8)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        // Tokens so far: Ollama's own count for finished steps, else the streamed pieces.
+        let tokens = r.pieces.max(r.stats.eval_count);
+        match r.first_text {
+            None => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    let what = if r.stats.eval_count > 0 {
+                        "using its tools, then reading what they found".to_string()
+                    } else {
+                        format!("loading the model and reading your request (~{} tokens)", r.prompt_tokens)
+                    };
+                    ui.label(RichText::new(format!("{what} · {elapsed:.0} s")).weak());
+                });
+            }
+            Some(t0) => {
+                let rate = r.pieces as f64 / t0.elapsed().as_secs_f64().max(0.05);
+                let target = if avg_tokens > 0.0 { avg_tokens } else { 150.0 };
+                // An estimate: never claims done before the model says so.
+                let frac = (tokens as f64 / target).min(0.95) as f32;
+                let left = match (rate > 0.5).then(|| (target - tokens as f64).max(0.0) / rate) {
+                    Some(s) => format!("about {s:.0} s left"),
+                    None => "…".into(),
+                };
+                ui.add(egui::ProgressBar::new(frac).animate(true).text(format!("{tokens} tokens · {rate:.1} tok/s · {left} · {elapsed:.0} s")));
+            }
+        }
+        let l = r.load.lock().map(|l| *l).unwrap_or_default();
+        let mut parts = Vec::new();
+        if let (Some(g), Some(u), Some(t)) = (l.gpu_pct, l.vram_used_mb, l.vram_total_mb) {
+            parts.push(format!("GPU {g} % · VRAM {:.1} / {:.1} GB", u as f64 / 1024.0, t as f64 / 1024.0));
+        }
+        if let Some(c) = l.gpu_temp_c {
+            parts.push(format!("{c} °C"));
+        }
+        if let Some(c) = l.cpu_pct {
+            parts.push(format!("CPU {c} %"));
+        }
+        if let Some((t, v)) = r.residency {
+            parts.push(placement(t, v));
+        }
+        if !parts.is_empty() {
+            let hot = l.gpu_temp_c.is_some_and(|c| c >= 85);
+            let color = if hot {
+                Color32::from_rgb(230, 120, 100)
+            } else if l.gpu_pct.unwrap_or(0) >= 50 {
+                Color32::from_rgb(120, 210, 140)
+            } else {
+                Color32::from_rgb(170, 170, 180)
+            };
+            let tip = if hot { "The graphics card is hot — tick CPU only to keep the model off it." } else { "Measured every second while Flux MoE answers." };
+            ui.label(RichText::new(parts.join(" · ")).small().color(color)).on_hover_text(tip);
+        }
+    });
 }
 
 fn bubble(ui: &mut egui::Ui, text: &str, fill: Color32, right: bool) {
@@ -492,6 +675,7 @@ async fn agent(
     let first_new = messages.len();
     for _ in 0..MAX_STEPS {
         let reply = ollama::chat(base, model, &messages, &tools, cpu_only, |t| on(Ev::Text(t.to_string()))).await?;
+        on(Ev::Stats(reply.stats));
         messages.push(json!({"role": "assistant", "content": reply.content, "tool_calls": reply.tool_calls}));
         if reply.tool_calls.is_empty() {
             return Ok(messages.split_off(first_new));
@@ -540,9 +724,11 @@ pub async fn ask(question: &str, lib: Library, cpu_only: bool) -> Result<(), Str
     let started = std::time::Instant::now();
     let messages = vec![json!({"role": "system", "content": skills::system(&lib)}), json!({"role": "user", "content": question})];
     let memory = Mutex::new(Memory::default());
+    let totals = Mutex::new(ollama::Stats::default());
     let print = |ev: Ev| {
         match ev {
             Ev::Text(t) => print!("{t}"),
+            Ev::Stats(s) => totals.lock().unwrap().add(&s),
             Ev::Tool(r) => println!("\n  · {r}"),
             Ev::Action(Action::Moves { root, moves }) => {
                 println!("\n  [would ask the user to apply {} moves in {}]", moves.len(), root.display());
@@ -556,7 +742,8 @@ pub async fn ask(question: &str, lib: Library, cpu_only: bool) -> Result<(), Str
         let _ = std::io::stdout().flush();
     };
     agent(ollama::BASE, &model, messages, cpu_only, &lib, &memory, &print).await?;
-    println!("\n({:.1} s)", started.elapsed().as_secs_f64());
+    let s = *totals.lock().unwrap();
+    println!("\n({})", summary(&model, &s, started.elapsed().as_secs_f64(), ollama::residency(&model).await));
     Ok(())
 }
 
@@ -615,7 +802,7 @@ mod tests {
             vec![
                 json!({"message": {"role": "assistant", "content": "", "tool_calls": [
                     {"function": {"name": "search_feeds", "arguments": {"query": "trance", "sort": "seeders"}}}]}, "done": false}),
-                json!({"done": true}),
+                json!({"done": true, "eval_count": 29, "eval_duration": 1_000_000_000u64, "prompt_eval_count": 2114, "prompt_eval_duration": 2_000_000_000u64}),
             ],
             vec![
                 json!({"message": {"content": "Top pick: Trance Classics 2026 (300 seeders)."}, "done": false}),
@@ -644,8 +831,18 @@ mod tests {
         // The tab saw the receipts, the streamed text and a download that waits for the user.
         let evs = events.into_inner().unwrap();
         assert!(evs.iter().any(|e| matches!(e, Ev::Tool(r) if r.contains("searched your feeds"))));
+        assert!(evs.iter().any(|e| matches!(e, Ev::Stats(s) if s.eval_count == 29 && s.prompt_count == 2114)), "Ollama's numbers reach the tab");
         assert!(evs.iter().any(|e| matches!(e, Ev::Action(Action::Download { title, .. }) if title == "Trance Classics 2026")));
         assert_eq!(out.last().unwrap()["content"], "Waiting for you to press Download.");
         assert_eq!(out.iter().filter(|m| m["role"] == "tool").count(), 2);
+    }
+
+    #[test]
+    fn the_summary_says_how_it_went() {
+        let s = ollama::Stats { eval_count: 29, eval_ns: 1_000_000_000, prompt_count: 2114, prompt_ns: 2_000_000_000, load_ns: 1_500_000_000, total_ns: 0 };
+        let t = summary("qwen3:4b-instruct", &s, 4.3, Some((3_760_000_000, 3_760_000_000)));
+        assert_eq!(t, "qwen3:4b-instruct · 29 tokens · 29.0 tok/s · read 2114 tokens in 2.0 s · model loaded in 1.5 s · 4.3 s in all · model 3.5 GB, all on the GPU");
+        assert!(placement(5_030_000_000, 3_880_000_000).contains("77 % on the GPU"));
+        assert!(placement(3_000_000_000, 0).ends_with("on the CPU"));
     }
 }

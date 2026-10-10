@@ -100,6 +100,54 @@ pub fn choose(models: &[Model], preferred: Option<&str>) -> Option<String> {
 pub struct Reply {
     pub content: String,
     pub tool_calls: Vec<Value>,
+    pub stats: Stats,
+}
+
+/// Ollama's own measurement of one reply (from its final stream line).
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct Stats {
+    pub eval_count: u64,
+    pub eval_ns: u64,
+    pub prompt_count: u64,
+    pub prompt_ns: u64,
+    pub load_ns: u64,
+    pub total_ns: u64,
+}
+
+impl Stats {
+    fn from(v: &Value) -> Stats {
+        let n = |k: &str| v[k].as_u64().unwrap_or(0);
+        Stats {
+            eval_count: n("eval_count"),
+            eval_ns: n("eval_duration"),
+            prompt_count: n("prompt_eval_count"),
+            prompt_ns: n("prompt_eval_duration"),
+            load_ns: n("load_duration"),
+            total_ns: n("total_duration"),
+        }
+    }
+
+    pub fn add(&mut self, o: &Stats) {
+        self.eval_count += o.eval_count;
+        self.eval_ns += o.eval_ns;
+        self.prompt_count += o.prompt_count;
+        self.prompt_ns += o.prompt_ns;
+        self.load_ns += o.load_ns;
+        self.total_ns += o.total_ns;
+    }
+
+    /// Answer tokens per second, as Ollama measured them.
+    pub fn rate(&self) -> f64 {
+        if self.eval_ns == 0 { 0.0 } else { self.eval_count as f64 / (self.eval_ns as f64 / 1e9) }
+    }
+}
+
+/// How much of `model` is in graphics memory right now: (total bytes, bytes in VRAM).
+pub async fn residency(model: &str) -> Option<(u64, u64)> {
+    let r = client(Duration::from_secs(3)).get(format!("{BASE}/api/ps")).send().await.ok()?;
+    let v: Value = r.json().await.ok()?;
+    let m = v["models"].as_array()?.iter().find(|m| m["name"] == model || m["model"] == model)?;
+    Some((m["size"].as_u64()?, m["size_vram"].as_u64().unwrap_or(0)))
 }
 
 /// `<think>…</think>` some models still put in the text itself.
@@ -167,6 +215,9 @@ pub async fn chat(base: &str, model: &str, messages: &[Value], tools: &Value, cp
             }
             if let Some(calls) = v["message"]["tool_calls"].as_array() {
                 reply.tool_calls.extend(calls.iter().cloned());
+            }
+            if v["done"] == true {
+                reply.stats = Stats::from(&v);
             }
         }
     }

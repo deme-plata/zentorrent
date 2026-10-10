@@ -33,6 +33,10 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 zeroize = "1"
 tracing = "0.1"
 
+# Flux MoE progress: the CPU gauge on Windows (GetSystemTimes).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
 [profile.release]
 opt-level = 3
 lto = "thin"

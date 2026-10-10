@@ -43,7 +43,9 @@ fn main() -> eframe::Result<()> {
         .build()
         .expect("tokio runtime");
 
-    let default_dir = dirs::download_dir()
+    // "Save to" as the user last chose it, else the system's Downloads folder.
+    let default_dir = saved_folder()
+        .or_else(dirs::download_dir)
         .or_else(dirs::home_dir)
         .unwrap_or_else(|| PathBuf::from("."));
 
@@ -1638,6 +1640,29 @@ fn spawn_meta_worker(
     tx
 }
 
+/// Where "Save to" is remembered between runs.
+fn prefs_path() -> PathBuf {
+    seed::data_dir().join("prefs.json")
+}
+
+/// The "Save to" folder the user last chose, if it still exists.
+fn saved_folder() -> Option<PathBuf> {
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(prefs_path()).ok()?).ok()?;
+    Some(PathBuf::from(v["save_to"].as_str()?)).filter(|p| p.is_dir())
+}
+
+fn remember_folder(dir: &std::path::Path) {
+    let path = prefs_path();
+    let mut v: serde_json::Value = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_else(|| serde_json::json!({}));
+    v["save_to"] = serde_json::json!(dir.to_string_lossy());
+    let _ = std::fs::create_dir_all(seed::data_dir());
+    let tmp = path.with_extension("json.tmp");
+    // Written whole, then renamed: never a half-written prefs file.
+    if std::fs::write(&tmp, serde_json::to_vec_pretty(&v).unwrap_or_default()).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
 /// The folder a torrent's files go in: its own folder (named after the
 /// torrent) when it has more than one file, else the download folder itself.
 fn torrent_folder(base: &std::path::Path, files: usize, name: Option<&str>) -> PathBuf {
@@ -1848,6 +1873,7 @@ impl eframe::App for App {
                         .set_directory(&self.folder)
                         .pick_folder()
                     {
+                        remember_folder(&dir);
                         self.folder = dir;
                     }
                 }
