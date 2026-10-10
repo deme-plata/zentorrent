@@ -222,7 +222,19 @@ pub struct Live {
     pub error: Option<String>,
     /// Bumped on every change, so the UI can repaint.
     pub version: u64,
+    pub fullscreen: bool,
+    /// The video window's ✕, Q, or Esc outside fullscreen stopped playback (Esc in
+    /// fullscreen only leaves fullscreen).
+    pub close: bool,
+    /// mpv shut itself down (a quit that got past the bindings): the handle must go.
+    pub gone: bool,
 }
+
+/// Keys of mpv's video window that ZenTorrent handles itself. Without them the
+/// window's ✕ and Q run mpv's `quit`, which ends mpv's core but leaves the window
+/// standing (frozen) until ZenTorrent exits.
+const BINDINGS: [(&str, &str); 4] =
+    [("CLOSE_WIN", "zentorrent-close"), ("q", "zentorrent-close"), ("Q", "zentorrent-close"), ("ESC", "zentorrent-esc")];
 
 const P_TIME: u64 = 1;
 const P_DURATION: u64 = 2;
@@ -231,6 +243,7 @@ const P_TITLE: u64 = 4;
 const P_POS: u64 = 5;
 const P_IDLE: u64 = 6;
 const P_ARTIST: u64 = 7;
+const P_FULLSCREEN: u64 = 8;
 
 struct Mpv {
     api: &'static Api,
@@ -273,7 +286,7 @@ impl Mpv {
             ("prefetch-playlist", "yes"),
             ("input-default-bindings", "yes"),
             ("input-vo-keyboard", "yes"),
-            ("title", "ZenTorrent player"),
+            ("title", "ZenTorrent player  —  Esc or Q closes"),
         ] {
             m.opt(k, v);
         }
@@ -300,9 +313,18 @@ impl Mpv {
             (P_POS, "playlist-pos", ffi::FORMAT_INT64),
             (P_IDLE, "idle-active", ffi::FORMAT_FLAG),
             (P_ARTIST, "metadata/by-key/artist", ffi::FORMAT_STRING),
+            (P_FULLSCREEN, "fullscreen", ffi::FORMAT_FLAG),
         ] {
             let n = ffi::cstr(name);
             unsafe { (api.observe_property)(h, id, n.as_ptr(), fmt) };
+        }
+        // The window's ✕ / Q / Esc come back to ZenTorrent as script messages.
+        // `keybind` is mpv 0.38+; older libmpv (Linux distributions) gets a forced section.
+        let bound = BINDINGS.iter().all(|(key, msg)| m.cmd(&["keybind", key, &format!("script-message {msg}")]).is_ok());
+        if !bound {
+            let section: String = BINDINGS.iter().map(|(key, msg)| format!("{key} script-message {msg}\n")).collect();
+            let _ = m.cmd(&["define-section", "zentorrent", &section, "force"]);
+            let _ = m.cmd(&["enable-section", "zentorrent"]);
         }
         let (hp, stop) = (h as usize, m.stop.clone());
         m.thread = Some(std::thread::Builder::new().name("mpv-events".into()).spawn(move || {
@@ -310,6 +332,12 @@ impl Mpv {
             while !stop.load(Ordering::Acquire) {
                 let ev = unsafe { &*(api.wait_event)(h, 1.0) };
                 if ev.event_id == ffi::EVENT_SHUTDOWN {
+                    // Not ours (Drop sets `stop` first): mpv quit by itself. Tell the
+                    // player, which destroys the handle — that is what closes the window.
+                    if !stop.load(Ordering::Acquire) {
+                        live.lock().unwrap().gone = true;
+                        repaint();
+                    }
                     break;
                 }
                 if ev.event_id == ffi::EVENT_NONE {
@@ -325,6 +353,7 @@ impl Mpv {
                             P_DURATION => l.duration = if none { 0.0 } else { unsafe { *(p.data as *const f64) } },
                             P_PAUSE => l.paused = !none && unsafe { *(p.data as *const i32) } != 0,
                             P_IDLE => l.idle = !none && unsafe { *(p.data as *const i32) } != 0,
+                            P_FULLSCREEN => l.fullscreen = !none && unsafe { *(p.data as *const i32) } != 0,
                             P_POS => l.mpv_pos = if none { None } else { Some(unsafe { *(p.data as *const i64) }) },
                             P_TITLE | P_ARTIST => {
                                 let s = if none { String::new() } else { unsafe { CStr::from_ptr(*(p.data as *const *const c_char)) }.to_string_lossy().into_owned() };
@@ -340,6 +369,27 @@ impl Mpv {
                         }
                     }
                     ffi::EVENT_FILE_LOADED => l.error = None,
+                    ffi::EVENT_CLIENT_MESSAGE if !ev.data.is_null() => {
+                        let cm = unsafe { &*(ev.data as *const ffi::EventClientMessage) };
+                        if cm.num_args > 0 && !cm.args.is_null() {
+                            let first = unsafe { CStr::from_ptr(*cm.args) }.to_string_lossy();
+                            // Acted on right here, not in the UI: a fullscreen video hides
+                            // ZenTorrent's window, and a hidden window draws no frames.
+                            let leave_fullscreen = first == "zentorrent-esc" && l.fullscreen;
+                            let close = first == "zentorrent-close" || (first == "zentorrent-esc" && !l.fullscreen);
+                            if leave_fullscreen {
+                                let (n, v) = (ffi::cstr("fullscreen"), ffi::cstr("no"));
+                                unsafe { (api.set_property_string)(h, n.as_ptr(), v.as_ptr()) };
+                            } else if close {
+                                // Stopping closes the window (no video, and force-window is off);
+                                // the player clears its queue when it next draws.
+                                let s = ffi::cstr("stop");
+                                let mut args = [s.as_ptr(), std::ptr::null()];
+                                unsafe { (api.command)(h, args.as_mut_ptr()) };
+                                l.close = true;
+                            }
+                        }
+                    }
                     _ => {}
                 }
                 l.version += 1;
@@ -410,6 +460,10 @@ impl Player {
     }
 
     fn mpv(&mut self) -> Result<&Mpv, String> {
+        // mpv quit by itself since: start a fresh one.
+        if std::mem::take(&mut self.live.lock().unwrap().gone) {
+            self.mpv = None;
+        }
         if self.mpv.is_none() {
             let m = Mpv::new(self.registry, self.live.clone(), self.repaint.clone())?;
             self.mpv = Some(m);
@@ -477,6 +531,21 @@ impl Player {
 
     /// Called every frame: follow mpv to the next track, queue the one after.
     pub fn tick(&mut self, complete: &dyn Fn(usize) -> bool) {
+        // The video window was closed (✕, Q, Esc — already stopped by the event
+        // thread), or mpv quit by itself: the queue ends here too.
+        let (close, gone) = {
+            let mut l = self.live.lock().unwrap();
+            (std::mem::take(&mut l.close), std::mem::take(&mut l.gone))
+        };
+        if gone {
+            // Destroying the handle is what takes mpv's window down.
+            self.mpv = None;
+        }
+        if close || gone {
+            self.queue.pos = None;
+            self.in_mpv.clear();
+            return;
+        }
         let pos = self.live.lock().unwrap().mpv_pos;
         let (Some(p), Some(m)) = (pos, self.mpv.as_ref()) else { return };
         let p = p as usize;

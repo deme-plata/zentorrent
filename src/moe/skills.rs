@@ -32,6 +32,8 @@ How you work:
 finds nothing, say so plainly.
 - Reply in the user's language (Danish or English), short and warm. Lists for results; no tables wider than the screen.
 - Feed results carry a number (id). To download one, call download with that id — the user confirms in the app.
+- “Best / top torrents” without a topic: search_feeds with NO query and sort=top. Never add a genre or a word the \
+user did not say.
 - To play, call play with the torrent's name (and a track if they asked for one). It starts at once.
 - Playlists: take the exact file paths from scan_folder or torrent_files — never make a path up. Then make_playlist.
 - Organizing a folder:
@@ -68,10 +70,13 @@ pub fn tools() -> Value {
         tool("torrent_files", "The files of one torrent (playable ones marked), to play a track or build a playlist.",
             json!({"torrent": {"type":"string","description":"the torrent's name (or part of it)"}}), &["torrent"]),
         tool("search_feeds", "Search the user's RSS feeds and everything the feed history remembers. Words, \"exact phrase\", -exclude. \
-              Results have an id for download.",
-            json!({"query": {"type":"string","description":"e.g. trance, \"group therapy\" -radio"},
-                   "sort": {"type":"string","enum":["best","seeders","activity","newest","size"],"description":"best = relevance"},
-                   "limit": {"type":"integer","description":"max results, default 15"}}), &["query"]),
+              No query = everything. For \"the best / top torrents\" without a topic, give NO query and sort=top: a varied mix \
+              of the strongest items across categories. Never invent a query word the user did not say. \
+              Results have an id for download; the user also sees them with a Download button each.",
+            json!({"query": {"type":"string","description":"only words the user asked for, e.g. trance, \"group therapy\" -radio; leave out for everything"},
+                   "sort": {"type":"string","enum":["top","best","seeders","activity","newest","size"],
+                            "description":"top = best overall (seeders, downloads per hour, freshness) mixed across categories; best = relevance to the query"},
+                   "limit": {"type":"integer","description":"max results, default 15"}}), &[]),
         tool("download", "Ask the user to confirm downloading a feed result (by its id from search_feeds).",
             json!({"id": {"type":"integer"}}), &["id"]),
         tool("play", "Play a torrent's music/video in ZenTorrent's player now (streams what isn't downloaded yet).",
@@ -126,6 +131,60 @@ pub enum Action {
     Download { title: String, link: String, feed_key: String },
     /// Needs the user's OK.
     Moves { root: PathBuf, moves: Vec<organize::Move> },
+    /// Feed results to show with a Download button each (display only; a click downloads).
+    Picks(Vec<Pick>),
+}
+
+/// One feed result as the user sees it in the chat.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Pick {
+    pub id: usize,
+    pub title: String,
+    pub feed: String,
+    pub size: Option<u64>,
+    pub seeders: Option<u32>,
+    pub grabs: Option<u32>,
+    pub seen: String,
+    pub freeleech: bool,
+    pub link: String,
+    pub feed_key: String,
+}
+
+/// "Top" ranking for when the user asks for the best torrents without a topic: what
+/// the feeds actually report counts — seeders, downloads per hour, total downloads —
+/// plus freshness and freeleech. Feeds without seeder numbers still rank sensibly.
+fn top_score(e: &history::Entry, now: u64) -> f64 {
+    let seeders = e.seeders.unwrap_or(0) as f64;
+    let per_hour = e.activity(now).unwrap_or(0.0).max(0.0);
+    let grabs = e.grabs.unwrap_or(0) as f64;
+    let age_days = now.saturating_sub(e.first_seen) as f64 / 86_400.0;
+    (1.0 + seeders).ln() * 2.0 + (1.0 + per_hour * 10.0).ln() * 1.5 + (1.0 + grabs).ln() * 0.5
+        + 1.0 / (1.0 + age_days)
+        + if e.freeleech { 0.5 } else { 0.0 }
+}
+
+/// Best first, but no category takes more than its share: a mix, not ten of one genre.
+/// Only strong items (at least half the best score) earn a place for variety's sake;
+/// the rest of the list is the next best, whatever their category.
+fn varied(mut ranked: Vec<usize>, entries: &[history::Entry], n: usize, score: impl Fn(usize) -> f64) -> Vec<usize> {
+    let cap = n.div_ceil(3).max(2);
+    let strong = ranked.first().map(|&i| score(i) * 0.5).unwrap_or(0.0);
+    let mut per: std::collections::HashMap<String, usize> = Default::default();
+    let mut out = Vec::new();
+    ranked.retain(|&i| {
+        let c = entries[i].category.to_lowercase();
+        let k = per.entry(c).or_insert(0);
+        if out.len() < n && *k < cap && score(i) >= strong {
+            *k += 1;
+            out.push(i);
+            false
+        } else {
+            true
+        }
+    });
+    // Too few categories to fill the list: top it up with the next best.
+    out.extend(ranked.into_iter().take(n.saturating_sub(out.len())));
+    out
 }
 
 impl Action {
@@ -163,7 +222,7 @@ fn mb(b: u64) -> u64 {
 }
 
 /// The torrent the model means: exact name, else a unique case-insensitive part of one.
-fn find<'a>(lib: &'a Library, what: &str) -> Result<&'a Torrent, String> {
+pub fn find<'a>(lib: &'a Library, what: &str) -> Result<&'a Torrent, String> {
     let w = what.trim().to_lowercase();
     if let Some(t) = lib.torrents.iter().find(|t| t.name.to_lowercase() == w) {
         return Ok(t);
@@ -229,8 +288,12 @@ pub fn run(name: &str, args: &Value, lib: &Library, mem: &mut Memory) -> Outcome
             }
         },
         "search_feeds" => {
+            if lib.feeds.is_empty() {
+                return error("there are no RSS feeds yet — add one in the RSS feeds tab");
+            }
             let q = s("query");
-            let sort = match s("sort").as_str() {
+            let mode = s("sort");
+            let sort = match mode.as_str() {
                 "seeders" => search::Sort::Seeders,
                 "activity" => search::Sort::Activity,
                 "newest" => search::Sort::Newest,
@@ -239,23 +302,52 @@ pub fn run(name: &str, args: &Value, lib: &Library, mem: &mut Memory) -> Outcome
             };
             let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(15).clamp(1, 40) as usize;
             let now = history::now();
-            let hits = search::run(&lib.feeds, |_| true, &search::parse(&q), sort, |_| String::new(), now);
+            let mut hits = search::run(&lib.feeds, |_| true, &search::parse(&q), sort, |_| String::new(), now);
+            let top = mode == "top" || (q.is_empty() && mode.is_empty());
+            if top {
+                hits.sort_by(|&a, &b| top_score(&lib.feeds[b], now).total_cmp(&top_score(&lib.feeds[a], now)));
+                hits = varied(hits, &lib.feeds, limit, |i| top_score(&lib.feeds[i], now));
+            }
             mem.results.clear();
+            let mut picks = Vec::new();
             let rows: Vec<Value> = hits
                 .iter()
                 .take(limit)
                 .map(|&i| {
                     let e = &lib.feeds[i];
                     mem.results.push(e.clone());
-                    json!({ "id": mem.results.len(), "title": e.title, "feed": e.feed, "mb": e.size.map(mb),
+                    let id = mem.results.len();
+                    let seen = history::ago(now.saturating_sub(e.first_seen));
+                    picks.push(Pick {
+                        id,
+                        title: e.title.clone(),
+                        feed: e.feed.clone(),
+                        size: e.size,
+                        seeders: e.seeders,
+                        grabs: e.grabs,
+                        seen: seen.clone(),
+                        freeleech: e.freeleech,
+                        link: e.link.clone(),
+                        feed_key: e.feed_key.clone(),
+                    });
+                    json!({ "id": id, "title": e.title, "feed": e.feed, "mb": e.size.map(mb),
                             "seeders": e.seeders, "grabs": e.grabs, "category": e.category, "tags": e.tags,
-                            "freeleech": e.freeleech, "still_in_feed": e.in_feed, "seen": history::ago(now.saturating_sub(e.first_seen)) })
+                            "freeleech": e.freeleech, "still_in_feed": e.in_feed, "seen": seen })
                 })
                 .collect();
-            if lib.feeds.is_empty() {
-                return error("there are no RSS feeds yet — add one in the RSS feeds tab");
+            // Which numbers these feeds report at all (private trackers often send no seeders).
+            let with = |f: fn(&history::Entry) -> bool| lib.feeds.iter().filter(|e| f(e)).count();
+            let numbers = json!({ "items": lib.feeds.len(), "with_seeders": with(|e| e.seeders.is_some()),
+                                  "with_downloads": with(|e| e.grabs.is_some()) });
+            let what = if q.is_empty() { "your feeds".to_string() } else { format!("your feeds for “{q}”") };
+            let shown = rows.len();
+            Outcome {
+                for_model: json!({ "query": q, "sorted": if top { "top (mixed across categories)" } else { mode.as_str() },
+                                   "found": hits.len(), "numbers_in_feeds": numbers, "results": rows,
+                                   "note": "the user already sees these with a Download button each — list them briefly" }),
+                receipt: if top { format!("ranked {what}: top {shown}") } else { format!("searched {what} ({} found)", hits.len()) },
+                action: (!picks.is_empty()).then_some(Action::Picks(picks)),
             }
-            data(json!({ "query": q, "found": hits.len(), "results": rows }), format!("searched your feeds for “{q}” ({} found)", hits.len()))
         }
         "download" => {
             let id = args.get("id").and_then(Value::as_u64).unwrap_or(0) as usize;
@@ -422,6 +514,40 @@ mod tests {
         assert!(matches!(d.action, Some(Action::Download { ref title, .. }) if title == "Trance Classics 2026"));
         assert!(d.action.unwrap().needs_ok());
         assert!(run("download", &json!({"id": 9}), &l, &mut mem).for_model["error"].is_string());
+    }
+
+    #[test]
+    fn top_picks_need_no_query_and_mix_categories() {
+        let now = history::now();
+        let e = |title: &str, cat: &str, grabs: u32, hours_ago: u64| history::Entry {
+            title: title.into(),
+            category: cat.into(),
+            link: format!("https://t/{title}?passkey=X"),
+            in_feed: true,
+            grabs: Some(grabs),
+            first_grabs: Some(0),
+            first_seen: now - hours_ago * 3600,
+            ..Default::default()
+        };
+        // Like Viktor's private feeds: no seeder numbers, only downloads.
+        let mut feeds: Vec<_> = (0..8).map(|i| e(&format!("Trance {i}"), "Music/Trance", 500 - i, 5)).collect();
+        feeds.push(e("Big Film 2026 1080p", "Movies/HD", 300, 10));
+        feeds.push(e("Show S01E01 1080p", "TV/HD", 200, 3));
+        feeds.push(e("Old Quiet Thing", "Music/Jazz", 1, 900));
+        let l = Library { feeds, ..Default::default() };
+        let mut mem = Memory::default();
+        let o = run("search_feeds", &json!({"sort": "top", "limit": 6}), &l, &mut mem);
+        let titles: Vec<&str> = o.for_model["results"].as_array().unwrap().iter().map(|r| r["title"].as_str().unwrap()).collect();
+        assert_eq!(titles.len(), 6);
+        assert!(titles.contains(&"Big Film 2026 1080p") && titles.contains(&"Show S01E01 1080p"), "a mix, not only trance: {titles:?}");
+        // Only film and TV are strong enough to join; the rest is the next-best trance, never filler.
+        assert!(titles.iter().filter(|t| t.starts_with("Trance")).count() <= 4, "{titles:?}");
+        assert!(!titles.contains(&"Old Quiet Thing"));
+        assert_eq!(o.for_model["numbers_in_feeds"]["with_seeders"], 0);
+        match o.action {
+            Some(Action::Picks(p)) => assert!(p.len() == 6 && p[0].link.contains("passkey"), "links stay in the app, for its buttons"),
+            other => panic!("expected picks, got {other:?}"),
+        }
     }
 
     #[test]

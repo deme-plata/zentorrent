@@ -24,7 +24,11 @@ type ManagedTorrentHandle = Arc<ManagedTorrent>;
 const FEED_RETRY: Duration = Duration::from_secs(60);
 
 mod details;
+mod engine;
 mod history;
+mod info;
+mod listview;
+mod mcp;
 mod meta;
 mod moe;
 mod player;
@@ -32,6 +36,7 @@ mod repair;
 mod rss;
 mod search;
 mod seed;
+mod serve;
 mod sidebar;
 mod tunnel;
 mod update;
@@ -51,6 +56,15 @@ fn main() -> eframe::Result<()> {
 
     // Leftovers of the previous update (the replaced program, set aside while it ran).
     update::clean_up();
+
+    // A terminal command on Windows: this is a windowed program, so attach to the
+    // terminal it was started from, or its output goes nowhere. Not for `mcp`,
+    // whose stdin/stdout are the client's pipes.
+    #[cfg(windows)]
+    if std::env::args().nth(1).is_some_and(|a| a != "mcp") {
+        // SAFETY: plain Win32 call; fails harmlessly when there is no parent console.
+        unsafe { windows_sys::Win32::System::Console::AttachConsole(windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS) };
+    }
 
     // Headless mode: `zentorrent --cli <magnet|url|file.torrent> [folder]`.
     let args: Vec<String> = std::env::args().collect();
@@ -204,6 +218,50 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    // `zentorrent serve [folder] [--port N]`: no window — the engine, the feeds and the
+    // MCP server, in a terminal or on a server. Ctrl-C stops it.
+    if args.get(1).map(String::as_str) == Some("serve") {
+        let folder = args.get(2).filter(|a| !a.starts_with("--")).map(PathBuf::from).unwrap_or(default_dir);
+        let port = args.iter().position(|a| a == "--port").and_then(|i| args.get(i + 1)).and_then(|p| p.parse().ok());
+        if let Err(e) = serve::run(rt, folder, port) {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    // `zentorrent mcp`: MCP over stdin/stdout, for clients that start a command; it
+    // talks to the running ZenTorrent (the window with MCP on, or `serve`).
+    if args.get(1).map(String::as_str) == Some("mcp") {
+        if let Err(e) = rt.block_on(mcp::stdio_bridge()) {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    // `zentorrent mcp-config`: the commands that connect Claude Code.
+    if args.get(1).map(String::as_str) == Some("mcp-config") {
+        let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "zentorrent".into());
+        println!("{}", mcp::setup_text(&mcp::config(), &exe));
+        return Ok(());
+    }
+
+    // No screen (an ssh session, a server): say what works instead of a winit error.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() && std::env::var_os("WAYLAND_SOCKET").is_none() {
+        eprintln!(
+            "ZenTorrent {}: no screen here (neither DISPLAY nor WAYLAND_DISPLAY is set), so no window.\n\n\
+             Run it without one:\n  \
+             zentorrent serve [folder]           the engine, your RSS feeds and the MCP server (Ctrl-C stops)\n  \
+             zentorrent --cli <magnet|url> [dir] download one torrent and seed it\n  \
+             zentorrent mcp-config               how to connect Claude Code to `serve`\n  \
+             zentorrent --ask \"<question>\"      one Flux MoE question in the terminal",
+            update::VERSION
+        );
+        std::process::exit(2);
+    }
+
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("ZenTorrent")
@@ -319,6 +377,8 @@ struct Inbox {
     vpn_test: Option<Result<u128, String>>,
     /// (info-hash, torrent name, play order + folder, or why not) after a Play click.
     tracks: Vec<(String, String, Result<(Vec<player::playlist::Track>, PathBuf), String>)>,
+    /// (info-hash, file index, bytes or why not) for the Details panel's Info tab.
+    info: Vec<(String, usize, Result<Vec<u8>, String>)>,
 }
 
 #[derive(Clone)]
@@ -422,85 +482,29 @@ struct App {
     vpn_testing: bool,
     /// This install's tunnel public key (hex), read when the VPN window opens.
     vpn_pub: Option<Result<String, String>>,
+    /// The MCP server (on while Flux MoE's MCP switch is on).
+    mcp: Option<mcp::Server>,
+    /// What MCP clients see (refreshed every 2 s while the server runs) and ask for.
+    mcp_lib: Arc<Mutex<moe::skills::Library>>,
+    mcp_asks: Arc<Mutex<Vec<mcp::Ask>>>,
+    mcp_lib_at: Instant,
+    /// The Downloads list's layout, order and media filter.
+    list: listview::ListView,
+    /// What each torrent holds (video / music / other), by info-hash, once its file list is known.
+    media: HashMap<String, listview::Media>,
 }
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, rt: tokio::runtime::Runtime, folder: PathBuf) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
 
-        // A torrent list damaged by an older version (empty session.json) is rebuilt
-        // from the saved .torrent files instead of stopping the engine.
-        let saves: Vec<PathBuf> = std::iter::once(folder.clone()).chain(dirs::download_dir()).collect();
-        let repaired: Vec<String> =
-            ["session", "session-vpn"].iter().filter_map(|s| repair::session(&seed::data_dir().join(s), &saves)).collect();
-
-        // The VPN comes first: when it is on, the engine may start only once the
-        // tunnel is up (kill switch), and with every non-tunnel path switched off.
         let vpn_settings = vpn::VpnSettings::load();
-        let vpn = vpn::Vpn::start(&rt, &vpn_settings);
-        let engine_opts = |listen: Option<librqbit::ListenerOptions>| SessionOptions {
-            // Persistence: librqbit remembers every torrent (and where it got
-            // to) in the data dir, so a restart resumes downloads and seeding.
-            persistence: Some(librqbit::SessionPersistenceConfig::Json {
-                folder: Some(seed::data_dir().join("session")),
-            }),
-            fastresume: true,
-            listen,
-            ..Default::default()
-        };
-        let (session, session_error) = match vpn::session_options(engine_opts(None), &vpn) {
-            None => (
-                None,
-                Some(format!(
-                    "VPN is on but the tunnel is down, so the torrent engine is stopped (kill switch): {}. \
-                     Fix the relay or turn the VPN off (VPN button, top right).",
-                    vpn.failure().unwrap_or("?")
-                )),
-            ),
-            // The VPN tunnel only carries outgoing connections, so no listener there.
-            Some(opts) if vpn.is_up() => match rt.block_on(Session::new_with_opts(folder.clone(), opts)) {
-                Ok(s) => (Some(s), None),
-                Err(e) => (None, Some(format!("could not start the torrent engine: {e:#}"))),
-            },
-            // Direct: listen on this install's port, else any free port, else not at all.
-            Some(_) => {
-                let mut last = None;
-                let mut started = None;
-                for listen in [Some(listener(listen_port())), Some(listener(0)), None] {
-                    match rt.block_on(Session::new_with_opts(folder.clone(), engine_opts(listen))) {
-                        Ok(s) => {
-                            started = Some(s);
-                            break;
-                        }
-                        Err(e) => last = Some(e),
-                    }
-                }
-                match started {
-                    Some(s) => (Some(s), None),
-                    None => (None, last.map(|e| format!("could not start the torrent engine: {e:#}"))),
-                }
-            }
-        };
-
+        // The engine: damaged torrent lists repaired, VPN kill switch, incoming listener.
+        let engine::Opened { session, error: session_error, vpn, notes: repaired } = engine::open(&rt, &folder);
         let inbox = Arc::new(Mutex::new(Inbox::default()));
-
         // Torrents restored from the previous run.
         let ledger = seed::Ledger::load();
-        let mut transfers = Vec::new();
-        if let Some(s) = &session {
-            let handles: Vec<ManagedTorrentHandle> = s.with_torrents(|it| it.map(|(_, h)| h.clone()).collect());
-            {
-                for h in &handles {
-                    let hash = h.info_hash().as_string();
-                    let e = ledger.entries.get(&hash);
-                    transfers.push(Transfer {
-                        name: h.name().or_else(|| e.map(|e| e.name.clone())).unwrap_or_else(|| hash.clone()),
-                        folder: e.map(|e| e.folder.clone()).unwrap_or_else(|| folder.clone()),
-                        handle: h.clone(),
-                    });
-                }
-            }
-        }
+        let transfers = session.as_ref().map(|s| engine::restore(s, &ledger, &folder)).unwrap_or_default();
 
         let meta_jobs = spawn_meta_worker(&rt, inbox.clone(), cc.egui_ctx.clone());
 
@@ -548,6 +552,12 @@ impl App {
             vpn_note: None,
             vpn_testing: false,
             vpn_pub: None,
+            mcp: None,
+            mcp_lib: Default::default(),
+            mcp_asks: Default::default(),
+            mcp_lib_at: Instant::now(),
+            list: listview::ListView::load(),
+            media: HashMap::new(),
         };
         app.apply_global_limits();
         app
@@ -604,6 +614,23 @@ impl App {
                     self.save_ledger();
                     self.apply_global_limits();
                     self.apply_torrent_limits(&self.transfers[i]);
+                }
+                details::Action::FetchInfo(file) => {
+                    let (h, inbox, ctx, hash) = (self.transfers[i].handle.clone(), self.inbox.clone(), ctx.clone(), d.hash.clone());
+                    self.rt.spawn(async move {
+                        use tokio::io::AsyncReadExt;
+                        let read = async {
+                            let s = h.stream(file).await.map_err(|e| format!("{e:#}"))?;
+                            let mut b = Vec::new();
+                            s.take(512 * 1024).read_to_end(&mut b).await.map_err(|e| e.to_string())?;
+                            Ok::<_, String>(b)
+                        };
+                        let got = tokio::time::timeout(Duration::from_secs(30), read)
+                            .await
+                            .unwrap_or_else(|_| Err("no peer has sent this file yet — try again in a moment".into()));
+                        inbox.lock().unwrap().info.push((hash, file, got));
+                        ctx.request_repaint();
+                    });
                 }
                 details::Action::SetFiles(only) => {
                     if let Some(sess) = self.session.clone() {
@@ -662,6 +689,35 @@ impl App {
                 }
             })
             .collect()
+    }
+
+    /// Artwork for a torrent in the thumbnail view: the OMDb poster when ratings are on
+    /// and the name looks like a film or an episode (looked up once, then cached).
+    fn poster_for(&mut self, name: &str) -> Option<egui::TextureHandle> {
+        let q = meta::guess(name, "")?;
+        let k = q.key();
+        match self.meta_cache.get(&k) {
+            Some(Some(info)) => match self.textures.get(&info.imdb_id) {
+                Some(t) => t.clone(),
+                None => {
+                    if let Some(url) = info.poster.clone() {
+                        self.textures.insert(info.imdb_id.clone(), None);
+                        let _ = self.meta_jobs.send(MetaJob::Poster { imdb_id: info.imdb_id.clone(), url });
+                    }
+                    None
+                }
+            },
+            Some(None) => None,
+            None => {
+                let ratings_on = self.store.show_ratings && !self.store.omdb_key.trim().is_empty();
+                if ratings_on && self.meta_error.is_none() && !self.meta_pending.contains(&k) && self.meta_cache.spend() {
+                    self.meta_pending.insert(k.clone());
+                    let _ = self.meta_jobs.send(MetaJob::Lookup { key: k, query: q, api_key: self.store.omdb_key.trim().to_string() });
+                    self.meta_cache.save();
+                }
+                None
+            }
+        }
     }
 
     /// Is transfer `i` shown under the sidebar's current filter?
@@ -1186,77 +1242,12 @@ impl App {
         let tunnelled = self.vpn.is_up();
         inbox.lock().unwrap().busy += 1;
         self.rt.spawn(async move {
-            let add = match (source, tunnelled) {
-                (Source::Link(s), false) => Ok(AddTorrent::from_url(s)),
-                (Source::Link(s), true) => vpn::tunnel_link(&http, &s).await,
-                (Source::Bytes(b), false) => Ok(AddTorrent::from_bytes(b)),
-                (Source::Bytes(b), true) => vpn::tunnel_bytes(b),
-                (Source::Fetch { url, cookie }, t) => match rss::fetch_torrent(&http, &url, Some(&cookie)).await {
-                    Ok(b) if t => vpn::tunnel_bytes(b),
-                    Ok(b) => Ok(AddTorrent::from_bytes(b)),
-                    Err(e) => Err(e),
-                },
-            };
-            let add = match add {
-                Ok(a) => a,
-                Err(e) => {
-                    let mut ib = inbox.lock().unwrap();
-                    ib.busy -= 1;
-                    ib.errors.push(format!("{label}: {e:#}"));
-                    ctx.request_repaint();
-                    return;
-                }
-            };
-            // Where it goes: a torrent with several files (an album, a season) gets its own
-            // folder named after it, a single file goes straight into the download folder
-            // (qBittorrent's default). librqbit only makes that folder itself when no
-            // output_folder is given, and ZenTorrent always gives the chosen "Save to" — so
-            // every album used to spill its files loose into Downloads. First list the files,
-            // then add from the same bytes (no second metadata fetch for magnets).
-            let listed = session
-                .add_torrent(add, Some(AddTorrentOptions { list_only: true, ..Default::default() }))
-                .await;
-            let (add, folder, peers) = match listed {
-                Ok(AddTorrentResponse::ListOnly(l)) => {
-                    let files = l.info.iter_file_details().count();
-                    let dest = torrent_folder(&folder, files, l.info.name().as_deref());
-                    (AddTorrent::from_bytes(l.torrent_bytes), dest, l.seen_peers)
-                }
-                Ok(AddTorrentResponse::Added(_, handle)) | Ok(AddTorrentResponse::AlreadyManaged(_, handle)) => {
-                    // Already in the list (or added anyway): nothing more to do.
-                    let mut ib = inbox.lock().unwrap();
-                    ib.busy -= 1;
-                    let name = handle.name().unwrap_or(label);
-                    let folder = handle.output_folder().to_path_buf();
-                    ib.added.push(Transfer { name, folder, handle });
-                    ctx.request_repaint();
-                    return;
-                }
-                Err(e) => {
-                    let mut ib = inbox.lock().unwrap();
-                    ib.busy -= 1;
-                    ib.errors.push(format!("{label}: {e:#}"));
-                    ctx.request_repaint();
-                    return;
-                }
-            };
-            let opts = AddTorrentOptions {
-                output_folder: Some(folder.to_string_lossy().into_owned()),
-                overwrite: true,
-                initial_peers: (!peers.is_empty()).then_some(peers),
-                ..Default::default()
-            };
-            let res = session.add_torrent(add, Some(opts)).await;
+            let res = engine::add(session, http, tunnelled, folder, label, source).await;
             let mut ib = inbox.lock().unwrap();
             ib.busy -= 1;
             match res {
-                Ok(AddTorrentResponse::Added(_, handle))
-                | Ok(AddTorrentResponse::AlreadyManaged(_, handle)) => {
-                    let name = handle.name().unwrap_or(label);
-                    ib.added.push(Transfer { name, folder, handle });
-                }
-                Ok(AddTorrentResponse::ListOnly(_)) => {}
-                Err(e) => ib.errors.push(format!("{label}: {e:#}")),
+                Ok(t) => ib.added.push(t),
+                Err(e) => ib.errors.push(e),
             }
             ctx.request_repaint();
         });
@@ -1343,6 +1334,64 @@ impl App {
         });
     }
 
+    /// The MCP server: started and stopped with Flux MoE's MCP switch; its library
+    /// snapshot kept fresh; what clients asked for carried out (or shown as a card).
+    fn mcp_tick(&mut self, ctx: &egui::Context) {
+        match (self.moe.mcp_on(), self.mcp.is_some()) {
+            (true, false) => {
+                let cfg = mcp::config();
+                *self.mcp_lib.lock().unwrap() = self.moe_library();
+                self.mcp_lib_at = Instant::now();
+                let c = ctx.clone();
+                let host = Arc::new(mcp::Relay { lib: self.mcp_lib.clone(), asks: self.mcp_asks.clone(), wake: Box::new(move || c.request_repaint()) });
+                match self.rt.block_on(mcp::serve(host, &cfg)) {
+                    Ok(srv) => {
+                        let cfg = mcp::Config { port: srv.port, ..cfg };
+                        let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "zentorrent".into());
+                        self.moe.mcp_started(srv.port, mcp::setup_text(&cfg, &exe));
+                        self.mcp = Some(srv);
+                    }
+                    Err(e) => self.moe.mcp_failed(e),
+                }
+            }
+            (false, true) => {
+                if let Some(s) = self.mcp.take() {
+                    s.stop();
+                }
+            }
+            _ => {}
+        }
+        if self.mcp.is_none() {
+            return;
+        }
+        if self.mcp_lib_at.elapsed() >= Duration::from_secs(2) {
+            *self.mcp_lib.lock().unwrap() = self.moe_library();
+            self.mcp_lib_at = Instant::now();
+        }
+        let asks: Vec<mcp::Ask> = std::mem::take(&mut *self.mcp_asks.lock().unwrap());
+        for a in asks {
+            match a {
+                mcp::Ask::Act(a) if a.needs_ok() => {
+                    self.moe.propose(a);
+                    self.view = View::Moe;
+                }
+                mcp::Ask::Act(a) => self.moe_actions(ctx, vec![a]),
+                mcp::Ask::Control(mcp::Control::Add(link)) => {
+                    let title = if link.starts_with("magnet:") {
+                        link.split("dn=").nth(1).and_then(|n| n.split('&').next()).map(|n| n.replace('+', " ")).unwrap_or_else(|| "magnet link".into())
+                    } else {
+                        link.rsplit('/').next().unwrap_or("torrent").to_string()
+                    };
+                    self.moe.propose(moe::skills::Action::Download { title, link, feed_key: String::new() });
+                    self.view = View::Moe;
+                }
+                mcp::Ask::Control(mcp::Control::Pause(h)) => self.set_paused(&h, true),
+                mcp::Ask::Control(mcp::Control::Resume(h)) => self.set_paused(&h, false),
+            }
+        }
+        ctx.request_repaint_after(Duration::from_secs(2));
+    }
+
     /// What Flux MoE's skills see: the torrents, their files, and the feed items.
     fn moe_library(&self) -> moe::skills::Library {
         let facts = self.collect_facts();
@@ -1402,6 +1451,8 @@ impl App {
                 }
                 // Moves are done by the tab itself (files only, after Apply).
                 Action::Moves { .. } => {}
+                // Result lists are shown in the tab; their Download buttons send Download.
+                Action::Picks(_) => {}
             }
         }
     }
@@ -1452,6 +1503,13 @@ impl App {
     }
 
     fn drain_inbox(&mut self, ctx: &egui::Context) {
+        // Info files fetched for the Details panel (ignored if it was closed meanwhile).
+        let infos = std::mem::take(&mut self.inbox.lock().unwrap().info);
+        for (hash, file, got) in infos {
+            if let Some(d) = self.details.as_mut().filter(|d| d.hash == hash) {
+                d.set_info(file, got);
+            }
+        }
         let ready = std::mem::take(&mut self.inbox.lock().unwrap().tracks);
         if !ready.is_empty() {
             self.engine_got = None; // the engine fetch (if any) is over, either way
@@ -1824,6 +1882,7 @@ impl eframe::App for App {
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = &root.ctx().clone();
         self.drain_inbox(ctx);
+        self.mcp_tick(ctx);
         self.vpn_window(ctx);
         let due = match self.fv.last_refresh {
             None => true,
@@ -2004,24 +2063,101 @@ impl eframe::App for App {
                     self.sidebar.filter = Default::default();
                 }
             }
+            // What each torrent holds, once its file list is known (kept: it doesn't change).
+            for t in &self.transfers {
+                let hash = t.handle.info_hash().as_string();
+                if self.media.contains_key(&hash) {
+                    continue;
+                }
+                let files: Vec<(String, u64)> = t
+                    .handle
+                    .with_metadata(|m| m.file_infos.iter().map(|f| (f.relative_filename.to_string_lossy().into_owned(), f.len)).collect())
+                    .unwrap_or_default();
+                if !files.is_empty() {
+                    self.media.insert(hash, listview::media_of(files.iter().map(|(p, l)| (p.as_str(), *l))));
+                }
+            }
+            let medias: Vec<listview::Media> =
+                self.transfers.iter().map(|t| self.media.get(&t.handle.info_hash().as_string()).copied().unwrap_or_default()).collect();
+            let mut counts = [0usize; 3];
+            for i in (0..self.transfers.len()).filter(|&i| self.visible(i)) {
+                counts[medias[i] as usize] += 1;
+            }
+            if !self.transfers.is_empty() {
+                self.list.toolbar(ui, counts);
+                ui.add_space(2.0);
+            }
+            let order = {
+                let keys: Vec<Option<listview::Key>> = (0..self.transfers.len())
+                    .map(|i| {
+                        let f = self.facts.get(i).filter(|_| self.visible(i))?;
+                        let s = self.transfers[i].handle.stats();
+                        Some(listview::Key {
+                            name: &f.name,
+                            size: f.size,
+                            progress: if s.total_bytes > 0 { s.progress_bytes as f64 / s.total_bytes as f64 } else { 0.0 },
+                            speed: f.down_mibs + f.up_mibs,
+                            ratio: f.ratio,
+                            status: if f.error { 0 } else if !f.finished && !f.paused { 1 } else if f.paused { 2 } else if f.live { 3 } else { 4 },
+                            media: medias[i],
+                        })
+                    })
+                    .collect();
+                self.list.arrange(&keys)
+            };
+            // Artwork for the thumbnails (films and episodes, when ratings are on).
+            let posters: HashMap<usize, egui::TextureHandle> = if self.list.layout == listview::Layout::Thumbs {
+                let names: Vec<(usize, String)> =
+                    order.iter().filter(|&&i| medias[i] == listview::Media::Video).map(|&i| (i, self.transfers[i].name.clone())).collect();
+                names.into_iter().filter_map(|(i, n)| self.poster_for(&n).map(|t| (i, t))).collect()
+            } else {
+                HashMap::new()
+            };
+
             let mut remove = None;
             let mut relabel: Vec<(String, String, bool)> = Vec::new();
             let mut open_details: Option<String> = None;
             let mut play_req: Option<String> = None;
             let labels = self.ledger.labels.clone();
+            let layout = self.list.layout;
             egui::ScrollArea::vertical().show(ui, |ui| {
-                for (i, t) in self.transfers.iter().enumerate() {
-                    if !self.visible(i) {
-                        continue;
+                let mut out = RowOut { relabel: &mut relabel, open_details: &mut open_details, play: &mut play_req, remove: &mut remove };
+                match layout {
+                    listview::Layout::Cards => {
+                        for &i in &order {
+                            let (t, Some(f)) = (&self.transfers[i], self.facts.get(i)) else { continue };
+                            let mut gone = false;
+                            transfer_row(ui, &self.rt, self.session.as_ref(), t, f, &labels, out.relabel, out.open_details, out.play, || gone = true);
+                            if gone {
+                                *out.remove = Some(i);
+                            }
+                            ui.add_space(4.0);
+                        }
                     }
-                    let Some(f) = self.facts.get(i) else { continue };
-                    transfer_row(ui, &self.rt, self.session.as_ref(), t, f, &labels, &mut relabel, &mut open_details, &mut play_req, || remove = Some(i));
-                    ui.add_space(4.0);
+                    listview::Layout::Compact => {
+                        ui.spacing_mut().item_spacing.y = 1.0;
+                        for (n, &i) in order.iter().enumerate() {
+                            let (t, Some(f)) = (&self.transfers[i], self.facts.get(i)) else { continue };
+                            compact_row(ui, &self.rt, self.session.as_ref(), t, f, medias[i], n % 2 == 1, &labels, i, &mut out);
+                        }
+                    }
+                    listview::Layout::Thumbs => {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
+                            for &i in &order {
+                                let (t, Some(f)) = (&self.transfers[i], self.facts.get(i)) else { continue };
+                                thumb_tile(ui, &self.rt, self.session.as_ref(), t, f, medias[i], posters.get(&i), &labels, i, &mut out);
+                            }
+                        });
+                    }
                 }
-                if shown == 0 && !self.transfers.is_empty() {
+                if order.is_empty() && !self.transfers.is_empty() {
                     ui.add_space(30.0);
                     ui.vertical_centered(|ui| {
                         ui.label(egui::RichText::new("Nothing matches this filter").size(16.0));
+                        if shown > 0 {
+                            ui.label(egui::RichText::new("(the type filter above hides the rest)").weak());
+                        }
                     });
                 }
             });
@@ -2684,6 +2820,267 @@ fn transfer_row(
         }
         ui.label(egui::RichText::new(line).small().monospace());
     });
+}
+
+/// What a click in the list asks the app for (carried out after the list is drawn).
+struct RowOut<'a> {
+    relabel: &'a mut Vec<(String, String, bool)>,
+    open_details: &'a mut Option<String>,
+    play: &'a mut Option<String>,
+    remove: &'a mut Option<usize>,
+}
+
+/// Status of one torrent in a word, with its colour.
+fn status_word(f: &sidebar::Facts, s: &librqbit::TorrentStats) -> (String, egui::Color32) {
+    if f.error {
+        ("error".into(), egui::Color32::from_rgb(220, 90, 80))
+    } else if f.paused {
+        ("paused".into(), egui::Color32::from_gray(140))
+    } else if f.finished {
+        (if f.live { "seeding" } else { "done" }.into(), egui::Color32::from_rgb(60, 170, 90))
+    } else {
+        let eta = s.live.as_ref().and_then(|l| l.time_remaining.as_ref()).map(|e| format!(" · {e}")).unwrap_or_default();
+        (format!("{:.0} %{eta}", if s.total_bytes > 0 { s.progress_bytes as f64 * 100.0 / s.total_bytes as f64 } else { 0.0 }), egui::Color32::from_rgb(70, 130, 220))
+    }
+}
+
+/// Right-click menu of the compact list and the thumbnails: what the card's buttons do.
+#[allow(clippy::too_many_arguments)]
+fn actions_menu(
+    ui: &mut egui::Ui,
+    rt: &tokio::runtime::Runtime,
+    session: Option<&Arc<Session>>,
+    t: &Transfer,
+    f: &sidebar::Facts,
+    all_labels: &[String],
+    i: usize,
+    out: &mut RowOut,
+) {
+    ui.label(egui::RichText::new(&t.name).strong().small());
+    ui.separator();
+    if player::has_media(&t.handle) && ui.button("▶ Play").clicked() {
+        *out.play = Some(f.hash.clone());
+        ui.close();
+    }
+    if !f.finished {
+        if let Some(sess) = session {
+            let paused = t.handle.is_paused();
+            if ui.button(if paused { "▶ Resume" } else { "⏸ Pause" }).clicked() {
+                let (sess, h) = (sess.clone(), t.handle.clone());
+                rt.spawn(async move {
+                    let _ = if paused { sess.unpause(&h).await } else { sess.pause(&h).await };
+                });
+                ui.close();
+            }
+        }
+    }
+    if ui.button("Details").clicked() {
+        *out.open_details = Some(f.hash.clone());
+        ui.close();
+    }
+    if ui.button("Open folder").clicked() {
+        let _ = open_folder(&t.folder);
+        ui.close();
+    }
+    ui.menu_button("Labels", |ui| {
+        if all_labels.is_empty() {
+            ui.label(egui::RichText::new("Make one in the sidebar under Labels").weak());
+        }
+        for l in all_labels {
+            let mut on = f.labels.contains(l);
+            if ui.checkbox(&mut on, l.as_str()).changed() {
+                out.relabel.push((f.hash.clone(), l.clone(), on));
+            }
+        }
+    });
+    ui.separator();
+    if ui.button("Remove").on_hover_text("Stop and remove from list (keeps files)").clicked() {
+        *out.remove = Some(i);
+        ui.close();
+    }
+}
+
+/// One line per torrent: status dot, kind, name — then a thin bar, status, size and speeds
+/// in fixed columns. Double-click opens Details; right-click has the rest; drag to label.
+#[allow(clippy::too_many_arguments)]
+fn compact_row(
+    ui: &mut egui::Ui,
+    rt: &tokio::runtime::Runtime,
+    session: Option<&Arc<Session>>,
+    t: &Transfer,
+    f: &sidebar::Facts,
+    media: listview::Media,
+    stripe: bool,
+    all_labels: &[String],
+    i: usize,
+    out: &mut RowOut,
+) {
+    let s = t.handle.stats();
+    let frac = if s.total_bytes > 0 { s.progress_bytes as f32 / s.total_bytes as f32 } else { 0.0 };
+    let (word, col) = status_word(f, &s);
+    let h = 24.0;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), h), egui::Sense::click_and_drag());
+    let p = ui.painter_at(rect);
+    let visuals = ui.visuals();
+    if resp.hovered() {
+        p.rect_filled(rect, 4.0, visuals.widgets.hovered.weak_bg_fill);
+    } else if stripe {
+        p.rect_filled(rect, 4.0, visuals.faint_bg_color);
+    }
+    let text = visuals.text_color();
+    let weak = visuals.weak_text_color();
+    let mid = rect.center().y;
+    p.circle_filled(egui::pos2(rect.left() + 10.0, mid), 4.0, col);
+    p.text(egui::pos2(rect.left() + 20.0, mid), egui::Align2::LEFT_CENTER, media.glyph(), egui::FontId::proportional(12.0), text);
+
+    // Fixed columns from the right: speeds, size, status, bar.
+    let speeds = match &s.live {
+        Some(l) if !s.finished => format!("↓ {}  ↑ {}", speed(l.download_speed.mbps), speed(l.upload_speed.mbps)),
+        Some(l) => format!("↑ {}", speed(l.upload_speed.mbps)),
+        None => String::new(),
+    };
+    let mono = egui::FontId::monospace(11.0);
+    let mut x = rect.right() - 8.0;
+    p.text(egui::pos2(x, mid), egui::Align2::RIGHT_CENTER, speeds, mono.clone(), weak);
+    x -= 150.0;
+    p.text(egui::pos2(x, mid), egui::Align2::RIGHT_CENTER, human(f.size), mono.clone(), weak);
+    x -= 78.0;
+    p.text(egui::pos2(x, mid), egui::Align2::RIGHT_CENTER, &word, egui::FontId::proportional(11.5), col);
+    x -= 104.0;
+    let bar = egui::Rect::from_min_size(egui::pos2(x - 90.0, mid - 3.0), egui::vec2(90.0, 6.0));
+    p.rect_filled(bar, 3.0, egui::Color32::from_white_alpha(22));
+    p.rect_filled(egui::Rect::from_min_size(bar.min, egui::vec2(90.0 * frac.clamp(0.0, 1.0), 6.0)), 3.0, col);
+
+    // The name gets what is left, cut with an ellipsis.
+    let name_left = rect.left() + 40.0;
+    let name_w = (bar.left() - 14.0 - name_left).max(40.0);
+    let mut job = egui::text::LayoutJob::single_section(t.name.clone(), egui::TextFormat::simple(egui::FontId::proportional(13.0), text));
+    job.wrap = egui::text::TextWrapping::truncate_at_width(name_w);
+    let galley = ui.fonts_mut(|fo| fo.layout_job(job));
+    p.galley(egui::pos2(name_left, mid - galley.size().y / 2.0), galley, text);
+    let mut chip_x = name_left + name_w.min(ui.fonts_mut(|fo| fo.layout_no_wrap(t.name.clone(), egui::FontId::proportional(13.0), text).size().x)) + 8.0;
+    for l in &f.labels {
+        let g = ui.fonts_mut(|fo| fo.layout_no_wrap(l.clone(), egui::FontId::proportional(10.5), egui::Color32::BLACK));
+        let r = egui::Rect::from_min_size(egui::pos2(chip_x, mid - 7.0), egui::vec2(g.size().x + 8.0, 14.0));
+        if r.right() > bar.left() - 8.0 {
+            break;
+        }
+        p.rect_filled(r, 7.0, sidebar::tint(l));
+        p.galley(egui::pos2(r.left() + 4.0, mid - g.size().y / 2.0), g, egui::Color32::BLACK);
+        chip_x = r.right() + 4.0;
+    }
+
+    if resp.drag_started() {
+        egui::DragAndDrop::set_payload(ui.ctx(), sidebar::Dragged(f.hash.clone()));
+    }
+    if resp.double_clicked() {
+        *out.open_details = Some(f.hash.clone());
+    }
+    let resp = resp.on_hover_text(format!("{}\n\nDouble-click: details · right-click: actions · drag onto a label", t.name));
+    resp.context_menu(|ui| actions_menu(ui, rt, session, t, f, all_labels, i, out));
+}
+
+/// A tile: artwork (the film's poster, else a colour and the kind), a progress ring,
+/// a ▶ on hover for media; the name and a status line under it.
+#[allow(clippy::too_many_arguments)]
+fn thumb_tile(
+    ui: &mut egui::Ui,
+    rt: &tokio::runtime::Runtime,
+    session: Option<&Arc<Session>>,
+    t: &Transfer,
+    f: &sidebar::Facts,
+    media: listview::Media,
+    poster: Option<&egui::TextureHandle>,
+    all_labels: &[String],
+    i: usize,
+    out: &mut RowOut,
+) {
+    let s = t.handle.stats();
+    let frac = if s.total_bytes > 0 { s.progress_bytes as f32 / s.total_bytes as f32 } else { 0.0 };
+    let (word, col) = status_word(f, &s);
+    let (w, art_h, h) = (172.0, 128.0, 186.0);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click_and_drag());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let p = ui.painter_at(rect);
+    let visuals = ui.visuals();
+    let hovered = resp.hovered();
+    p.rect_filled(rect, 10.0, if hovered { visuals.widgets.hovered.weak_bg_fill } else { visuals.faint_bg_color });
+    let art = egui::Rect::from_min_size(rect.min, egui::vec2(w, art_h));
+    let round_top = egui::CornerRadius { nw: 10, ne: 10, sw: 0, se: 0 };
+    let tint = listview::tint(&t.name);
+    p.rect_filled(art, round_top, tint);
+    // A soft fade to dark at the bottom of the artwork, under the ring.
+    let mut mesh = egui::Mesh::default();
+    let fade = egui::Rect::from_min_max(egui::pos2(art.left(), art.center().y), art.max);
+    mesh.colored_vertex(fade.left_top(), egui::Color32::TRANSPARENT);
+    mesh.colored_vertex(fade.right_top(), egui::Color32::TRANSPARENT);
+    mesh.colored_vertex(fade.right_bottom(), egui::Color32::from_black_alpha(150));
+    mesh.colored_vertex(fade.left_bottom(), egui::Color32::from_black_alpha(150));
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    p.add(mesh);
+    match poster {
+        Some(tex) => {
+            let ph = art_h - 12.0;
+            let pr = egui::Rect::from_center_size(art.center(), egui::vec2(ph * 2.0 / 3.0, ph));
+            p.image(tex.id(), pr, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+        }
+        None => {
+            p.text(art.center() - egui::vec2(0.0, 10.0), egui::Align2::CENTER_CENTER, media.glyph(), egui::FontId::proportional(38.0), egui::Color32::WHITE);
+            p.text(
+                art.center() + egui::vec2(0.0, 26.0),
+                egui::Align2::CENTER_CENTER,
+                listview::initials(&t.name),
+                egui::FontId::proportional(13.0),
+                egui::Color32::from_white_alpha(170),
+            );
+        }
+    }
+    // Progress ring, bottom right of the artwork.
+    let rc = egui::pos2(art.right() - 22.0, art.bottom() - 22.0);
+    listview::ring(&p, rc, 14.0, frac, col);
+    let inner = if s.finished { "✔".to_string() } else { format!("{:.0}", frac * 100.0) };
+    p.text(rc, egui::Align2::CENTER_CENTER, inner, egui::FontId::proportional(10.5), egui::Color32::WHITE);
+    // ▶ on hover, for torrents that can play.
+    let can_play = player::has_media(&t.handle);
+    let play_spot = egui::Rect::from_center_size(art.center(), egui::vec2(52.0, 52.0));
+    let over_play = can_play && hovered && resp.hover_pos().is_some_and(|q| play_spot.contains(q));
+    if can_play && hovered {
+        p.circle_filled(art.center(), 24.0, egui::Color32::from_black_alpha(if over_play { 210 } else { 150 }));
+        p.text(art.center() + egui::vec2(2.0, 0.0), egui::Align2::CENTER_CENTER, "▶", egui::FontId::proportional(22.0), egui::Color32::WHITE);
+    }
+
+    // Name (two lines at most) and status.
+    let text = visuals.text_color();
+    let mut job = egui::text::LayoutJob::single_section(t.name.clone(), egui::TextFormat::simple(egui::FontId::proportional(12.5), text));
+    job.wrap = egui::text::TextWrapping { max_width: w - 16.0, max_rows: 2, break_anywhere: false, overflow_character: Some('…') };
+    let galley = ui.fonts_mut(|fo| fo.layout_job(job));
+    p.galley(egui::pos2(rect.left() + 8.0, art.bottom() + 6.0), galley, text);
+    p.text(
+        egui::pos2(rect.left() + 8.0, rect.bottom() - 9.0),
+        egui::Align2::LEFT_CENTER,
+        format!("{}  ·  {word}", human(f.size)),
+        egui::FontId::proportional(11.0),
+        col,
+    );
+    if let Some(l) = f.labels.first() {
+        p.circle_filled(egui::pos2(rect.right() - 10.0, rect.bottom() - 9.0), 4.0, sidebar::tint(l));
+    }
+
+    if resp.drag_started() {
+        egui::DragAndDrop::set_payload(ui.ctx(), sidebar::Dragged(f.hash.clone()));
+    }
+    if resp.clicked() {
+        if over_play {
+            *out.play = Some(f.hash.clone());
+        } else {
+            *out.open_details = Some(f.hash.clone());
+        }
+    }
+    let resp = resp.on_hover_text(format!("{}\n\nClick: details{} · right-click: actions · drag onto a label", t.name, if can_play { " · ▶: play" } else { "" }));
+    resp.context_menu(|ui| actions_menu(ui, rt, session, t, f, all_labels, i, out));
 }
 
 fn human(b: u64) -> String {

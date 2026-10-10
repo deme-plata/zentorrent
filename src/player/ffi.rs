@@ -27,6 +27,8 @@ pub const EVENT_NONE: c_int = 0;
 pub const EVENT_SHUTDOWN: c_int = 1;
 pub const EVENT_END_FILE: c_int = 7;
 pub const EVENT_FILE_LOADED: c_int = 8;
+/// A `script-message` from an input binding (ZenTorrent's own keys in the video window).
+pub const EVENT_CLIENT_MESSAGE: c_int = 16;
 pub const EVENT_PROPERTY_CHANGE: c_int = 22;
 
 /// mpv_end_file_reason: the file could not be played.
@@ -54,6 +56,12 @@ pub struct EventEndFile {
     pub playlist_entry_id: i64,
     pub playlist_insert_id: i64,
     pub playlist_insert_num_entries: c_int,
+}
+
+#[repr(C)]
+pub struct EventClientMessage {
+    pub num_args: c_int,
+    pub args: *const *const c_char,
 }
 
 pub type StreamRead = unsafe extern "C" fn(cookie: *mut c_void, buf: *mut c_char, nbytes: u64) -> i64;

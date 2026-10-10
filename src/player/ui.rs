@@ -82,7 +82,11 @@ pub fn bar(ui: &mut egui::Ui, p: &mut Player, pu: &mut PlayerUi, files: &Files) 
         // Right-hand controls are laid out first (right to left), so they always
         // fit; the seek slider then takes whatever width is left.
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.small_button("x").on_hover_text("Stop").clicked() {
+            if ui
+                .button("Close")
+                .on_hover_text("Stop and close the video window\n(or in the video window: its close button, Esc or Q)")
+                .clicked()
+            {
                 p.stop();
             }
             if ui.selectable_label(pu.show_playlist, "Playlist").clicked() {

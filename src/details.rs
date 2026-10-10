@@ -1,7 +1,8 @@
 //! The Details panel: one torrent, up close.
 //!
-//! A modal over the list with a live speed graph on top and five tabs:
-//! Status (the numbers), Details (hash, magnet, pieces, trackers), Files
+//! A modal over the list with a live speed graph on top and six tabs:
+//! Status (the numbers), Details (hash, magnet, pieces, trackers), Info (the
+//! release's .nfo or readme, see `info`), Files
 //! (choose what to download, per-file progress), Peers (who you trade
 //! with) and Settings (this torrent's speed limits and seed goal, plus the
 //! limits for all torrents).
@@ -14,7 +15,7 @@ use std::collections::{HashSet, VecDeque};
 
 use eframe::egui::{self, Color32, RichText};
 
-use crate::{human, seed, sidebar, speed, Transfer};
+use crate::{human, info, seed, sidebar, speed, Transfer};
 
 /// Seconds of speed history kept per torrent for the graph.
 pub const HISTORY: usize = 300;
@@ -26,6 +27,7 @@ const UP: Color32 = Color32::from_rgb(60, 170, 90);
 pub enum Tab {
     Status,
     Details,
+    Info,
     Files,
     Peers,
     Settings,
@@ -35,11 +37,29 @@ pub enum Tab {
 pub struct Details {
     pub hash: String,
     pub tab: Tab,
+    /// The Info tab's document, once looked at.
+    info: Option<InfoDoc>,
+}
+
+/// The info files of this torrent and the one being shown.
+struct InfoDoc {
+    files: Vec<(usize, String, u64)>,
+    sel: usize,
+    text: Option<Result<String, String>>,
+    asked: bool,
 }
 
 impl Details {
     pub fn new(hash: String) -> Self {
-        Self { hash, tab: Tab::Status }
+        Self { hash, tab: Tab::Status, info: None }
+    }
+
+    /// An info file fetched through the torrent (it was not downloaded yet).
+    pub fn set_info(&mut self, file: usize, got: Result<Vec<u8>, String>) {
+        if let Some(doc) = self.info.as_mut().filter(|d| d.files.get(d.sel).is_some_and(|f| f.0 == file)) {
+            let kind = info::kind_of(&doc.files[doc.sel].1);
+            doc.text = Some(got.map(|b| info::decode(&b, kind)));
+        }
     }
 }
 
@@ -56,6 +76,8 @@ pub enum Action {
     Label(String, bool),
     /// Limits or goals changed: save the ledger and apply the limits now.
     LedgerChanged,
+    /// Read this (small, not yet downloaded) file through the torrent for the Info tab.
+    FetchInfo(usize),
 }
 
 /// Draw the panel. `f` is this frame's sidebar facts for the torrent.
@@ -110,6 +132,7 @@ pub fn show(
             for (tab, name) in [
                 (Tab::Status, "Status"),
                 (Tab::Details, "Details"),
+                (Tab::Info, "Info"),
                 (Tab::Files, "Files"),
                 (Tab::Peers, "Peers"),
                 (Tab::Settings, "Settings"),
@@ -129,6 +152,7 @@ pub fn show(
             .show(ui, |ui| match d.tab {
             Tab::Status => status_tab(ui, t, f, &s, ledger),
             Tab::Details => details_tab(ui, t, f, &mut out),
+            Tab::Info => info_tab(ui, t, &mut d.info, &mut out),
             Tab::Files => files_tab(ui, t, &s, &mut out),
             Tab::Peers => peers_tab(ui, t),
             Tab::Settings => settings_tab(ui, t, f, ledger, &mut out),
@@ -247,6 +271,59 @@ fn graph(ui: &mut egui::Ui, hist: &VecDeque<(f32, f32)>) {
 /// The graph's top (MiB/s) and gridline count for a peak speed, so every
 /// gridline lands on a round number in the unit it is shown in: KB/s below
 /// 1 MB/s (50 KB/s at least), MB/s above. 1, 2.5 and 5 split into 5 steps, 2 into 4.
+/// The Info tab: the release's .nfo / readme. A downloaded file is read from disk;
+/// one still downloading is fetched through the torrent (it is small).
+fn info_tab(ui: &mut egui::Ui, t: &Transfer, doc: &mut Option<InfoDoc>, out: &mut Vec<Action>) {
+    let doc = doc.get_or_insert_with(|| {
+        let files = t
+            .handle
+            .with_metadata(|m| m.file_infos.iter().map(|f| (f.relative_filename.to_string_lossy().replace('\\', "/"), f.len)).collect::<Vec<_>>())
+            .unwrap_or_default();
+        InfoDoc { files: info::candidates(&files), sel: 0, text: None, asked: false }
+    });
+    if doc.files.is_empty() {
+        ui.label(RichText::new("No info file in this torrent (.nfo, readme or .txt).").weak());
+        return;
+    }
+    if doc.files.len() > 1 {
+        let mut sel = doc.sel;
+        egui::ComboBox::from_id_salt("info-file").selected_text(&doc.files[sel].1).show_ui(ui, |ui| {
+            for (i, f) in doc.files.iter().enumerate() {
+                ui.selectable_value(&mut sel, i, &f.1);
+            }
+        });
+        if sel != doc.sel {
+            *doc = InfoDoc { files: std::mem::take(&mut doc.files), sel, text: None, asked: false };
+        }
+        ui.add_space(4.0);
+    }
+    let (file, path, len) = doc.files[doc.sel].clone();
+    let kind = info::kind_of(&path);
+    if doc.text.is_none() && !doc.asked {
+        let done = t.handle.stats().file_progress.get(file).is_some_and(|&d| d >= len);
+        if done {
+            let on_disk = t.handle.output_folder().join(&path);
+            doc.text = Some(std::fs::read(&on_disk).map(|b| info::decode(&b, kind)).map_err(|e| format!("{}: {e}", on_disk.display())));
+        } else {
+            out.push(Action::FetchInfo(file));
+            doc.asked = true;
+        }
+    }
+    match &doc.text {
+        None => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(RichText::new(format!("fetching {path} from the swarm…")).weak());
+            });
+        }
+        Some(Err(e)) => {
+            ui.colored_label(Color32::from_rgb(230, 120, 100), e);
+        }
+        Some(Ok(text)) => info::show(ui, kind, text),
+    }
+}
+
+
 pub fn scale(peak_mib: f32) -> (f32, usize) {
     let kib = peak_mib * 1024.0 * 1.15;
     let (top_in_unit, unit) = if kib < 1000.0 { (nice_ceiling(kib.max(50.0)), 1.0 / 1024.0) } else { (nice_ceiling(peak_mib * 1.15), 1.0) };

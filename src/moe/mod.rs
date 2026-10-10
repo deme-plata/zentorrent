@@ -22,7 +22,7 @@ use std::time::Instant;
 use eframe::egui::{self, Color32, RichText};
 use serde_json::{json, Value};
 
-use skills::{Action, Library, Memory};
+use skills::{Action, Library, Memory, Pick};
 
 /// Model steps per message (tool call → answer → tool call …).
 const MAX_STEPS: usize = 6;
@@ -39,6 +39,10 @@ enum Line {
     Stats(String),
     /// A proposal waiting for the user (index into `Moe::cards`).
     Card(usize),
+    /// Feed results with a Download button each (index into `Moe::picks`).
+    Picks(usize),
+    /// Commands to copy (how to connect an MCP client).
+    Setup(String),
 }
 
 enum CardState {
@@ -57,6 +61,10 @@ enum Ev {
     Setup(ollama::Setup),
     /// The models that can use tools, for the picker.
     Models(Vec<String>),
+    /// Bigger models from the signed list that could be fetched: (tag, GB).
+    Offers(Vec<(String, f64)>),
+    /// A model fetched from the picker is ready.
+    Pulled(String),
     /// Ollama is not installed; wait for the user's click before downloading it.
     NeedsSetup,
     Text(String),
@@ -86,6 +94,9 @@ struct Settings {
     model: Option<String>,
     #[serde(default)]
     cpu_only: bool,
+    /// Serve ZenTorrent's tools over MCP (127.0.0.1, with a token).
+    #[serde(default)]
+    mcp: bool,
 }
 
 fn settings_path() -> std::path::PathBuf {
@@ -153,10 +164,15 @@ pub struct Moe {
     busy: bool,
     history: Vec<Value>,
     cards: Vec<Card>,
+    /// Result lists shown in the chat; `bool` = that row was downloaded.
+    picks: Vec<Vec<(Pick, bool)>>,
     events: Arc<Mutex<Vec<Ev>>>,
     memory: Arc<Mutex<Memory>>,
     settings: Settings,
     models: Vec<String>,
+    offers: Vec<(String, f64)>,
+    /// The picker's "Get …" panel: which model, and whether it fits here.
+    offer: Option<(String, ollama::Fit)>,
     can_undo: bool,
     /// A message typed this frame, waiting for the app to take a library snapshot.
     pending: Option<String>,
@@ -178,10 +194,13 @@ impl Default for Moe {
             busy: false,
             history: Vec::new(),
             cards: Vec::new(),
+            picks: Vec::new(),
             events: Default::default(),
             memory: Default::default(),
             settings,
             models: Vec::new(),
+            offers: Vec::new(),
+            offer: None,
             can_undo: organize::can_undo(),
             pending: None,
             task: None,
@@ -193,6 +212,7 @@ impl Default for Moe {
 
 const STARTERS: &[(&str, &str)] = &[
     ("Overview of my library", "Give me an overview of my library: what I have, what is still downloading, and what is playable."),
+    ("Top picks from my feeds", "Show me the top picks from my RSS feeds and their history: a varied mix of the best torrents, not one genre."),
     ("Find trance in my feeds", "Find trance in my RSS feeds and history, most seeders first."),
     ("Organize my music by genre", "Organize the music in my download folder into genre folders."),
     ("Play something", "Play something from my library — pick something good and tell me what it is."),
@@ -222,6 +242,17 @@ impl Moe {
             ollama::ensure(pick, |s| Moe::push(&events, &ctx, Ev::Setup(s))).await;
             if let Ok(m) = ollama::models().await {
                 let names = m.into_iter().filter(|m| m.tools).map(|m| m.name).collect::<Vec<_>>();
+                // Models from the signed list that are not here yet: the picker offers them.
+                if let Ok(man) = ollama::manifest().await {
+                    let offers = man
+                        .extra_models
+                        .iter()
+                        .chain(&man.models)
+                        .filter(|t| !names.contains(t))
+                        .filter_map(|t| man.sizes_gb.get(t).map(|gb| (t.clone(), *gb)))
+                        .collect();
+                    Moe::push(&events, &ctx, Ev::Offers(offers));
+                }
                 Moe::push(&events, &ctx, Ev::Models(names));
             }
         });
@@ -264,6 +295,7 @@ impl Moe {
         let (events, ctx, memory, cpu) = (self.events.clone(), ctx.clone(), self.memory.clone(), self.settings.cpu_only);
         self.task = Some(rt.spawn(async move {
             let on = |e: Ev| Moe::push(&events, &ctx, e);
+            ollama::ensure_placement(&model, cpu).await;
             let r = agent(ollama::BASE, &model, messages, cpu, &lib, &memory, &on).await;
             Moe::push(&events, &ctx, Ev::Done(r));
         }));
@@ -275,6 +307,17 @@ impl Moe {
             match ev {
                 Ev::Setup(ollama::Setup::Line(l)) => self.lines.push(Line::Note(l)),
                 Ev::Models(m) => self.models = m,
+                Ev::Offers(o) => self.offers = o,
+                Ev::Pulled(tag) => {
+                    self.lines.push(Line::Note(format!("{tag} is ready — Flux MoE uses it now.")));
+                    self.offers.retain(|(t, _)| *t != tag);
+                    if !self.models.contains(&tag) {
+                        self.models.push(tag.clone());
+                    }
+                    self.settings.model = Some(tag.clone());
+                    self.save_settings();
+                    self.status = Status::Ready(tag);
+                }
                 Ev::NeedsSetup => self.status = Status::NeedsSetup,
                 Ev::Setup(ollama::Setup::Ready(m)) => {
                     self.lines.push(Line::Note(format!("Flux MoE is ready — model {m}, on this computer.")));
@@ -301,6 +344,11 @@ impl Moe {
                 Ev::Tool(r) => {
                     self.flush_live();
                     self.lines.push(Line::Tool(r));
+                }
+                Ev::Action(Action::Picks(p)) => {
+                    self.flush_live();
+                    self.picks.push(p.into_iter().map(|p| (p, false)).collect());
+                    self.lines.push(Line::Picks(self.picks.len() - 1));
                 }
                 Ev::Action(a) if a.needs_ok() => {
                     self.flush_live();
@@ -351,6 +399,33 @@ impl Moe {
         }
     }
 
+    /// Is the MCP switch on?
+    pub fn mcp_on(&self) -> bool {
+        self.settings.mcp
+    }
+
+    pub fn mcp_started(&mut self, port: u16, setup: String) {
+        self.lines.push(Line::Note(format!(
+            "MCP is on: AI clients on this computer can use ZenTorrent's tools at 127.0.0.1:{port} (with the token below). \
+             Downloads and file moves they ask for show up here for you to confirm."
+        )));
+        self.lines.push(Line::Setup(setup));
+    }
+
+    pub fn mcp_failed(&mut self, why: String) {
+        self.settings.mcp = false;
+        self.save_settings();
+        self.lines.push(Line::Error(format!("MCP could not start: {why}")));
+    }
+
+    /// Something an MCP client asked for that needs the user's OK: a card.
+    pub fn propose(&mut self, a: Action) {
+        self.flush_live();
+        self.lines.push(Line::Note("🔌 An MCP client asks:".into()));
+        self.cards.push(Card { action: a, state: CardState::Waiting });
+        self.lines.push(Line::Card(self.cards.len() - 1));
+    }
+
     /// A message the user sent: the app answers with `send` and a fresh library snapshot.
     pub fn take_pending(&mut self) -> Option<String> {
         self.pending.take()
@@ -379,11 +454,27 @@ impl Moe {
             if let Some(m) = &current {
                 ui.label(RichText::new("on this computer").weak());
                 let mut pick = m.clone();
+                let mut get: Option<(String, f64)> = None;
                 egui::ComboBox::from_id_salt("moe-model").selected_text(&pick).show_ui(ui, |ui| {
-                    for name in &self.models {
+                    // Qwen only (the skills are tuned on it); the current model always shows.
+                    for name in self.models.iter().filter(|n| n.starts_with("qwen") || *n == m) {
                         ui.selectable_value(&mut pick, name.clone(), name);
                     }
+                    if !self.offers.is_empty() {
+                        ui.separator();
+                        for (tag, gb) in &self.offers {
+                            if ui.selectable_label(false, format!("Get {tag} ({gb:.1} GB)…")).clicked() {
+                                get = Some((tag.clone(), *gb));
+                            }
+                        }
+                    }
                 });
+                if let Some((tag, gb)) = get {
+                    let dir = ollama::models_dir();
+                    let drive = dir.components().next().map(|c| c.as_os_str().to_string_lossy().into_owned()).unwrap_or_default();
+                    let f = ollama::fit(gb, ollama::vram_gb(), ollama::free_disk_gb(&dir), &drive);
+                    self.offer = Some((tag, f));
+                }
                 if &pick != m {
                     self.settings.model = Some(pick.clone());
                     self.save_settings();
@@ -399,6 +490,16 @@ impl Moe {
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.checkbox(&mut self.settings.cpu_only, "CPU only").on_hover_text("Keep the model off the graphics card (slower, cooler).").changed() {
+                    self.save_settings();
+                }
+                if ui
+                    .checkbox(&mut self.settings.mcp, "MCP")
+                    .on_hover_text(
+                        "Let AI clients on this computer (Claude Code, Flux MoE elsewhere) use ZenTorrent's tools over MCP. \
+                         Only this computer, only with the token; downloads and moves wait for your OK here.",
+                    )
+                    .changed()
+                {
                     self.save_settings();
                 }
                 if self.can_undo && ui.button("↶ Undo last organize").on_hover_text("Put the last applied moves back").clicked() {
@@ -428,6 +529,31 @@ impl Moe {
         });
         if let Status::Failed(e) = &self.status {
             ui.colored_label(Color32::from_rgb(230, 160, 60), e);
+        }
+        // The picker's "Get …": what it costs and how it would run here, before anything downloads.
+        if let Some((tag, f)) = self.offer.clone() {
+            egui::Frame::new().fill(Color32::from_rgb(34, 38, 48)).corner_radius(8.0).inner_margin(egui::Margin::same(10)).show(ui, |ui| {
+                ui.label(RichText::new(format!("Get {tag}?")).strong());
+                ui.label(&f.text);
+                ui.horizontal(|ui| {
+                    let go = ui.add_enabled(f.can_get, egui::Button::new(RichText::new("Download").strong()));
+                    if go.clicked() {
+                        let (events, ctx2, t) = (self.events.clone(), ctx.clone(), tag.clone());
+                        rt.spawn(async move {
+                            let say = |s| Moe::push(&events, &ctx2, Ev::Setup(s));
+                            match ollama::pull(&t, &say).await {
+                                Ok(()) => Moe::push(&events, &ctx2, Ev::Pulled(t)),
+                                Err(e) => say(ollama::Setup::Line(format!("Could not get {t}: {e}"))),
+                            }
+                        });
+                        self.lines.push(Line::Note(format!("Getting {tag} — progress shows here.")));
+                        self.offer = None;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.offer = None;
+                    }
+                });
+            });
         }
         if self.status == Status::NeedsSetup {
             ui.add_space(8.0);
@@ -475,6 +601,7 @@ impl Moe {
 
         // ── transcript ──────────────────────────────────────────
         let mut decided: Option<(usize, bool)> = None;
+        let mut grab: Option<(usize, usize)> = None;
         egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
             if !self.talked() {
                 ui.add_space(20.0);
@@ -497,12 +624,27 @@ impl Moe {
                     Line::Note(t) => {
                         ui.label(RichText::new(t).small().weak());
                     }
+                    Line::Setup(t) => {
+                        egui::Frame::new().fill(Color32::from_rgb(22, 26, 32)).corner_radius(6.0).inner_margin(egui::Margin::same(8)).show(ui, |ui| {
+                            ui.add(egui::Label::new(RichText::new(t).monospace().size(11.0)).selectable(true).wrap());
+                            if ui.small_button("📋 Copy").on_hover_text("Paste it in a terminal").clicked() {
+                                ui.ctx().copy_text(t.clone());
+                            }
+                        });
+                    }
                     Line::Error(t) => {
                         ui.colored_label(Color32::from_rgb(230, 120, 100), t);
                     }
                     Line::Stats(t) => {
                         ui.label(RichText::new(t).small().color(Color32::from_rgb(120, 140, 160)));
                         ui.add_space(4.0);
+                    }
+                    Line::Picks(i) => {
+                        if let Some(rows) = self.picks.get(*i) {
+                            if let Some(r) = picks_ui(ui, rows) {
+                                grab = Some((*i, r));
+                            }
+                        }
                     }
                     Line::Card(i) => {
                         if let Some(c) = self.cards.get(*i) {
@@ -521,6 +663,13 @@ impl Moe {
             }
         });
 
+        // A Download button in a result list: the click is the user's OK.
+        if let Some((list, row)) = grab {
+            if let Some((p, done)) = self.picks.get_mut(list).and_then(|l| l.get_mut(row)) {
+                *done = true;
+                actions.push(Action::Download { title: p.title.clone(), link: p.link.clone(), feed_key: p.feed_key.clone() });
+            }
+        }
         if let Some((i, ok)) = decided {
             let card = &mut self.cards[i];
             if !ok {
@@ -541,6 +690,58 @@ impl Moe {
         }
         actions
     }
+}
+
+/// A result list from the feeds: each row with its numbers and a Download button.
+/// Returns the row whose button was clicked.
+fn picks_ui(ui: &mut egui::Ui, rows: &[(Pick, bool)]) -> Option<usize> {
+    let mut clicked = None;
+    egui::Frame::new()
+        .fill(Color32::from_rgb(28, 34, 44))
+        .stroke(egui::Stroke::new(1.0, Color32::from_rgb(70, 100, 140)))
+        .corner_radius(8.0)
+        .inner_margin(egui::Margin::same(8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            for (row, (p, done)) in rows.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    // The button is laid out first (right side), so a long title is cut, never the button.
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if *done {
+                            ui.label(RichText::new("✓ started").small().color(Color32::from_rgb(120, 200, 140)));
+                        } else if ui.button("⬇ Download").on_hover_text("Start this download now — see Downloads").clicked() {
+                            clicked = Some(row);
+                        }
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            ui.label(RichText::new(format!("{:>2}", p.id)).monospace().weak());
+                            ui.vertical(|ui| {
+                                ui.add(egui::Label::new(RichText::new(&p.title).strong()).truncate()).on_hover_text(&p.title);
+                                let mut meta = vec![p.feed.clone()];
+                                if let Some(s) = p.size {
+                                    meta.push(crate::human(s));
+                                }
+                                if let Some(s) = p.seeders {
+                                    meta.push(format!("{s} seeders"));
+                                }
+                                if let Some(g) = p.grabs {
+                                    meta.push(format!("{g} downloads"));
+                                }
+                                meta.push(format!("seen {} ago", p.seen));
+                                if p.freeleech {
+                                    meta.push("freeleech".into());
+                                }
+                                ui.label(RichText::new(meta.join(" · ")).small().weak());
+                            });
+                        });
+                    });
+                });
+                if row + 1 < rows.len() {
+                    ui.separator();
+                }
+            }
+        });
+    ui.add_space(4.0);
+    clicked
 }
 
 /// The live panel while an answer is generated (as in sigil-top): what it waits
@@ -620,9 +821,14 @@ fn card_ui(ui: &mut egui::Ui, i: usize, c: &Card) -> Option<bool> {
     let mut out = None;
     egui::Frame::new().fill(Color32::from_rgb(34, 44, 38)).stroke(egui::Stroke::new(1.0, Color32::from_rgb(90, 160, 110))).corner_radius(8.0).inner_margin(egui::Margin::same(10)).show(ui, |ui| {
         match &c.action {
-            Action::Download { title, .. } => {
+            Action::Download { title, link, feed_key } => {
                 ui.label(RichText::new("Download?").strong());
                 ui.label(title);
+                // Not from one of your feeds (an MCP client's link): say where it comes from.
+                if feed_key.is_empty() {
+                    let from = if link.starts_with("magnet:") { "a magnet link".to_string() } else { crate::rss::display_url(link) };
+                    ui.label(RichText::new(format!("from {from}")).small().weak());
+                }
             }
             Action::Moves { root, moves } => {
                 ui.label(RichText::new(format!("Move {} item{} in {}", moves.len(), if moves.len() == 1 { "" } else { "s" }, root.display())).strong());
@@ -741,6 +947,9 @@ pub async fn ask(question: &str, lib: Library, cpu_only: bool) -> Result<(), Str
         }
         let _ = std::io::stdout().flush();
     };
+    if ollama::ensure_placement(&model, cpu_only).await {
+        println!("  (the model was on the CPU though a GPU is here — reloading it onto the GPU)");
+    }
     agent(ollama::BASE, &model, messages, cpu_only, &lib, &memory, &print).await?;
     let s = *totals.lock().unwrap();
     println!("\n({})", summary(&model, &s, started.elapsed().as_secs_f64(), ollama::residency(&model).await));

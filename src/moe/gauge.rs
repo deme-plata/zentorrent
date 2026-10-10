@@ -17,7 +17,7 @@ pub struct Load {
 }
 
 /// `nvidia-smi` without a console window flashing up on Windows.
-fn nvidia() -> Option<Vec<u64>> {
+pub fn nvidia() -> Option<Vec<u64>> {
     let mut cmd = std::process::Command::new("nvidia-smi");
     cmd.args(["--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu", "--format=csv,noheader,nounits"]);
     #[cfg(windows)]

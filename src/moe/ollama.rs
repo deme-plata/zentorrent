@@ -150,6 +150,33 @@ pub async fn residency(model: &str) -> Option<(u64, u64)> {
     Some((m["size"].as_u64()?, m["size_vram"].as_u64().unwrap_or(0)))
 }
 
+/// Make the model run where the user wants it. Measured 2026-10-10 on Viktor's RTX 2060
+/// (Ollama 0.40): once a model was loaded with "CPU only" (num_gpu 0), Ollama keeps that
+/// copy for its keep-alive and every later request that does not mention num_gpu reuses it
+/// — 4 tok/s on the CPU instead of ~60 on the GPU, though "CPU only" was switched off.
+/// num_gpu -1 does not make it reload either. So: if this machine has a GPU, CPU only is
+/// off and the model sits wholly in system memory, unload it once; Ollama then places it
+/// again by itself (all of it on the GPU when it fits). Once per model per run, so a model
+/// that truly does not fit is not reloaded on every message. Returns true if it unloaded.
+pub async fn ensure_placement(model: &str, cpu_only: bool) -> bool {
+    static TRIED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    if cpu_only || TRIED.lock().unwrap().iter().any(|m| m == model) {
+        return false;
+    }
+    let Some((_, vram)) = residency(model).await else { return false }; // not loaded: Ollama places it fresh
+    let has_gpu = tokio::task::spawn_blocking(|| super::gauge::nvidia().is_some()).await.unwrap_or(false);
+    if vram > 0 || !has_gpu {
+        return false;
+    }
+    TRIED.lock().unwrap().push(model.to_string());
+    client(Duration::from_secs(30))
+        .post(format!("{BASE}/api/generate"))
+        .json(&json!({ "model": model, "keep_alive": 0 }))
+        .send()
+        .await
+        .is_ok_and(|r| r.status().is_success())
+}
+
 /// `<think>…</think>` some models still put in the text itself.
 pub fn strip_thinking(s: &str) -> String {
     // Reasoning that arrives without its opening tag (qwen3 with thinking "off",
@@ -250,6 +277,16 @@ pub struct AiManifest {
     pub ollama_version: String,
     /// Largest first: the first that fits this machine is pulled, smaller ones on failure.
     pub models: Vec<String>,
+    /// Bigger models (0.9.3+): tried first only on a GPU with their `min_vram_gb`, and
+    /// offered in the picker. Kept out of `models`, which older clients walk top-down.
+    #[serde(default)]
+    pub extra_models: Vec<String>,
+    /// Download size per model, GB (for the picker's fit check).
+    #[serde(default)]
+    pub sizes_gb: std::collections::BTreeMap<String, f64>,
+    /// Models only picked automatically on a GPU at least this big (GB of VRAM).
+    #[serde(default)]
+    pub min_vram_gb: std::collections::BTreeMap<String, u64>,
     #[serde(default)]
     pub installers: std::collections::BTreeMap<String, Installer>,
 }
@@ -268,7 +305,7 @@ pub fn parse_manifest(body: &[u8], sig: &str) -> Result<AiManifest, String> {
     Ok(m)
 }
 
-async fn manifest() -> Result<AiManifest, String> {
+pub async fn manifest() -> Result<AiManifest, String> {
     let c = reqwest::Client::builder().timeout(Duration::from_secs(30)).build().map_err(|e| e.to_string())?;
     let get = |name: String| {
         let c = c.clone();
@@ -482,8 +519,12 @@ async fn ensure_inner(preferred: Option<String>, say: &impl Fn(Setup)) -> Result
             Err(e) => return found.ok_or_else(|| format!("no model that can use tools is installed, and the signed AI manifest could not be read ({e})")),
         },
     };
+    let vram = vram_gb();
     let mut last = String::from("no models in the manifest");
-    for tag in &m.models {
+    for tag in m.extra_models.iter().chain(&m.models) {
+        if m.min_vram_gb.get(tag).is_some_and(|&need| vram < need) {
+            continue; // a big model for big GPUs only; the picker still offers it
+        }
         say(Setup::Line(format!("Getting the model {tag} (once)…")));
         match pull(tag, say).await {
             Ok(()) => return Ok(tag.clone()),
@@ -500,6 +541,78 @@ async fn ensure_inner(preferred: Option<String>, say: &impl Fn(Setup)) -> Result
         }
         None => Err(format!("could not get a model: {last}")),
     }
+}
+
+// ---------------------------------------------------------------- will it fit?
+
+/// Graphics memory of the (largest NVIDIA) GPU in GB; 0 = none found.
+pub fn vram_gb() -> u64 {
+    super::gauge::nvidia().map(|p| p[2] / 1024).unwrap_or(0)
+}
+
+/// Where Ollama keeps models: OLLAMA_MODELS, else ~/.ollama/models.
+pub fn models_dir() -> PathBuf {
+    std::env::var_os("OLLAMA_MODELS")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".ollama").join("models"))
+}
+
+/// Free space on the drive holding `path` (or its nearest existing parent), GB.
+pub fn free_disk_gb(path: &std::path::Path) -> Option<f64> {
+    let mut p = path.to_path_buf();
+    while !p.exists() {
+        p = p.parent()?.to_path_buf();
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let wide: Vec<u16> = p.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut free = 0u64;
+        // SAFETY: a NUL-terminated path and a valid out-pointer; the other two are optional.
+        let ok = unsafe {
+            windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, std::ptr::null_mut(), std::ptr::null_mut())
+        };
+        (ok != 0).then(|| free as f64 / 1e9)
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let c = std::ffi::CString::new(p.as_os_str().as_bytes()).ok()?;
+        let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
+        // SAFETY: a NUL-terminated path and a valid out-pointer.
+        (unsafe { libc::statvfs(c.as_ptr(), &mut s) } == 0).then(|| s.f_bavail as f64 * s.f_frsize as f64 / 1e9)
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        None
+    }
+}
+
+/// Whether a model of `size_gb` can be fetched and how well it would run here.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Fit {
+    /// Enough free disk to download it.
+    pub can_get: bool,
+    pub text: String,
+}
+
+pub fn fit(size_gb: f64, vram_gb: u64, free_gb: Option<f64>, drive: &str) -> Fit {
+    if let Some(free) = free_gb.filter(|&f| f < size_gb * 1.1 + 1.0) {
+        return Fit {
+            can_get: false,
+            text: format!("Needs about {:.0} GB of disk; {drive} has {free:.1} GB free — make room there first.", size_gb * 1.1 + 1.0),
+        };
+    }
+    let run = if vram_gb == 0 {
+        "No GPU found: it would run on the CPU — very slow for a model this size.".to_string()
+    } else if vram_gb as f64 >= size_gb * 1.15 {
+        format!("Fits your GPU ({vram_gb} GB) — fast.")
+    } else {
+        let pct = ((vram_gb as f64 / (size_gb * 1.15)) * 100.0).min(99.0) as u32;
+        format!("Your GPU has {vram_gb} GB: about {pct} % of it runs there, the rest on the CPU — slow.")
+    };
+    Fit { can_get: true, text: format!("{size_gb:.1} GB download. {run}") }
 }
 
 #[cfg(test)]
@@ -522,6 +635,17 @@ mod tests {
         assert_eq!(choose(&have, Some("gemma4:latest")).as_deref(), Some("gemma4:latest"));
         assert_eq!(choose(&have, Some("llava:7b")).as_deref(), Some("qwen3:4b-instruct"), "a pick that can't use tools is not used");
         assert_eq!(choose(&[m("llava:7b", 4, false)], None), None);
+    }
+
+    #[test]
+    fn the_fit_check_is_honest() {
+        // Viktor's laptop: RTX 2060 6 GB, 8.6 GB free on C:.
+        let f = fit(17.7, 6, Some(8.6), "C:");
+        assert!(!f.can_get && f.text.contains("make room"), "{}", f.text);
+        let f = fit(17.7, 6, Some(40.0), "C:");
+        assert!(f.can_get && f.text.contains("29 %") && f.text.contains("slow"), "{}", f.text);
+        assert!(fit(17.7, 24, Some(40.0), "C:").text.contains("fast"));
+        assert!(fit(2.5, 0, None, "C:").text.contains("CPU"));
     }
 
     #[test]

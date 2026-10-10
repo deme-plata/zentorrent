@@ -81,6 +81,39 @@ Press **Details** on any torrent:
 
 - **Sort** by best match, **most seeders**, **most active** (downloads per hour since first seen), newest, largest or name.
 
+### The Downloads list *(new in 0.10)*
+
+Three layouts, switched with the icons above the list and remembered:
+
+- **Cards**: every detail and button, as before.
+- **Compact**: one line per torrent with a status dot, bar, size and speeds. Double-click opens Details, right-click has the actions, drag a row onto a label.
+- **Thumbnails**: the film or show's poster (when ratings are on) or a colour tile, a progress ring, and a ▶ on hover.
+
+Sort by added, name, size, progress, speed, ratio or status, and filter to **Video / Music / Other** (by where the bytes are; scene RAR sets count as video). The sidebar's filters still apply.
+
+### Watch while it downloads *(0.8.3 – 0.8.5)*
+
+- **Built-in player** (libmpv, high-quality renderer): Play streams the pieces where the playhead is, so it starts before the download is done.
+- **Inside the archive**: multi-part RAR, ZIP and TAR sets play directly, no unpacking.
+- The video window closes with its close button, **Esc** or **Q** (Esc in fullscreen leaves fullscreen first).
+
+### ✨ Flux MoE — a media assistant on your own computer *(0.9)*
+
+A local model (installed and set up for you through Ollama, on your GPU when it fits) that knows your torrents, files and feed history: give an overview, **top picks** from thousands of feed items mixed across genres with a ⬇ per row, play things, build playlists, and tidy folders behind a preview you approve (with undo). Live progress shows tokens per second, VRAM and whether it runs on the GPU or the CPU.
+
+### Info tab
+
+A torrent's **.nfo** is shown the way it was drawn (code page 437, monospace), READMEs as rich text.
+
+### 🔌 MCP: let your own AI drive it *(new in 0.10)*
+
+ZenTorrent speaks the [Model Context Protocol](https://modelcontextprotocol.io): Claude Code or any MCP client can list your torrents, search the feeds (top picks too), add, pause, resume and play.
+
+- **In the app**: tick **MCP** in the Flux MoE tab. It listens on `127.0.0.1` only, with a token. Downloads and file moves a client asks for appear as cards **you** confirm.
+- **On a server**: `zentorrent serve` runs the engine, your feeds (with auto-download) and the MCP server without a window. Whoever starts it hands control to the client, so actions happen directly.
+- Connect Claude Code with the line `zentorrent mcp-config` prints, or use `zentorrent mcp` (a stdio bridge) for clients that start a command.
+- Feed links carry passkeys, so they never leave the app: results use ids.
+
 ### Everything else
 
 - **Seeding & ratio ledger.** Lifetime upload per torrent survives restarts (librqbit's own counter resets every run). Stop seeding at a ratio or after N hours.
@@ -96,14 +129,17 @@ Grab a build from **[GitHub Releases](https://github.com/deme-plata/zentorrent/r
 
 | Platform | GitHub Releases | Mirror |
 |---|---|---|
-| Windows x64 | [`zentorrent-0.7.1-windows-x64.exe`](https://github.com/deme-plata/zentorrent/releases/download/v0.7.1/zentorrent-0.7.1-windows-x64.exe) | [quillon.xyz](https://quillon.xyz/downloads/zentorrent-0.7.1-windows-x64.exe) |
-| Linux x64 | [`zentorrent-0.7.1-linux-x64`](https://github.com/deme-plata/zentorrent/releases/download/v0.7.1/zentorrent-0.7.1-linux-x64) | [quillon.xyz](https://quillon.xyz/downloads/zentorrent-0.7.1-linux-x64) |
+| Windows x64 | [`zentorrent-0.10.0-windows-x64.exe`](https://github.com/deme-plata/zentorrent/releases/download/v0.10.0/zentorrent-0.10.0-windows-x64.exe) | [quillon.xyz](https://quillon.xyz/downloads/zentorrent-0.10.0-windows-x64.exe) |
+| Linux x64 | [`zentorrent-0.10.0-linux-x64`](https://github.com/deme-plata/zentorrent/releases/download/v0.10.0/zentorrent-0.10.0-linux-x64) | [quillon.xyz](https://quillon.xyz/downloads/zentorrent-0.10.0-linux-x64) |
 
 Both are byte-identical to what the in-app updater installs. Their BLAKE3 hashes are in the Ed25519-signed [`zentorrent-latest.json`](https://quillon.xyz/downloads/zentorrent-latest.json).
 
 ```bash
-chmod +x zentorrent-0.7.1-linux-x64 && ./zentorrent-0.7.1-linux-x64
+chmod +x zentorrent-0.10.0-linux-x64 && ./zentorrent-0.10.0-linux-x64
 ```
+
+On Linux the built-in player uses the system's libmpv (`sudo apt install libmpv2`); on Windows
+ZenTorrent fetches and verifies its own copy on the first Play.
 
 ## 🛠 Build from source
 
@@ -127,6 +163,10 @@ BLAKE3 content id, so anyone can re-snapshot the tree and check it.
 | `zentorrent --fetch <torrent-url> [cookie]` | fetch one .torrent the way the app does |
 | `zentorrent --login <feed-url> <user> <pass>` | tracker log-in with proof |
 | `zentorrent --update` | check the signed channel, install if newer |
+| `zentorrent serve [folder] [--port N]` | the engine, the feeds and the MCP server, no window (Ctrl-C stops) |
+| `zentorrent mcp` | MCP over stdin/stdout, forwarded to the running ZenTorrent |
+| `zentorrent mcp-config` | the `claude mcp add …` line for this install |
+| `zentorrent --ask "<question>" [folder]` | one Flux MoE turn in the terminal (actions printed, not done) |
 
 ## 🧭 How it fits together
 
@@ -173,9 +213,11 @@ flowchart LR
 - [x] Details panel: speed graph, files, peers, per-torrent and global speed limits *(0.7)*
 - [x] RSS search (genre, seeders, activity) and a history that remembers every feed item *(0.7.1)*
 - [ ] Opt-in, anonymous usage statistics *(0.8)*
-- [ ] **Flux MoE assistant tab**: ask about your feeds and history, let it sort a music folder by genre
+- [x] **Flux MoE assistant tab**: overview, feed search and top picks, play, playlists, tidy folders *(0.9)*
 - [ ] **IronTunnel**: a built-in Rust VPN tunnel to bind torrent traffic to *(in progress)*
-- [ ] Built-in audio/video player
+- [x] Built-in audio/video player, streaming while downloading, inside RAR/ZIP/TAR *(0.8.3 – 0.8.5)*
+- [x] MCP server and headless `zentorrent serve` *(0.10)*
+- [x] Downloads list: compact and thumbnail layouts, sort and media filter *(0.10)*
 - [ ] Speed schedules · tray icon · macOS build
 
 ## License
