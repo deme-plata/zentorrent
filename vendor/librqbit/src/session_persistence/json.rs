@@ -104,6 +104,11 @@ impl JsonSessionPersistenceStore {
         tmp.write_all(&buf)
             .await
             .with_context(|| format!("error writing {tmp_filename:?}"))?;
+        // ZenTorrent patch: tokio queues the write; make it reach the disk BEFORE the rename,
+        // or an exit right after leaves session.json empty (the engine then refuses to start).
+        tmp.flush().await.with_context(|| format!("error flushing {tmp_filename:?}"))?;
+        tmp.sync_all().await.with_context(|| format!("error syncing {tmp_filename:?}"))?;
+        drop(tmp);
         trace!(?tmp_filename, "wrote to temp file");
 
         tokio::fs::rename(&tmp_filename, &self.db_filename)
@@ -167,7 +172,8 @@ impl JsonSessionPersistenceStore {
                 .await
             {
                 Ok(mut f) => {
-                    if let Err(e) = f.write_all(&torrent_bytes).await {
+                    // ZenTorrent patch: flush, so the .torrent is complete even if we exit next.
+                    if let Err(e) = async { f.write_all(&torrent_bytes).await?; f.flush().await?; f.sync_all().await }.await {
                         warn!(error=?e, file=?torrent_bytes_file, "error writing torrent bytes")
                     }
                 }
@@ -228,6 +234,10 @@ impl BitVFactory for JsonSessionPersistenceStore {
         tokio::io::copy(&mut b.as_raw_slice(), &mut dst)
             .await
             .context("error writing bitslice to {filename:?}")?;
+        // ZenTorrent patch: on disk before the rename (see flush()).
+        dst.flush().await.context("error flushing bitslice")?;
+        dst.sync_all().await.context("error syncing bitslice")?;
+        drop(dst);
         tokio::fs::rename(&tmp_filename, &filename)
             .await
             .with_context(|| format!("error renaming {tmp_filename:?} to {filename:?}"))?;

@@ -20,3 +20,10 @@ Second (VPN, `src/vpn.rs`), in `librqbit/src/session.rs` where the HTTP client g
 IronTunnel relay) instead of locally. Measured before the patch: one DNS query per tracker name
 from the ZenTorrent process to the local resolver while every byte of traffic was tunnelled.
 Only runs when a proxy is configured, i.e. only with the VPN on.
+
+Third (2026-10-10), in `librqbit/src/session_persistence/json.rs`: every file the session store
+writes (`session.json` via its `.tmp`, the `.bitv` progress files, the stored `.torrent` copies) is
+flushed and `sync_all`ed before it is renamed into place or dropped. Upstream calls `write_all` on a
+tokio `File` and renames straight after; tokio only *queues* that write, so an exit right after a
+save (closing ZenTorrent) left `session.json` EMPTY — and the engine then refuses to start
+("error deserializing session database: EOF while parsing"). Search "ZenTorrent patch".

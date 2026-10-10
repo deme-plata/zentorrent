@@ -28,6 +28,7 @@ mod history;
 mod meta;
 mod moe;
 mod player;
+mod repair;
 mod rss;
 mod search;
 mod seed;
@@ -121,6 +122,22 @@ fn main() -> eframe::Result<()> {
             eprintln!("error: {e}");
             std::process::exit(1);
         }
+        return Ok(());
+    }
+
+    // `zentorrent --repair-session <session folder> [save folder]`: show how a damaged
+    // torrent list would be rebuilt (writes nothing; the app repairs by itself at start).
+    if args.get(1).map(String::as_str) == Some("--repair-session") {
+        let Some(dir) = args.get(2).map(PathBuf::from) else {
+            eprintln!("usage: zentorrent --repair-session <session folder> [save folder]");
+            std::process::exit(2);
+        };
+        let saves = vec![args.get(3).map(PathBuf::from).unwrap_or(default_dir)];
+        let plan = repair::plan(&dir, &saves);
+        for t in &plan {
+            println!("{}  {}  →  {}", if t.found { "found  " } else { "MISSING" }, t.name, t.folder.display());
+        }
+        println!("{} torrents, {} found on disk", plan.len(), plan.iter().filter(|t| t.found).count());
         return Ok(());
     }
 
@@ -409,6 +426,12 @@ impl App {
     fn new(cc: &eframe::CreationContext<'_>, rt: tokio::runtime::Runtime, folder: PathBuf) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
 
+        // A torrent list damaged by an older version (empty session.json) is rebuilt
+        // from the saved .torrent files instead of stopping the engine.
+        let saves: Vec<PathBuf> = std::iter::once(folder.clone()).chain(dirs::download_dir()).collect();
+        let repaired: Vec<String> =
+            ["session", "session-vpn"].iter().filter_map(|s| repair::session(&seed::data_dir().join(s), &saves)).collect();
+
         // The VPN comes first: when it is on, the engine may start only once the
         // tunnel is up (kill switch), and with every non-tunnel path switched off.
         let vpn_settings = vpn::VpnSettings::load();
@@ -487,7 +510,7 @@ impl App {
             transfers,
             folder,
             link: String::new(),
-            errors: Vec::new(),
+            errors: repaired,
             view: View::Downloads,
             store: rss::FeedStore::load(),
             fv: FeedView::default(),
