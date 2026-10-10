@@ -1,6 +1,6 @@
 [package]
 name = "zentorrent"
-version = "0.9.1"
+version = "0.9.2"
 edition = "2021"
 description = "ZenTorrent: a fast, ad-free desktop BitTorrent client (egui + librqbit) with a faceted sidebar, RSS/Torznab feeds, ratio ledger and signed updates."
 license = "MIT OR Apache-2.0"
