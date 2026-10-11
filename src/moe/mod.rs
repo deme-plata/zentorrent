@@ -922,9 +922,8 @@ pub async fn ask(question: &str, lib: Library, cpu_only: bool) -> Result<(), Str
     use std::io::Write;
     let settings: Settings = std::fs::read(settings_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
     let cpu_only = cpu_only || settings.cpu_only;
-    if !ollama::reachable().await {
-        return Err("Ollama is not running on this computer (open the Flux MoE tab once to set it up)".into());
-    }
+    // Installed but stopped (closed from the tray, or quit by itself): start it again.
+    ollama::wake().await?;
     let model = ollama::choose(&ollama::models().await?, settings.model.as_deref()).ok_or("no model that can use tools is installed")?;
     println!("Flux MoE · {model}{} · {}", if cpu_only { " (CPU only)" } else { "" }, lib.folder.display());
     let started = std::time::Instant::now();

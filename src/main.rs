@@ -24,6 +24,7 @@ type ManagedTorrentHandle = Arc<ManagedTorrent>;
 const FEED_RETRY: Duration = Duration::from_secs(60);
 
 mod details;
+mod diskguard;
 mod engine;
 mod history;
 mod info;
@@ -488,6 +489,11 @@ struct App {
     mcp_lib: Arc<Mutex<moe::skills::Library>>,
     mcp_asks: Arc<Mutex<Vec<mcp::Ask>>>,
     mcp_lib_at: Instant,
+    /// Disk guard (see diskguard.rs): when it last looked, the free space it saw, and the
+    /// downloads it paused (info-hashes) so it resumes exactly those.
+    disk_at: Instant,
+    disk_free: Option<f64>,
+    space_paused: Vec<String>,
     /// The Downloads list's layout, order and media filter.
     list: listview::ListView,
     /// What each torrent holds (video / music / other), by info-hash, once its file list is known.
@@ -556,6 +562,9 @@ impl App {
             mcp_lib: Default::default(),
             mcp_asks: Default::default(),
             mcp_lib_at: Instant::now(),
+            disk_at: Instant::now() - Duration::from_secs(60),
+            disk_free: None,
+            space_paused: Vec::new(),
             list: listview::ListView::load(),
             media: HashMap::new(),
         };
@@ -773,6 +782,38 @@ impl App {
         self.rt.spawn(async move {
             let _ = if pause { sess.pause(&h).await } else { sess.unpause(&h).await };
         });
+    }
+
+    /// Every 10 s: the disk guard (diskguard.rs). Pauses running downloads when the drive
+    /// they go to is nearly full, resumes exactly those when there is room again.
+    fn guard_disk(&mut self) {
+        if self.disk_at.elapsed() < Duration::from_secs(10) {
+            return;
+        }
+        self.disk_at = Instant::now();
+        self.disk_free = moe::ollama::free_disk_gb(&self.folder);
+        match diskguard::step(self.disk_free, !self.space_paused.is_empty()) {
+            diskguard::Step::Pause => {
+                let running: Vec<String> = self
+                    .transfers
+                    .iter()
+                    .filter(|t| !t.handle.is_paused() && !t.handle.stats().finished)
+                    .map(|t| t.handle.info_hash().as_string())
+                    .collect();
+                for h in running {
+                    self.set_paused(&h, true);
+                    if !self.space_paused.contains(&h) {
+                        self.space_paused.push(h);
+                    }
+                }
+            }
+            diskguard::Step::Resume => {
+                for h in std::mem::take(&mut self.space_paused) {
+                    self.set_paused(&h, false);
+                }
+            }
+            diskguard::Step::Nothing => {}
+        }
     }
 
     /// Once a second: fold upload counters into the ledger, count seed
@@ -1986,6 +2027,7 @@ impl eframe::App for App {
         self.player_ui(root, ctx);
 
         self.tick_ledger();
+        self.guard_disk();
         // Drawn before the central panels; as a modal it sits above all of them.
         self.details_ui(ctx);
         if self.view == View::Seeding {
@@ -2012,6 +2054,17 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(root, |ui| {
             if let Some(err) = &self.session_error {
                 ui.colored_label(egui::Color32::LIGHT_RED, err);
+            }
+            if !self.space_paused.is_empty() {
+                let free = self.disk_free.map(|f| format!("{f:.1} GB")).unwrap_or_else(|| "almost nothing".into());
+                ui.colored_label(
+                    egui::Color32::from_rgb(240, 170, 60),
+                    format!(
+                        "⚠ The drive your downloads go to is nearly full ({free} free). ZenTorrent paused {} download(s) so Windows and your other programs keep working; they continue by themselves once {} GB are free. Free some space, or choose another Save to folder.",
+                        self.space_paused.len(),
+                        diskguard::OK_GB
+                    ),
+                );
             }
             if busy > 0 {
                 ui.horizontal(|ui| {

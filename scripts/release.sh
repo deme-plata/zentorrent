@@ -57,6 +57,11 @@ m,s=sys.argv[1:]; open(m+".sig","w").write(Ed25519PrivateKey.from_private_bytes(
 PY
 cp "$TMP/m.json" "$DL/zentorrent-latest.json.new"; cp "$TMP/m.json.sig" "$DL/zentorrent-latest.json.sig.new"
 mv "$DL/zentorrent-latest.json.new" "$DL/zentorrent-latest.json"; mv "$DL/zentorrent-latest.json.sig.new" "$DL/zentorrent-latest.json.sig"
+# Always-newest links: a shared link or an old README never hands out an old build
+# (2026-10-10: 21 people got 0.7.1 from a link that pinned it). Swapped atomically.
+for pair in "zentorrent-windows-x64.exe:$W" "zentorrent-linux-x64:$L"; do
+  ln -sfn "${pair#*:}" "$DL/${pair%%:*}.new" && mv -T "$DL/${pair%%:*}.new" "$DL/${pair%%:*}"
+done
 
 echo "▸ verifying the LIVE channel"
 curl -fsS "$BASE/zentorrent-latest.json" -o "$TMP/live.json"; curl -fsS "$BASE/zentorrent-latest.json.sig" -o "$TMP/live.sig"
@@ -67,6 +72,10 @@ b=open(sys.argv[1],"rb").read(); Ed25519PublicKey.from_public_bytes(bytes.fromhe
 assert json.loads(b)["version"]==sys.argv[4]; print("✓ live manifest signature verifies, version", sys.argv[4])
 PY
 for f in "$L" "$W"; do curl -fsS -o /dev/null -w "✓ HTTP %{http_code} %{size_download}B $f\n" "$BASE/$f"; done
+for pair in "zentorrent-windows-x64.exe:$W" "zentorrent-linux-x64:$L"; do
+  got=$(curl -fsS "$BASE/${pair%%:*}" | b3sum --no-names); want=$(b3sum --no-names "$DL/${pair#*:}")
+  [ "$got" = "$want" ] && echo "✓ ${pair%%:*} serves $VER" || { echo "✗ ${pair%%:*} does not serve $VER" >&2; exit 1; }
+done
 
 git add Cargo.toml Cargo.lock
 git -c commit.gpgsign=false commit -qm "release v$VER: $NOTE" || true

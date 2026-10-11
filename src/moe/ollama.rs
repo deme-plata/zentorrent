@@ -154,27 +154,55 @@ pub async fn residency(model: &str) -> Option<(u64, u64)> {
 /// (Ollama 0.40): once a model was loaded with "CPU only" (num_gpu 0), Ollama keeps that
 /// copy for its keep-alive and every later request that does not mention num_gpu reuses it
 /// — 4 tok/s on the CPU instead of ~60 on the GPU, though "CPU only" was switched off.
-/// num_gpu -1 does not make it reload either. So: if this machine has a GPU, CPU only is
-/// off and the model sits wholly in system memory, unload it once; Ollama then places it
-/// again by itself (all of it on the GPU when it fits). Once per model per run, so a model
-/// that truly does not fit is not reloaded on every message. Returns true if it unloaded.
+/// num_gpu -1 does not make it reload either.
+///
+/// And a fresh load lands on the CPU whenever the graphics card is busy at that moment
+/// (a browser, another model): measured the same day, a "hi" took 101 s at 3.7 tok/s on
+/// the CPU; the same model on the then-free card: 54.6 tok/s, loaded in 8.5 s.
+///
+/// So: before each message, if CPU only is off and the model sits (partly) in system
+/// memory while the card has room for all of it now, unload it; Ollama then places it
+/// again by itself. At most every 10 minutes per model, so a model Ollama will not put on
+/// the card is not reloaded on every message. Returns true if it unloaded.
 pub async fn ensure_placement(model: &str, cpu_only: bool) -> bool {
-    static TRIED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-    if cpu_only || TRIED.lock().unwrap().iter().any(|m| m == model) {
+    static LAST: std::sync::Mutex<Vec<(String, std::time::Instant)>> = std::sync::Mutex::new(Vec::new());
+    if cpu_only {
         return false;
     }
-    let Some((_, vram)) = residency(model).await else { return false }; // not loaded: Ollama places it fresh
-    let has_gpu = tokio::task::spawn_blocking(|| super::gauge::nvidia().is_some()).await.unwrap_or(false);
-    if vram > 0 || !has_gpu {
+    let recent = LAST.lock().unwrap().iter().any(|(m, t)| m == model && t.elapsed() < Duration::from_secs(600));
+    if recent {
         return false;
     }
-    TRIED.lock().unwrap().push(model.to_string());
+    let Some((total, vram)) = residency(model).await else { return false }; // not loaded: Ollama places it fresh
+    let gpu = tokio::task::spawn_blocking(super::gauge::nvidia).await.ok().flatten().map(|g| (g[1], g[2]));
+    if !should_move(total, vram, gpu) {
+        return false;
+    }
+    {
+        let mut last = LAST.lock().unwrap();
+        last.retain(|(m, _)| m != model);
+        last.push((model.to_string(), std::time::Instant::now()));
+    }
     client(Duration::from_secs(30))
         .post(format!("{BASE}/api/generate"))
         .json(&json!({ "model": model, "keep_alive": 0 }))
         .send()
         .await
         .is_ok_and(|r| r.status().is_success())
+}
+
+/// Move the model to the card? `total`/`vram`: its size and the part already on the card
+/// (bytes); `gpu`: graphics memory (used, total) in MiB, None without an NVIDIA card. Yes
+/// when more than 2 % of it is in system memory and the card has room for that part now,
+/// plus 512 MiB to spare (the desktop and the browser need some too).
+pub fn should_move(total: u64, vram: u64, gpu: Option<(u64, u64)>) -> bool {
+    let Some((used_mb, total_mb)) = gpu else { return false };
+    let off_card = total.saturating_sub(vram);
+    if total == 0 || off_card <= total / 50 {
+        return false;
+    }
+    let free_mb = total_mb.saturating_sub(used_mb);
+    off_card / (1 << 20) + 512 <= free_mb
 }
 
 /// `<think>…</think>` some models still put in the text itself.
@@ -214,7 +242,16 @@ pub async fn chat(base: &str, model: &str, messages: &[Value], tools: &Value, cp
     let send = |body: &Value| {
         client(Duration::from_secs(600)).post(format!("{base}/api/chat")).json(body).send()
     };
-    let mut r = send(&body).await.map_err(|e| format!("the local model did not answer: {e}"))?;
+    let mut r = match send(&body).await {
+        Ok(r) => r,
+        // Nobody listening: Ollama was closed or quit (seen 2026-10-10 on Viktor's PC: its
+        // tray app was gone, no crash logged). Start it again and ask once more.
+        Err(e) if e.is_connect() && base == BASE => {
+            wake().await.map_err(|w| format!("the local model did not answer ({e}), and starting Ollama again failed: {w}"))?;
+            send(&body).await.map_err(|e| format!("the local model did not answer: {e}"))?
+        }
+        Err(e) => return Err(format!("the local model did not answer: {e}")),
+    };
     if !r.status().is_success() {
         let e = fail(r).await;
         if !e.to_lowercase().contains("think") {
@@ -350,6 +387,12 @@ pub fn find_binary() -> Option<PathBuf> {
 }
 
 fn start(bin: &PathBuf) -> Result<(), String> {
+    // Ollama's own Windows install: start its tray app, which runs the server as the
+    // user knows it (icon, settings, its updater) — not a second, hidden server.
+    let tray = bin.with_file_name("ollama app.exe");
+    if cfg!(windows) && tray.is_file() {
+        return std::process::Command::new(&tray).spawn().map(|_| ()).map_err(|e| format!("could not start Ollama ({}): {e}", tray.display()));
+    }
     std::fs::create_dir_all(own_dir()).map_err(|e| e.to_string())?;
     let log = std::fs::File::create(own_dir().join("serve.log")).map_err(|e| e.to_string())?;
     let mut cmd = std::process::Command::new(bin);
@@ -370,6 +413,20 @@ async fn wait_until_up(secs: u64) -> bool {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     false
+}
+
+/// Ollama running again if it stopped (installed, but nothing answers on its port).
+pub async fn wake() -> Result<(), String> {
+    if reachable().await {
+        return Ok(());
+    }
+    let bin = find_binary().ok_or("Ollama is not installed any more — open the Flux MoE tab to set it up again")?;
+    start(&bin)?;
+    if wait_until_up(30).await {
+        Ok(())
+    } else {
+        Err(format!("Ollama did not start; its log is {}", own_dir().join("serve.log").display()))
+    }
 }
 
 /// Download `inst` to `dest`, hashing as it streams; refuse any size or SHA-256 mismatch.
@@ -618,6 +675,21 @@ pub fn fit(size_gb: f64, vram_gb: u64, free_gb: Option<f64>, drive: &str) -> Fit
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_model_goes_to_the_card_when_there_is_room() {
+        let gb = |g: f64| (g * (1u64 << 30) as f64) as u64;
+        let model = gb(3.61);
+        // Viktor's RTX 2060 after the browser: 242 MiB of 6144 used. On the CPU → move.
+        assert!(should_move(model, 0, Some((242, 6144))));
+        // The card busy (another model, 4.9 GB used): leave it, no reload for nothing.
+        assert!(!should_move(model, 0, Some((5000, 6144))));
+        // Already on the card, or no NVIDIA card at all: nothing to do.
+        assert!(!should_move(model, model, Some((4036, 6144))));
+        assert!(!should_move(model, 0, None));
+        // Partly on the card (60 %): the rest fits now → move it all.
+        assert!(should_move(model, model * 6 / 10, Some((2400, 6144))));
+    }
 
     #[test]
     fn thinking_is_not_shown() {

@@ -127,15 +127,16 @@ ZenTorrent speaks the [Model Context Protocol](https://modelcontextprotocol.io):
 
 Grab a build from **[GitHub Releases](https://github.com/deme-plata/zentorrent/releases/latest)**. After that, the **Update** button in the top-right corner keeps you current:
 
-| Platform | GitHub Releases | Mirror |
+| Platform | Always the newest | GitHub |
 |---|---|---|
-| Windows x64 | [`zentorrent-0.10.0-windows-x64.exe`](https://github.com/deme-plata/zentorrent/releases/download/v0.10.0/zentorrent-0.10.0-windows-x64.exe) | [quillon.xyz](https://quillon.xyz/downloads/zentorrent-0.10.0-windows-x64.exe) |
-| Linux x64 | [`zentorrent-0.10.0-linux-x64`](https://github.com/deme-plata/zentorrent/releases/download/v0.10.0/zentorrent-0.10.0-linux-x64) | [quillon.xyz](https://quillon.xyz/downloads/zentorrent-0.10.0-linux-x64) |
+| Windows x64 | [**zentorrent-windows-x64.exe**](https://quillon.xyz/downloads/zentorrent-windows-x64.exe) | [latest release page](https://github.com/deme-plata/zentorrent/releases/latest) |
+| Linux x64 | [**zentorrent-linux-x64**](https://quillon.xyz/downloads/zentorrent-linux-x64) | [latest release page](https://github.com/deme-plata/zentorrent/releases/latest) |
 
 Both are byte-identical to what the in-app updater installs. Their BLAKE3 hashes are in the Ed25519-signed [`zentorrent-latest.json`](https://quillon.xyz/downloads/zentorrent-latest.json).
 
 ```bash
-chmod +x zentorrent-0.10.0-linux-x64 && ./zentorrent-0.10.0-linux-x64
+wget https://quillon.xyz/downloads/zentorrent-linux-x64
+chmod +x zentorrent-linux-x64 && ./zentorrent-linux-x64
 ```
 
 On Linux the built-in player uses the system's libmpv (`sudo apt install libmpv2`); on Windows
