@@ -850,6 +850,8 @@ impl TorrentStateLive {
         let pieces = locked.get_pieces_mut()?;
 
         // if we have all the pieces of the file, reopen it read only
+        // (ZenTorrent patch: upstream had the comment but not the reopen)
+        let mut complete = Vec::new();
         for (idx, file_info) in self
             .metadata
             .file_infos
@@ -858,7 +860,14 @@ impl TorrentStateLive {
             .skip_while(|(_, fi)| !fi.piece_range.contains(&id.get()))
             .take_while(|(_, fi)| fi.piece_range.contains(&id.get()))
         {
-            let _remaining = pieces.update_file_have_on_piece_completed(id, idx, file_info);
+            if pieces.update_file_have_on_piece_completed(id, idx, file_info) == 0 {
+                complete.push(idx);
+            }
+        }
+        for idx in complete {
+            if let Err(e) = self.files.on_file_completed(idx) {
+                debug!(?id, idx, "could not reopen a complete file read-only: {e:#}");
+            }
         }
 
         self.streams

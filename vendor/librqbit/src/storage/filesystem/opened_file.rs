@@ -111,6 +111,8 @@ struct OpenedFileLocked {
     #[allow(unused)]
     path: PathBuf,
     fd: Option<File>,
+    /// ZenTorrent patch: `fd` was opened with write access (see `ensure_writable`).
+    writable: bool,
     #[cfg(windows)]
     tried_marking_sparse: bool,
 }
@@ -140,10 +142,56 @@ impl OpenedFile {
             file: RwLock::new(OpenedFileLocked {
                 path,
                 fd: Some(f),
+                writable: false,
                 #[cfg(windows)]
                 tried_marking_sparse: false,
             }),
         }
+    }
+
+    // ZenTorrent patch: files are opened read-only, get write access only when data is
+    // written to them, and lose it again once they are complete. A handle with write
+    // access blocks programs that open files sharing reads only: WinRAR could not
+    // extract a finished, seeding RAR set ("the process cannot access the file because
+    // it is being used by another process").
+
+    /// Reopen the file with write access, if it does not have it yet.
+    pub fn ensure_writable(&self) -> anyhow::Result<()> {
+        {
+            let g = self.file.read();
+            if g.writable || g.fd.is_none() {
+                return Ok(());
+            }
+        }
+        let mut g = self.file.write();
+        if !g.writable && g.fd.is_some() {
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&g.path)
+                .with_context(|| format!("error opening {:?} in read/write mode", g.path))?;
+            g.fd = Some(f);
+            g.writable = true;
+            #[cfg(windows)]
+            {
+                g.tried_marking_sparse = false;
+            }
+        }
+        Ok(())
+    }
+
+    /// Give up write access: the file is complete.
+    pub fn make_read_only(&self) -> anyhow::Result<()> {
+        let mut g = self.file.write();
+        if g.writable && g.fd.is_some() {
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .open(&g.path)
+                .with_context(|| format!("error reopening {:?} read-only", g.path))?;
+            g.fd = Some(f);
+            g.writable = false;
+        }
+        Ok(())
     }
 
     pub fn new_dummy() -> Self {

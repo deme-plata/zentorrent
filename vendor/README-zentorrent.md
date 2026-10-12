@@ -27,3 +27,14 @@ flushed and `sync_all`ed before it is renamed into place or dropped. Upstream ca
 tokio `File` and renames straight after; tokio only *queues* that write, so an exit right after a
 save (closing ZenTorrent) left `session.json` EMPTY — and the engine then refuses to start
 ("error deserializing session database: EOF while parsing"). Search "ZenTorrent patch".
+
+Fourth (2026-10-12), in `librqbit/src/storage/` and `torrent_state/live/mod.rs`: files are opened
+**read-only**, get write access only when data is written to them (`OpenedFile::ensure_writable`),
+and lose it again once every piece of the file has completed (`TorrentStorage::on_file_completed`,
+called from `on_piece_completed`; upstream had the comment "reopen it read only" but no reopen).
+`ensure_file_length` leaves a file that already has its length alone. Why: upstream kept every
+file open read+write while seeding, and on Windows a handle with write access blocks programs
+that open files sharing reads only. WinRAR could not extract finished RAR sets ("the process
+cannot access the file because it is being used by another process", Viktor 2026-10-12, three
+torrents). Measured on Linux via /proc/<pid>/fdinfo: 0.8.4 seeding = O_RDWR on every file; patched
+= O_RDONLY on every file, including one downloaded during the run. Search "ZenTorrent patch".
