@@ -98,6 +98,9 @@ pub enum Vpn {
     Failed(String),
 }
 
+/// How often the start-up test of the tunnel is tried before the kill switch holds.
+const START_TRIES: u64 = 3;
+
 impl Vpn {
     /// Bring the tunnel up before the engine starts. Blocks for at most the probe
     /// timeout (~10 s) when the relay does not answer.
@@ -117,9 +120,21 @@ impl Vpn {
             Err(e) => return Vpn::Failed(e),
         };
         let cfg = ProxyConfig::new(s.relay.trim(), key, relay_key);
-        let rtt = match probe(&cfg).await {
-            Ok(rtt) => rtt,
-            Err(e) => return Vpn::Failed(format!("relay {}: {e}", s.relay.trim())),
+        // One failed try is not a relay that is down: a PC waking up or joining Wi-Fi,
+        // or a busy relay, drops a first connection now and then (Viktor, 2026-10-12:
+        // "os error 10054" at start-up, relay fine a minute later). Fast failures are
+        // tried again; a timeout has already waited long enough.
+        let t0 = std::time::Instant::now();
+        let mut tries = 0u64;
+        let rtt = loop {
+            tries += 1;
+            match probe(&cfg).await {
+                Ok(rtt) => break rtt,
+                Err(_) if tries < START_TRIES && t0.elapsed() < Duration::from_secs(8) => {
+                    tokio::time::sleep(Duration::from_secs(tries)).await
+                }
+                Err(e) => return Vpn::Failed(format!("relay {}: {e}", s.relay.trim())),
+            }
         };
         match start_proxy(cfg).await {
             Ok(proxy) => Vpn::Up { proxy, relay: s.relay.trim().to_string(), rtt },

@@ -428,6 +428,9 @@ struct FeedView {
     last_pick: Option<String>,
 }
 
+/// How often a tunnel that is down is tried again (kill switch on).
+const VPN_RETRY: Duration = Duration::from_secs(30);
+
 struct App {
     rt: tokio::runtime::Runtime,
     session: Option<Arc<Session>>,
@@ -494,6 +497,11 @@ struct App {
     disk_at: Instant,
     disk_free: Option<f64>,
     space_paused: Vec<String>,
+    /// Kill switch on: the next try of the tunnel, and the one running.
+    vpn_retry_at: Instant,
+    vpn_retry: Option<tokio::task::JoinHandle<vpn::Vpn>>,
+    /// Downloads asked for while the kill switch held; started once the engine is up.
+    waiting: Vec<(String, Source)>,
     /// The Downloads list's layout, order and media filter.
     list: listview::ListView,
     /// What each torrent holds (video / music / other), by info-hash, once its file list is known.
@@ -565,6 +573,9 @@ impl App {
             disk_at: Instant::now() - Duration::from_secs(60),
             disk_free: None,
             space_paused: Vec::new(),
+            vpn_retry_at: Instant::now() + VPN_RETRY,
+            vpn_retry: None,
+            waiting: Vec::new(),
             list: listview::ListView::load(),
             media: HashMap::new(),
         };
@@ -1264,12 +1275,62 @@ impl App {
         }
     }
 
+    /// Kill switch on: try the tunnel again every `VPN_RETRY`, and the moment it is
+    /// up start the engine, the saved torrents and the downloads that waited.
+    fn retry_vpn(&mut self, ctx: &egui::Context) {
+        if self.session.is_some() || !matches!(self.vpn, vpn::Vpn::Failed(_)) {
+            return;
+        }
+        if let Some(h) = &self.vpn_retry {
+            if !h.is_finished() {
+                return;
+            }
+            let h = self.vpn_retry.take().unwrap();
+            self.vpn_retry_at = Instant::now() + VPN_RETRY;
+            let Ok(v) = self.rt.block_on(h) else { return };
+            if !v.is_up() {
+                self.vpn = v;
+                return;
+            }
+            let (session, error) = engine::start(&self.rt, &self.folder, &v);
+            self.http = v.http();
+            self.vpn = v;
+            self.session = session;
+            self.session_error = error;
+            let Some(s) = self.session.clone() else { return };
+            self.transfers = engine::restore(&s, &self.ledger, &self.folder);
+            self.apply_global_limits();
+            self.errors.retain(|e| !e.contains("waiting for the VPN tunnel"));
+            for (label, source) in std::mem::take(&mut self.waiting) {
+                self.start(ctx, label, source);
+            }
+            return;
+        }
+        if Instant::now() >= self.vpn_retry_at {
+            let s = self.vpn_running.clone();
+            let ctx = ctx.clone();
+            self.vpn_retry = Some(self.rt.spawn(async move {
+                let v = match vpn::client_key() {
+                    Ok(key) => vpn::Vpn::start_with(&s, key).await,
+                    Err(e) => vpn::Vpn::Failed(format!("tunnel key: {e:#}")),
+                };
+                ctx.request_repaint();
+                v
+            }));
+        }
+    }
+
     /// Start a torrent in the background. `source` is a magnet link, an
     /// http(s) URL to a .torrent file, or the raw bytes of a .torrent file.
     fn start(&mut self, ctx: &egui::Context, label: String, source: Source) {
         // Never a silent no-op: if the engine did not start, every Download
         // button would otherwise do nothing at all.
         let Some(session) = self.session.clone() else {
+            if matches!(self.vpn, vpn::Vpn::Failed(_)) {
+                self.errors.push(format!("{label}: waiting for the VPN tunnel; it starts by itself once the tunnel is up."));
+                self.waiting.push((label, source));
+                return;
+            }
             let why = self.session_error.clone().unwrap_or_else(|| "the torrent engine is not running".into());
             self.errors.push(format!("{label}: can't start — {why}"));
             return;
@@ -2028,6 +2089,7 @@ impl eframe::App for App {
 
         self.tick_ledger();
         self.guard_disk();
+        self.retry_vpn(ctx);
         // Drawn before the central panels; as a modal it sits above all of them.
         self.details_ui(ctx);
         if self.view == View::Seeding {

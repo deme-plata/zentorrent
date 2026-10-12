@@ -30,6 +30,12 @@ pub fn open(rt: &tokio::runtime::Runtime, folder: &Path) -> Opened {
     // The VPN comes first: when it is on, the engine may start only once the
     // tunnel is up (kill switch), and with every non-tunnel path switched off.
     let vpn = vpn::Vpn::start(rt, &vpn::VpnSettings::load());
+    let (session, error) = start(rt, folder, &vpn);
+    Opened { session, error, vpn, notes }
+}
+
+/// The engine for this VPN state: none while the kill switch holds (with why).
+pub fn start(rt: &tokio::runtime::Runtime, folder: &Path, vpn: &vpn::Vpn) -> (Option<Arc<Session>>, Option<String>) {
     let engine_opts = |listen: Option<librqbit::ListenerOptions>| SessionOptions {
         // Persistence: librqbit remembers every torrent (and where it got
         // to) in the data dir, so a restart resumes downloads and seeding.
@@ -38,12 +44,12 @@ pub fn open(rt: &tokio::runtime::Runtime, folder: &Path) -> Opened {
         listen,
         ..Default::default()
     };
-    let (session, error) = match vpn::session_options(engine_opts(None), &vpn) {
+    match vpn::session_options(engine_opts(None), vpn) {
         None => (
             None,
             Some(format!(
                 "VPN is on but the tunnel is down, so the torrent engine is stopped (kill switch): {}. \
-                 Fix the relay or turn the VPN off.",
+                 ZenTorrent tries again every 30 s and starts by itself once the tunnel is up; or turn the VPN off.",
                 vpn.failure().unwrap_or("?")
             )),
         ),
@@ -70,8 +76,7 @@ pub fn open(rt: &tokio::runtime::Runtime, folder: &Path) -> Opened {
                 None => (None, last.map(|e| format!("could not start the torrent engine: {e:#}"))),
             }
         }
-    };
-    Opened { session, error, vpn, notes }
+    }
 }
 
 /// The torrents the session remembered from the previous run.
