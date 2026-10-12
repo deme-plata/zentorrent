@@ -23,6 +23,7 @@ type ManagedTorrentHandle = Arc<ManagedTorrent>;
 /// How soon a feed that failed to load is tried again.
 const FEED_RETRY: Duration = Duration::from_secs(60);
 
+mod cover;
 mod details;
 mod diskguard;
 mod engine;
@@ -373,6 +374,8 @@ struct Inbox {
     meta: Vec<(String, Result<Option<meta::Info>, String>)>,
     /// (imdb id, poster bytes or error)
     posters: Vec<(String, Result<Vec<u8>, String>)>,
+    /// Pictures read from inside torrents, by info-hash (`None`: not a picture after all).
+    covers: Vec<(String, Option<egui::ColorImage>)>,
     busy: usize,
     /// Result of the VPN window's "Test relay" (handshake + ping, ms).
     vpn_test: Option<Result<u128, String>>,
@@ -453,6 +456,8 @@ struct App {
     meta_error: Option<String>,
     meta_error_at: Option<Instant>,
     textures: HashMap<String, Option<egui::TextureHandle>>,
+    /// The picture that came inside each torrent, by info-hash.
+    covers: HashMap<String, cover::State>,
     last_tick: Instant,
     last_ledger_save: Instant,
     sidebar: sidebar::Sidebar,
@@ -544,6 +549,7 @@ impl App {
             meta_error: None,
             meta_error_at: None,
             textures: HashMap::new(),
+            covers: HashMap::new(),
             last_tick: Instant::now(),
             last_ledger_save: Instant::now(),
             sidebar: Default::default(),
@@ -1732,6 +1738,13 @@ impl App {
             let tex = res.ok().and_then(|b| poster_texture(ctx, &id, &b));
             self.textures.insert(id, tex);
         }
+        for (hash, img) in ib.covers.drain(..) {
+            let state = match img {
+                Some(img) => cover::State::Ready(ctx.load_texture(format!("cover-{hash}"), img, egui::TextureOptions::LINEAR)),
+                None => cover::State::None,
+            };
+            self.covers.insert(hash, state);
+        }
         for (url, res) in ib.login.drain(..) {
             self.fv.login_busy = false;
             match res {
@@ -2194,6 +2207,40 @@ impl eframe::App for App {
             }
             let medias: Vec<listview::Media> =
                 self.transfers.iter().map(|t| self.media.get(&t.handle.info_hash().as_string()).copied().unwrap_or_default()).collect();
+            // The picture inside each torrent (album covers): chosen once its file list
+            // is known, read in the background once that file has downloaded.
+            for (t, &media) in self.transfers.iter().zip(&medias) {
+                let hash = t.handle.info_hash().as_string();
+                match self.covers.get(&hash) {
+                    None => {
+                        let files: Vec<(String, u64)> = t
+                            .handle
+                            .with_metadata(|m| m.file_infos.iter().map(|f| (f.relative_filename.to_string_lossy().into_owned(), f.len)).collect())
+                            .unwrap_or_default();
+                        if files.is_empty() {
+                            continue;
+                        }
+                        let state = match cover::pick(&files, media == listview::Media::Audio) {
+                            Some(i) => cover::State::Waiting { file: i, path: t.handle.output_folder().join(&files[i].0), len: files[i].1 },
+                            None => cover::State::None,
+                        };
+                        self.covers.insert(hash, state);
+                    }
+                    Some(cover::State::Waiting { file, path, len }) => {
+                        if !t.handle.stats().file_progress.get(*file).is_some_and(|d| d >= len) {
+                            continue;
+                        }
+                        let (path, inbox, ctx, key) = (path.clone(), self.inbox.clone(), ctx.clone(), hash.clone());
+                        self.rt.spawn_blocking(move || {
+                            let img = cover::decode(&path);
+                            inbox.lock().unwrap().covers.push((key, img));
+                            ctx.request_repaint();
+                        });
+                        self.covers.insert(hash, cover::State::Loading);
+                    }
+                    Some(_) => {}
+                }
+            }
             let mut counts = [0usize; 3];
             for i in (0..self.transfers.len()).filter(|&i| self.visible(i)) {
                 counts[medias[i] as usize] += 1;
@@ -2220,14 +2267,20 @@ impl eframe::App for App {
                     .collect();
                 self.list.arrange(&keys)
             };
-            // Artwork for the thumbnails (films and episodes, when ratings are on).
-            let posters: HashMap<usize, egui::TextureHandle> = if self.list.layout == listview::Layout::Thumbs {
+            // Artwork: a film's OMDb poster in the thumbnails (when ratings are on), else
+            // the picture that came inside the torrent.
+            let mut art: HashMap<usize, egui::TextureHandle> = if self.list.layout == listview::Layout::Thumbs {
                 let names: Vec<(usize, String)> =
                     order.iter().filter(|&&i| medias[i] == listview::Media::Video).map(|&i| (i, self.transfers[i].name.clone())).collect();
                 names.into_iter().filter_map(|(i, n)| self.poster_for(&n).map(|t| (i, t))).collect()
             } else {
                 HashMap::new()
             };
+            for &i in &order {
+                if let (false, Some(cover::State::Ready(tex))) = (art.contains_key(&i), self.covers.get(&self.transfers[i].handle.info_hash().as_string())) {
+                    art.insert(i, tex.clone());
+                }
+            }
 
             let mut remove = None;
             let mut relabel: Vec<(String, String, bool)> = Vec::new();
@@ -2242,7 +2295,7 @@ impl eframe::App for App {
                         for &i in &order {
                             let (t, Some(f)) = (&self.transfers[i], self.facts.get(i)) else { continue };
                             let mut gone = false;
-                            transfer_row(ui, &self.rt, self.session.as_ref(), t, f, &labels, out.relabel, out.open_details, out.play, || gone = true);
+                            transfer_row(ui, &self.rt, self.session.as_ref(), t, f, art.get(&i), &labels, out.relabel, out.open_details, out.play, || gone = true);
                             if gone {
                                 *out.remove = Some(i);
                             }
@@ -2253,7 +2306,7 @@ impl eframe::App for App {
                         ui.spacing_mut().item_spacing.y = 1.0;
                         for (n, &i) in order.iter().enumerate() {
                             let (t, Some(f)) = (&self.transfers[i], self.facts.get(i)) else { continue };
-                            compact_row(ui, &self.rt, self.session.as_ref(), t, f, medias[i], n % 2 == 1, &labels, i, &mut out);
+                            compact_row(ui, &self.rt, self.session.as_ref(), t, f, medias[i], art.get(&i), n % 2 == 1, &labels, i, &mut out);
                         }
                     }
                     listview::Layout::Thumbs => {
@@ -2261,7 +2314,7 @@ impl eframe::App for App {
                             ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
                             for &i in &order {
                                 let (t, Some(f)) = (&self.transfers[i], self.facts.get(i)) else { continue };
-                                thumb_tile(ui, &self.rt, self.session.as_ref(), t, f, medias[i], posters.get(&i), &labels, i, &mut out);
+                                thumb_tile(ui, &self.rt, self.session.as_ref(), t, f, medias[i], art.get(&i), &labels, i, &mut out);
                             }
                         });
                     }
@@ -2826,6 +2879,7 @@ fn transfer_row(
     session: Option<&Arc<Session>>,
     t: &Transfer,
     f: &sidebar::Facts,
+    art: Option<&egui::TextureHandle>,
     all_labels: &[String],
     relabel: &mut Vec<(String, String, bool)>,
     open_details: &mut Option<String>,
@@ -2839,101 +2893,109 @@ fn transfer_row(
     ui.group(|ui| {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
-            // Buttons are laid out first (right to left) so they always fit; the
-            // name and chips then get the width that's left, truncated if need be.
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("Remove").on_hover_text("Stop and remove from list (keeps files)").clicked() {
-                    on_remove();
-                }
-                ui.menu_button("Labels", |ui| {
-                    if all_labels.is_empty() {
-                        ui.label(egui::RichText::new("Make one in the sidebar under Labels").weak());
-                    }
-                    for l in all_labels {
-                        let mut on = f.labels.contains(l);
-                        if ui.checkbox(&mut on, l.as_str()).changed() {
-                            relabel.push((f.hash.clone(), l.clone(), on));
+            if let Some(tex) = art {
+                let side = egui::vec2(58.0, 58.0);
+                ui.add(egui::Image::new((tex.id(), side)).uv(cover::fill_uv(tex.size(), side)).corner_radius(6));
+            }
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    // Buttons are laid out first (right to left) so they always fit; the
+                    // name and chips then get the width that's left, truncated if need be.
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("Remove").on_hover_text("Stop and remove from list (keeps files)").clicked() {
+                            on_remove();
                         }
-                    }
+                        ui.menu_button("Labels", |ui| {
+                            if all_labels.is_empty() {
+                                ui.label(egui::RichText::new("Make one in the sidebar under Labels").weak());
+                            }
+                            for l in all_labels {
+                                let mut on = f.labels.contains(l);
+                                if ui.checkbox(&mut on, l.as_str()).changed() {
+                                    relabel.push((f.hash.clone(), l.clone(), on));
+                                }
+                            }
+                        });
+                        if ui
+                            .small_button("Details")
+                            .on_hover_text("Speed graph, files, peers and this torrent's own settings")
+                            .clicked()
+                        {
+                            *open_details = Some(f.hash.clone());
+                        }
+                        if player::has_media(&t.handle)
+                            && ui
+                                .small_button("▶ Play")
+                                .on_hover_text("Auto-play: starts right away and streams what hasn't downloaded yet — also films packed in RAR/ZIP/TAR archives (stored, as scene releases are). Uses the torrent's .m3u playlist if it has one.")
+                                .clicked()
+                        {
+                            *play = Some(f.hash.clone());
+                        }
+                        if ui.small_button("Open folder").clicked() {
+                            let _ = open_folder(&t.folder);
+                        }
+                        if !s.finished {
+                            if let Some(sess) = session {
+                                let label = if paused { "▶ Resume" } else { "⏸ Pause" };
+                                if ui.small_button(label).clicked() {
+                                    let (sess, h) = (sess.clone(), t.handle.clone());
+                                    rt.spawn(async move {
+                                        let _ = if paused { sess.unpause(&h).await } else { sess.pause(&h).await };
+                                    });
+                                }
+                            }
+                        }
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            // The name is the drag handle: drop it on a sidebar entry.
+                            ui.dnd_drag_source(egui::Id::new(("zt-drag", &f.hash)), sidebar::Dragged(f.hash.clone()), |ui| {
+                                ui.add(egui::Label::new(egui::RichText::new(&t.name).strong()).truncate());
+                            })
+                            .response
+                            .on_hover_text(format!("{}\n\nDrag onto a label to tag it, or onto Paused / Downloading to pause or resume", t.name));
+                            for l in &f.labels {
+                                chip(ui, l, sidebar::tint(l)).on_hover_text("label");
+                            }
+                            // Private trackers are the ones worth naming on the row.
+                            if f.private {
+                                for site in &f.sites {
+                                    chip(ui, &format!("{} 🔒", sidebar::pretty(site)), egui::Color32::from_gray(170)).on_hover_text("private tracker");
+                                }
+                            }
+                        });
+                    });
                 });
-                if ui
-                    .small_button("Details")
-                    .on_hover_text("Speed graph, files, peers and this torrent's own settings")
-                    .clicked()
-                {
-                    *open_details = Some(f.hash.clone());
-                }
-                if player::has_media(&t.handle)
-                    && ui
-                        .small_button("▶ Play")
-                        .on_hover_text("Auto-play: starts right away and streams what hasn't downloaded yet — also films packed in RAR/ZIP/TAR archives (stored, as scene releases are). Uses the torrent's .m3u playlist if it has one.")
-                        .clicked()
-                {
-                    *play = Some(f.hash.clone());
-                }
-                if ui.small_button("Open folder").clicked() {
-                    let _ = open_folder(&t.folder);
-                }
-                if !s.finished {
-                    if let Some(sess) = session {
-                        let label = if paused { "▶ Resume" } else { "⏸ Pause" };
-                        if ui.small_button(label).clicked() {
-                            let (sess, h) = (sess.clone(), t.handle.clone());
-                            rt.spawn(async move {
-                                let _ = if paused { sess.unpause(&h).await } else { sess.pause(&h).await };
-                            });
-                        }
+
+                let bar_text = if s.finished {
+                    "✔ Complete".to_string()
+                } else {
+                    format!("{:.1} %", frac * 100.0)
+                };
+                let fill = if s.finished {
+                    egui::Color32::from_rgb(60, 170, 90)
+                } else {
+                    egui::Color32::from_rgb(70, 130, 220)
+                };
+                ui.add(egui::ProgressBar::new(frac).text(bar_text).fill(fill));
+
+                let mut line = format!("{} / {}", human(s.progress_bytes), human(s.total_bytes));
+                if let Some(live) = &s.live {
+                    if !s.finished {
+                        line += &format!("  ·  ↓ {}", speed(live.download_speed.mbps));
                     }
+                    line += &format!("  ·  ↑ {}", speed(live.upload_speed.mbps));
+                    line += &format!("  ·  peers {}", live.snapshot.peer_stats.live);
+                    if let (false, Some(eta)) = (s.finished, &live.time_remaining) {
+                        line += &format!("  ·  ETA {eta}");
+                    }
+                } else {
+                    line += &format!("  ·  {}", s.state);
                 }
-                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    // The name is the drag handle: drop it on a sidebar entry.
-                    ui.dnd_drag_source(egui::Id::new(("zt-drag", &f.hash)), sidebar::Dragged(f.hash.clone()), |ui| {
-                        ui.add(egui::Label::new(egui::RichText::new(&t.name).strong()).truncate());
-                    })
-                    .response
-                    .on_hover_text(format!("{}\n\nDrag onto a label to tag it, or onto Paused / Downloading to pause or resume", t.name));
-                    for l in &f.labels {
-                        chip(ui, l, sidebar::tint(l)).on_hover_text("label");
-                    }
-                    // Private trackers are the ones worth naming on the row.
-                    if f.private {
-                        for site in &f.sites {
-                            chip(ui, &format!("{} 🔒", sidebar::pretty(site)), egui::Color32::from_gray(170)).on_hover_text("private tracker");
-                        }
-                    }
-                });
+                if let Some(e) = &s.error {
+                    line += &format!("  ·  error: {e}");
+                }
+                ui.label(egui::RichText::new(line).small().monospace());
             });
         });
-
-        let bar_text = if s.finished {
-            "✔ Complete".to_string()
-        } else {
-            format!("{:.1} %", frac * 100.0)
-        };
-        let fill = if s.finished {
-            egui::Color32::from_rgb(60, 170, 90)
-        } else {
-            egui::Color32::from_rgb(70, 130, 220)
-        };
-        ui.add(egui::ProgressBar::new(frac).text(bar_text).fill(fill));
-
-        let mut line = format!("{} / {}", human(s.progress_bytes), human(s.total_bytes));
-        if let Some(live) = &s.live {
-            if !s.finished {
-                line += &format!("  ·  ↓ {}", speed(live.download_speed.mbps));
-            }
-            line += &format!("  ·  ↑ {}", speed(live.upload_speed.mbps));
-            line += &format!("  ·  peers {}", live.snapshot.peer_stats.live);
-            if let (false, Some(eta)) = (s.finished, &live.time_remaining) {
-                line += &format!("  ·  ETA {eta}");
-            }
-        } else {
-            line += &format!("  ·  {}", s.state);
-        }
-        if let Some(e) = &s.error {
-            line += &format!("  ·  error: {e}");
-        }
-        ui.label(egui::RichText::new(line).small().monospace());
     });
 }
 
@@ -3025,6 +3087,7 @@ fn compact_row(
     t: &Transfer,
     f: &sidebar::Facts,
     media: listview::Media,
+    art: Option<&egui::TextureHandle>,
     stripe: bool,
     all_labels: &[String],
     i: usize,
@@ -3046,7 +3109,15 @@ fn compact_row(
     let weak = visuals.weak_text_color();
     let mid = rect.center().y;
     p.circle_filled(egui::pos2(rect.left() + 10.0, mid), 4.0, col);
-    p.text(egui::pos2(rect.left() + 20.0, mid), egui::Align2::LEFT_CENTER, media.glyph(), egui::FontId::proportional(12.0), text);
+    match art {
+        Some(tex) => {
+            let r = egui::Rect::from_center_size(egui::pos2(rect.left() + 29.0, mid), egui::vec2(20.0, 20.0));
+            p.image(tex.id(), r, cover::fill_uv(tex.size(), r.size()), egui::Color32::WHITE);
+        }
+        None => {
+            p.text(egui::pos2(rect.left() + 20.0, mid), egui::Align2::LEFT_CENTER, media.glyph(), egui::FontId::proportional(12.0), text);
+        }
+    }
 
     // Fixed columns from the right: speeds, size, status, bar.
     let speeds = match &s.live {
@@ -3067,7 +3138,7 @@ fn compact_row(
     p.rect_filled(egui::Rect::from_min_size(bar.min, egui::vec2(90.0 * frac.clamp(0.0, 1.0), 6.0)), 3.0, col);
 
     // The name gets what is left, cut with an ellipsis.
-    let name_left = rect.left() + 40.0;
+    let name_left = rect.left() + 44.0;
     let name_w = (bar.left() - 14.0 - name_left).max(40.0);
     let mut job = egui::text::LayoutJob::single_section(t.name.clone(), egui::TextFormat::simple(egui::FontId::proportional(13.0), text));
     job.wrap = egui::text::TextWrapping::truncate_at_width(name_w);
@@ -3095,7 +3166,7 @@ fn compact_row(
     resp.context_menu(|ui| actions_menu(ui, rt, session, t, f, all_labels, i, out));
 }
 
-/// A tile: artwork (the film's poster, else a colour and the kind), a progress ring,
+/// A tile: artwork (the film's poster or the torrent's own picture, else a colour and the kind), a progress ring,
 /// a ▶ on hover for media; the name and a status line under it.
 #[allow(clippy::too_many_arguments)]
 fn thumb_tile(
@@ -3126,6 +3197,10 @@ fn thumb_tile(
     let round_top = egui::CornerRadius { nw: 10, ne: 10, sw: 0, se: 0 };
     let tint = listview::tint(&t.name);
     p.rect_filled(art, round_top, tint);
+    let wide = poster.filter(|tex| tex.size()[0] as f32 >= 0.8 * tex.size()[1] as f32);
+    if let Some(tex) = wide {
+        egui::Image::new((tex.id(), art.size())).uv(cover::fill_uv(tex.size(), art.size())).corner_radius(round_top).paint_at(ui, art);
+    }
     // A soft fade to dark at the bottom of the artwork, under the ring.
     let mut mesh = egui::Mesh::default();
     let fade = egui::Rect::from_min_max(egui::pos2(art.left(), art.center().y), art.max);
@@ -3137,6 +3212,7 @@ fn thumb_tile(
     mesh.add_triangle(0, 2, 3);
     p.add(mesh);
     match poster {
+        Some(_) if wide.is_some() => {}
         Some(tex) => {
             let ph = art_h - 12.0;
             let pr = egui::Rect::from_center_size(art.center(), egui::vec2(ph * 2.0 / 3.0, ph));
