@@ -23,6 +23,7 @@ type ManagedTorrentHandle = Arc<ManagedTorrent>;
 /// How soon a feed that failed to load is tried again.
 const FEED_RETRY: Duration = Duration::from_secs(60);
 
+mod autostart;
 mod cover;
 mod details;
 mod diskguard;
@@ -40,6 +41,7 @@ mod search;
 mod seed;
 mod serve;
 mod sidebar;
+mod tray;
 mod tunnel;
 mod update;
 mod vpn;
@@ -63,7 +65,7 @@ fn main() -> eframe::Result<()> {
     // terminal it was started from, or its output goes nowhere. Not for `mcp`,
     // whose stdin/stdout are the client's pipes.
     #[cfg(windows)]
-    if std::env::args().nth(1).is_some_and(|a| a != "mcp") {
+    if std::env::args().nth(1).is_some_and(|a| a != "mcp" && a != autostart::FLAG) {
         // SAFETY: plain Win32 call; fails harmlessly when there is no parent console.
         unsafe { windows_sys::Win32::System::Console::AttachConsole(windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS) };
     }
@@ -104,6 +106,30 @@ fn main() -> eframe::Result<()> {
                 std::process::exit(1);
             }
         }
+        return Ok(());
+    }
+
+    // `zentorrent --start-with-windows [on|off]`: the Settings switch, from a terminal.
+    if args.get(1).map(String::as_str) == Some("--start-with-windows") {
+        if !autostart::supported() {
+            println!("starting with the computer is a Windows setting");
+            return Ok(());
+        }
+        match args.get(2).map(String::as_str) {
+            Some(v @ ("on" | "off")) => {
+                if let Err(e) = autostart::set_wanted(v == "on") {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+            None => {}
+            Some(_) => {
+                eprintln!("usage: zentorrent --start-with-windows [on|off]");
+                std::process::exit(2);
+            }
+        }
+        println!("start with Windows: {}", if autostart::wanted() { "on" } else { "off" });
+        println!("registered: {}", autostart::registered().unwrap_or_else(|| "(nothing)".into()));
         return Ok(());
     }
 
@@ -262,6 +288,11 @@ fn main() -> eframe::Result<()> {
             update::VERSION
         );
         std::process::exit(2);
+    }
+
+    // Windows' start-up list follows the Settings switch and this exe's path.
+    if let Err(e) = autostart::apply(autostart::wanted()) {
+        eprintln!("{e}");
     }
 
     let opts = eframe::NativeOptions {
@@ -464,6 +495,12 @@ struct App {
     textures: HashMap<String, Option<egui::TextureHandle>>,
     /// The picture that came inside each torrent, by info-hash.
     covers: HashMap<String, cover::State>,
+    /// Started by Windows at log-in: to the tray (or minimized) on the first frame.
+    start_minimized: bool,
+    /// The tray icon while "keep running in the tray" is on (Windows).
+    tray: Option<tray::Tray>,
+    /// The tray knows the window's handle (set on the first frame).
+    hwnd_known: bool,
     /// The torrent picture read large for the open Details panel (info-hash, texture once read).
     cover_large: Option<(String, Option<egui::TextureHandle>)>,
     last_tick: Instant,
@@ -559,6 +596,11 @@ impl App {
             textures: HashMap::new(),
             covers: HashMap::new(),
             cover_large: None,
+            start_minimized: std::env::args().any(|a| a == autostart::FLAG),
+            tray: (tray::supported() && tray::wanted())
+                .then(|| tray::create(&cc.egui_ctx).map_err(|e| eprintln!("{e}")).ok())
+                .flatten(),
+            hwnd_known: false,
             last_tick: Instant::now(),
             last_ledger_save: Instant::now(),
             sidebar: Default::default(),
@@ -650,6 +692,33 @@ impl App {
                 .weak()
                 .small(),
             );
+
+            if autostart::supported() {
+                section(ui, "Start-up & tray");
+                let mut on = autostart::wanted();
+                if ui
+                    .checkbox(&mut on, "Start ZenTorrent when Windows starts, so downloads and seeding carry on")
+                    .changed()
+                {
+                    if let Err(e) = autostart::set_wanted(on) {
+                        self.errors.push(e);
+                    }
+                }
+            }
+            if tray::supported() {
+                let mut on = self.tray.is_some();
+                if ui
+                    .checkbox(&mut on, "Keep running in the system tray when the window is closed (Quit from the tray icon's menu)")
+                    .changed()
+                {
+                    tray::set_wanted(on);
+                    self.tray = if on {
+                        tray::create(ctx).map_err(|e| self.errors.push(e)).ok()
+                    } else {
+                        None
+                    };
+                }
+            }
 
             section(ui, "VPN");
             ui.horizontal(|ui| {
@@ -2024,9 +2093,20 @@ fn saved_folder() -> Option<PathBuf> {
 }
 
 fn remember_folder(dir: &std::path::Path) {
+    set_pref("save_to", serde_json::json!(dir.to_string_lossy()));
+}
+
+/// One setting from prefs.json.
+fn pref(key: &str) -> Option<serde_json::Value> {
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(prefs_path()).ok()?).ok()?;
+    v.get(key).cloned()
+}
+
+/// Change one setting in prefs.json, keeping the others.
+fn set_pref(key: &str, value: serde_json::Value) {
     let path = prefs_path();
     let mut v: serde_json::Value = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_else(|| serde_json::json!({}));
-    v["save_to"] = serde_json::json!(dir.to_string_lossy());
+    v[key] = value;
     let _ = std::fs::create_dir_all(seed::data_dir());
     let tmp = path.with_extension("json.tmp");
     // Written whole, then renamed: never a half-written prefs file.
@@ -2193,8 +2273,39 @@ impl Source {
 }
 
 impl eframe::App for App {
-    fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, root: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = &root.ctx().clone();
+        #[cfg(windows)]
+        if !self.hwnd_known {
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            if let Ok(h) = frame.window_handle() {
+                if let RawWindowHandle::Win32(w) = h.as_raw() {
+                    tray::set_window(w.hwnd.get());
+                    self.hwnd_known = true;
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = (frame, self.hwnd_known);
+        // Started by Windows at log-in: in the tray when it is on, else minimized. Not on
+        // the first frame: eframe shows the window after that one, undoing the hiding.
+        if self.start_minimized && ctx.cumulative_frame_nr() >= 3 {
+            self.start_minimized = false;
+            if !(self.tray.is_some() && tray::hide()) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            }
+        }
+        if self.start_minimized {
+            ctx.request_repaint();
+        }
+        // Closing the window keeps ZenTorrent running in the tray (Quit is in its menu).
+        if ctx.input(|i| i.viewport().close_requested())
+            && self.tray.is_some()
+            && !tray::QUIT.load(std::sync::atomic::Ordering::Relaxed)
+            && tray::hide()
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
         self.drain_inbox(ctx);
         self.mcp_tick(ctx);
         self.vpn_window(ctx);

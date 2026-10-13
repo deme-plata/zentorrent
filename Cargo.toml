@@ -35,7 +35,10 @@ tracing = "0.1"
 
 # Flux MoE progress: the CPU gauge on Windows (GetSystemTimes).
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_Storage_FileSystem", "Win32_System_Console"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Registry", "Win32_UI_WindowsAndMessaging"] }
+# System tray icon (Settings → keep running in the tray); its window handle from eframe.
+tray-icon = "=0.25.1"
+raw-window-handle = "0.6"
 
 # Flux MoE fit check: free disk where Ollama keeps models (statvfs).
 [target.'cfg(unix)'.dependencies]
