@@ -593,7 +593,7 @@ fn peers_tab(ui: &mut egui::Ui, t: &Transfer) {
 
 /// A speed limit: one-click presets, plus a field for an exact value
 /// (drag it, or click and type). 0 = unlimited.
-fn limit(ui: &mut egui::Ui, v: &mut u32) -> bool {
+pub(crate) fn limit(ui: &mut egui::Ui, v: &mut u32) -> bool {
     let mut changed = false;
     for (label, kib) in [("unlimited", 0), ("1 MB/s", 1024), ("5 MB/s", 5 * 1024), ("10 MB/s", 10 * 1024), ("50 MB/s", 50 * 1024)] {
         if ui.selectable_label(*v == kib, label).clicked() && *v != kib {

@@ -401,7 +401,11 @@ enum View {
     Seeding,
     Feeds,
     Moe,
+    Settings,
 }
+
+/// Where people reach the people behind ZenTorrent (shown under Settings → About).
+const CONTACT: &str = "bitknight.dipper688@passmail.net";
 
 /// RSS state that lives only in memory (the feed list itself is in `rss::FeedStore`).
 #[derive(Default)]
@@ -587,6 +591,166 @@ impl App {
         };
         app.apply_global_limits();
         app
+    }
+
+    /// "Choose folder…": where new downloads go (remembered for the next start).
+    fn choose_folder(&mut self) {
+        if let Some(dir) = rfd::FileDialog::new().set_directory(&self.folder).pick_folder() {
+            remember_folder(&dir);
+            self.folder = dir;
+        }
+    }
+
+    /// The Settings tab: what is otherwise spread over the app, in one place, and About.
+    fn settings_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.set_max_width(760.0);
+            let section = |ui: &mut egui::Ui, title: &str| {
+                ui.add_space(14.0);
+                ui.label(egui::RichText::new(title).heading());
+                ui.separator();
+            };
+
+            section(ui, "Downloads");
+            let mut limits_changed = false;
+            egui::Grid::new("zt-settings-downloads").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
+                ui.label("Save to");
+                ui.horizontal(|ui| {
+                    ui.monospace(self.folder.display().to_string());
+                    if ui.button("Choose folder…").clicked() {
+                        self.choose_folder();
+                    }
+                    if ui.button("Open").clicked() {
+                        let _ = open_folder(&self.folder);
+                    }
+                });
+                ui.end_row();
+                ui.label("Total download limit");
+                ui.horizontal(|ui| limits_changed |= details::limit(ui, &mut self.ledger.global_down_kib));
+                ui.end_row();
+                ui.label("Total upload limit");
+                ui.horizontal(|ui| limits_changed |= details::limit(ui, &mut self.ledger.global_up_kib));
+                ui.end_row();
+            });
+            if limits_changed {
+                self.save_ledger();
+                self.apply_global_limits();
+            }
+            ui.label(
+                egui::RichText::new(format!(
+                    "Limits apply at once. When the drive you save to has less than {} GB free, downloads pause by themselves and continue at {} GB.",
+                    diskguard::LOW_GB,
+                    diskguard::OK_GB
+                ))
+                .weak()
+                .small(),
+            );
+
+            section(ui, "VPN");
+            ui.horizontal(|ui| {
+                let (state, color) = match &self.vpn {
+                    vpn::Vpn::Off => ("Off: torrent traffic goes out directly from this computer.".to_string(), ui.visuals().text_color()),
+                    vpn::Vpn::Up { relay, .. } => (format!("On: encrypted tunnel to {relay}."), egui::Color32::from_rgb(90, 200, 120)),
+                    vpn::Vpn::Failed(_) => ("On, but the tunnel is down: downloads wait until it is up (tried every 30 s).".to_string(), egui::Color32::LIGHT_RED),
+                };
+                ui.colored_label(color, state);
+                if ui.button("VPN settings…").clicked() {
+                    self.vpn_open = true;
+                    self.vpn_edit = self.vpn_settings.clone();
+                    self.vpn_note = None;
+                    self.vpn_pub = Some(vpn::client_key().map(|k| k.public().to_hex()).map_err(|e| format!("{e:#}")));
+                }
+            });
+
+            section(ui, "Posters & ratings");
+            ui.horizontal_wrapped(|ui| {
+                let mut changed = ui.checkbox(&mut self.store.show_ratings, "Show film posters and ratings (IMDb, Rotten Tomatoes, Metascore)").changed();
+                if self.store.show_ratings {
+                    ui.label("OMDb key:");
+                    let r = ui.add(egui::TextEdit::singleline(&mut self.store.omdb_key).password(true).hint_text("free key").desired_width(110.0));
+                    if r.changed() {
+                        self.meta_error = None;
+                    }
+                    changed |= r.lost_focus();
+                    if self.store.omdb_key.trim().is_empty() {
+                        ui.hyperlink_to("get a free key (1,000/day)", "https://www.omdbapi.com/apikey.aspx");
+                    }
+                }
+                if changed {
+                    if let Err(e) = self.store.save() {
+                        self.errors.push(format!("could not save settings: {e:#}"));
+                    }
+                }
+            });
+
+            section(ui, "Updates");
+            ui.horizontal(|ui| {
+                ui.label(format!("This is ZenTorrent {}.", env!("CARGO_PKG_VERSION")));
+                match self.upd.clone() {
+                    Upd::Checking => {
+                        ui.spinner();
+                        ui.label("checking…");
+                    }
+                    Upd::Available(m) => {
+                        if ui.button(egui::RichText::new(format!("⬆ Update to v{}", m.version)).strong()).clicked() {
+                            self.install_update(ctx, m);
+                        }
+                    }
+                    Upd::Installing(v) => {
+                        ui.spinner();
+                        ui.label(format!("installing v{v}…"));
+                    }
+                    Upd::Installed(v) => {
+                        ui.label(format!("v{v} is installed: start ZenTorrent again to use it."));
+                    }
+                    Upd::UpToDate | Upd::Failed(_) => {
+                        if let Upd::Failed(e) = &self.upd {
+                            ui.colored_label(egui::Color32::LIGHT_RED, e);
+                        }
+                        if ui.button("Check for updates").clicked() {
+                            self.check_update(ctx);
+                        }
+                    }
+                }
+            });
+            ui.label(egui::RichText::new("ZenTorrent looks for a new version at start and every 6 hours; updates are signed and checked before they install.").weak().small());
+
+            section(ui, "About");
+            ui.label(egui::RichText::new(format!("⚡ ZenTorrent {}", env!("CARGO_PKG_VERSION"))).strong());
+            ui.label("A fast, private BitTorrent client with a built-in player, RSS feeds, an optional VPN, and Flux MoE, a media assistant that runs on this computer.");
+            ui.add_space(6.0);
+            egui::Grid::new("zt-settings-about").num_columns(2).spacing([16.0, 6.0]).show(ui, |ui| {
+                ui.label("Contact");
+                ui.horizontal(|ui| {
+                    ui.hyperlink_to(CONTACT, format!("mailto:{CONTACT}")).on_hover_text("Questions, ideas, bug reports");
+                    if ui.small_button("Copy").clicked() {
+                        ctx.copy_text(CONTACT.to_string());
+                    }
+                });
+                ui.end_row();
+                ui.label("Website");
+                ui.hyperlink_to("quillon.xyz", "https://quillon.xyz");
+                ui.end_row();
+                ui.label("Source & releases");
+                ui.hyperlink_to("github.com/deme-plata/zentorrent", "https://github.com/deme-plata/zentorrent");
+                ui.end_row();
+                ui.label("Licence");
+                ui.label("MIT or Apache-2.0");
+                ui.end_row();
+                ui.label("Built with");
+                ui.label("librqbit (BitTorrent engine), egui (window), libmpv (player, LGPL)");
+                ui.end_row();
+                ui.label("Your data");
+                ui.horizontal(|ui| {
+                    let dir = seed::data_dir();
+                    ui.monospace(dir.display().to_string());
+                    if ui.small_button("Open").clicked() {
+                        let _ = open_folder(&dir);
+                    }
+                });
+                ui.end_row();
+            });
+        });
     }
 
     /// The "All torrents" limits from the ledger → the engine.
@@ -2032,6 +2196,7 @@ impl eframe::App for App {
                 ui.selectable_value(&mut self.view, View::Seeding, "Seeding & ratio");
                 ui.selectable_value(&mut self.view, View::Feeds, format!("RSS feeds ({})", self.store.feeds.len()));
                 ui.selectable_value(&mut self.view, View::Moe, "✨ Flux MoE").on_hover_text("Your media assistant: overview, feed search, play, playlists, tidy folders — runs on this computer");
+                ui.selectable_value(&mut self.view, View::Settings, "⚙ Settings").on_hover_text("Save folder, speed limits, VPN, ratings, updates, and About");
                 ui.add_space(8.0);
                 self.vpn_badge(ui);
                 self.update_ui(ui, ctx);
@@ -2043,13 +2208,7 @@ impl eframe::App for App {
                 ui.label("Save to:");
                 ui.monospace(self.folder.display().to_string());
                 if ui.button("Choose folder…").clicked() {
-                    if let Some(dir) = rfd::FileDialog::new()
-                        .set_directory(&self.folder)
-                        .pick_folder()
-                    {
-                        remember_folder(&dir);
-                        self.folder = dir;
-                    }
+                    self.choose_folder();
                 }
             });
 
@@ -2113,6 +2272,10 @@ impl eframe::App for App {
         if self.view == View::Feeds {
             egui::CentralPanel::default().show(root, |ui| self.feeds_ui(ui, ctx));
             ctx.request_repaint_after(Duration::from_millis(500));
+            return;
+        }
+        if self.view == View::Settings {
+            egui::CentralPanel::default().show(root, |ui| self.settings_ui(ui, ctx));
             return;
         }
         if self.view == View::Moe {
