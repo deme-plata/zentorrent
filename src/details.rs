@@ -72,6 +72,8 @@ pub enum Action {
     /// true = pause, false = resume.
     Pause(bool),
     OpenFolder,
+    /// Open the torrent's picture (the banner) in the system's picture viewer.
+    OpenPicture,
     /// (label, on)
     Label(String, bool),
     /// Limits or goals changed: save the ledger and apply the limits now.
@@ -88,6 +90,7 @@ pub fn show(
     f: &sidebar::Facts,
     ledger: &mut seed::Ledger,
     history: Option<&VecDeque<(f32, f32)>>,
+    banner: Option<&egui::TextureHandle>,
 ) -> Vec<Action> {
     let mut out = Vec::new();
     let modal = egui::Modal::new(egui::Id::new("zt-details")).show(ctx, |ui| {
@@ -113,6 +116,25 @@ pub fn show(
             });
         });
         ui.add_space(2.0);
+        // ── the picture that came with the torrent, large ────────────
+        if let Some(tex) = banner {
+            // The rest of the panel needs about 620 px: the banner gets what the window has left.
+            let h = (screen.height() - 620.0).clamp(80.0, 240.0);
+            let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click());
+            // Behind it the same picture, filling the width and darkened; on top all of it.
+            egui::Image::new((tex.id(), rect.size()))
+                .uv(crate::cover::fill_uv(tex.size(), rect.size()))
+                .tint(Color32::from_gray(60))
+                .corner_radius(8)
+                .paint_at(ui, rect);
+            let size = tex.size_vec2();
+            let fit = egui::Rect::from_center_size(rect.center(), size * (rect.height() / size.y).min(rect.width() / size.x));
+            egui::Image::new((tex.id(), fit.size())).paint_at(ui, fit);
+            if resp.on_hover_text("Open the full picture").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                out.push(Action::OpenPicture);
+            }
+            ui.add_space(6.0);
+        }
         ui.label(RichText::new(&t.name).heading().strong());
         let frac = if s.total_bytes > 0 { s.progress_bytes as f32 / s.total_bytes as f32 } else { 0.0 };
         ui.add(

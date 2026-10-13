@@ -22,7 +22,8 @@ pub enum State {
     /// This file of it, read once it has downloaded.
     Waiting { file: usize, path: PathBuf, len: u64 },
     Loading,
-    Ready(egui::TextureHandle),
+    /// Shown small in the lists; `path` is the file, for the large banner in Details.
+    Ready { tex: egui::TextureHandle, path: PathBuf },
 }
 
 /// The best picture among a torrent's files (paths relative to the torrent, sizes in
@@ -55,10 +56,11 @@ pub fn pick(files: &[(String, u64)], audio: bool) -> Option<usize> {
         .map(|(_, i)| i)
 }
 
-/// Read a picture into a small image for the screen; `None` when it is not one.
-pub fn decode(path: &Path) -> Option<egui::ColorImage> {
+/// Read a picture into an image for the screen, at most `max` pixels wide and high;
+/// `None` when it is not one.
+pub fn decode(path: &Path, max: u32) -> Option<egui::ColorImage> {
     let bytes = std::fs::read(path).ok()?;
-    let img = image::load_from_memory(&bytes).ok()?.thumbnail(320, 320).to_rgba8();
+    let img = image::load_from_memory(&bytes).ok()?.thumbnail(max, max).to_rgba8();
     Some(egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw()))
 }
 

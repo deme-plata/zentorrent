@@ -374,8 +374,10 @@ struct Inbox {
     meta: Vec<(String, Result<Option<meta::Info>, String>)>,
     /// (imdb id, poster bytes or error)
     posters: Vec<(String, Result<Vec<u8>, String>)>,
-    /// Pictures read from inside torrents, by info-hash (`None`: not a picture after all).
-    covers: Vec<(String, Option<egui::ColorImage>)>,
+    /// Pictures read from inside torrents: (info-hash, file, image; `None`: not a picture after all).
+    covers: Vec<(String, PathBuf, Option<egui::ColorImage>)>,
+    /// The same picture read large, for the Details banner.
+    cover_large: Vec<(String, Option<egui::ColorImage>)>,
     busy: usize,
     /// Result of the VPN window's "Test relay" (handshake + ping, ms).
     vpn_test: Option<Result<u128, String>>,
@@ -462,6 +464,8 @@ struct App {
     textures: HashMap<String, Option<egui::TextureHandle>>,
     /// The picture that came inside each torrent, by info-hash.
     covers: HashMap<String, cover::State>,
+    /// The torrent picture read large for the open Details panel (info-hash, texture once read).
+    cover_large: Option<(String, Option<egui::TextureHandle>)>,
     last_tick: Instant,
     last_ledger_save: Instant,
     sidebar: sidebar::Sidebar,
@@ -554,6 +558,7 @@ impl App {
             meta_error_at: None,
             textures: HashMap::new(),
             covers: HashMap::new(),
+            cover_large: None,
             last_tick: Instant::now(),
             last_ledger_save: Instant::now(),
             sidebar: Default::default(),
@@ -777,6 +782,25 @@ impl App {
     }
 
     /// Draw the Details panel and carry out what it asks for.
+    /// The torrent's own picture for the Details banner: read large in the background
+    /// the first time, the list's small copy until then.
+    fn banner_for(&mut self, ctx: &egui::Context, hash: &str) -> Option<egui::TextureHandle> {
+        let Some(cover::State::Ready { tex, path }) = self.covers.get(hash) else { return None };
+        match &self.cover_large {
+            Some((h, large)) if h == hash => Some(large.clone().unwrap_or_else(|| tex.clone())),
+            _ => {
+                self.cover_large = Some((hash.to_string(), None));
+                let (path, inbox, ctx, key) = (path.clone(), self.inbox.clone(), ctx.clone(), hash.to_string());
+                self.rt.spawn_blocking(move || {
+                    let img = cover::decode(&path, 1200);
+                    inbox.lock().unwrap().cover_large.push((key, img));
+                    ctx.request_repaint();
+                });
+                Some(tex.clone())
+            }
+        }
+    }
+
     fn details_ui(&mut self, ctx: &egui::Context) {
         let Some(mut d) = self.details.take() else { return };
         let Some(i) = self.transfers.iter().position(|t| t.handle.info_hash().as_string() == d.hash) else {
@@ -787,7 +811,8 @@ impl App {
             return;
         };
         let hash = d.hash.clone();
-        let actions = details::show(ctx, &mut d, &self.transfers[i], &f, &mut self.ledger, self.speed_hist.get(&hash));
+        let banner = self.banner_for(ctx, &hash);
+        let actions = details::show(ctx, &mut d, &self.transfers[i], &f, &mut self.ledger, self.speed_hist.get(&hash), banner.as_ref());
         let mut keep = true;
         for a in actions {
             match a {
@@ -795,6 +820,11 @@ impl App {
                 details::Action::Pause(p) => self.set_paused(&d.hash, p),
                 details::Action::OpenFolder => {
                     let _ = open_folder(&self.transfers[i].folder);
+                }
+                details::Action::OpenPicture => {
+                    if let Some(cover::State::Ready { path, .. }) = self.covers.get(&d.hash) {
+                        let _ = open_folder(path);
+                    }
                 }
                 details::Action::Label(l, on) => {
                     self.ledger.set_label(&d.hash, &l, on);
@@ -1902,12 +1932,17 @@ impl App {
             let tex = res.ok().and_then(|b| poster_texture(ctx, &id, &b));
             self.textures.insert(id, tex);
         }
-        for (hash, img) in ib.covers.drain(..) {
+        for (hash, path, img) in ib.covers.drain(..) {
             let state = match img {
-                Some(img) => cover::State::Ready(ctx.load_texture(format!("cover-{hash}"), img, egui::TextureOptions::LINEAR)),
+                Some(img) => cover::State::Ready { tex: ctx.load_texture(format!("cover-{hash}"), img, egui::TextureOptions::LINEAR), path },
                 None => cover::State::None,
             };
             self.covers.insert(hash, state);
+        }
+        for (hash, img) in ib.cover_large.drain(..) {
+            if let Some((open, tex)) = self.cover_large.as_mut().filter(|(h, _)| *h == hash) {
+                *tex = img.map(|img| ctx.load_texture(format!("cover-large-{open}"), img, egui::TextureOptions::LINEAR));
+            }
         }
         for (url, res) in ib.login.drain(..) {
             self.fv.login_busy = false;
@@ -2395,8 +2430,8 @@ impl eframe::App for App {
                         }
                         let (path, inbox, ctx, key) = (path.clone(), self.inbox.clone(), ctx.clone(), hash.clone());
                         self.rt.spawn_blocking(move || {
-                            let img = cover::decode(&path);
-                            inbox.lock().unwrap().covers.push((key, img));
+                            let img = cover::decode(&path, 320);
+                            inbox.lock().unwrap().covers.push((key, path, img));
                             ctx.request_repaint();
                         });
                         self.covers.insert(hash, cover::State::Loading);
@@ -2440,7 +2475,7 @@ impl eframe::App for App {
                 HashMap::new()
             };
             for &i in &order {
-                if let (false, Some(cover::State::Ready(tex))) = (art.contains_key(&i), self.covers.get(&self.transfers[i].handle.info_hash().as_string())) {
+                if let (false, Some(cover::State::Ready { tex, .. })) = (art.contains_key(&i), self.covers.get(&self.transfers[i].handle.info_hash().as_string())) {
                     art.insert(i, tex.clone());
                 }
             }
