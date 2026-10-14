@@ -20,6 +20,8 @@ blake3 = "1"
 sha2 = "0.10"
 lofty = "0.22"
 hex = "0.4"
+# "Delete the files too": to the Recycle Bin / trash, not gone for good.
+trash = "5.2"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 regex = "1"
 anyhow = "1"

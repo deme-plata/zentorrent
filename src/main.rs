@@ -35,6 +35,7 @@ mod mcp;
 mod meta;
 mod moe;
 mod player;
+mod remove;
 mod repair;
 mod rss;
 mod search;
@@ -497,6 +498,8 @@ struct App {
     covers: HashMap<String, cover::State>,
     /// Started by Windows at log-in: to the tray (or minimized) on the first frame.
     start_minimized: bool,
+    /// Remove was clicked for this torrent (info-hash): ask whether its files go too.
+    confirm_remove: Option<String>,
     /// The tray icon while "keep running in the tray" is on (Windows).
     tray: Option<tray::Tray>,
     /// The tray knows the window's handle (set on the first frame).
@@ -597,6 +600,7 @@ impl App {
             covers: HashMap::new(),
             cover_large: None,
             start_minimized: std::env::args().any(|a| a == autostart::FLAG),
+            confirm_remove: None,
             tray: (tray::supported() && tray::wanted())
                 .then(|| tray::create(&cc.egui_ctx).map_err(|e| eprintln!("{e}")).ok())
                 .flatten(),
@@ -638,6 +642,98 @@ impl App {
         };
         app.apply_global_limits();
         app
+    }
+
+    /// Remove: from the list only, or with the torrent's files (to the Recycle Bin).
+    fn remove_dialog(&mut self, ctx: &egui::Context) {
+        let Some(hash) = self.confirm_remove.clone() else { return };
+        let Some(t) = self.transfers.iter().find(|t| t.handle.info_hash().as_string() == hash) else {
+            self.confirm_remove = None;
+            return;
+        };
+        let (name, folder) = (t.name.clone(), t.handle.output_folder().display().to_string());
+        let got = t.handle.stats().progress_bytes;
+        let has_files = t.handle.with_metadata(|m| !m.file_infos.is_empty()).unwrap_or(false);
+        let mut choice: Option<Option<bool>> = None;
+        let modal = egui::Modal::new(egui::Id::new("zt-remove")).show(ctx, |ui| {
+            ui.set_width(460.0);
+            ui.label(egui::RichText::new("Remove this torrent?").heading());
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(&name).strong());
+            ui.label(egui::RichText::new(format!("{} downloaded, in {folder}", human(got))).weak().small());
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .button("Remove from list")
+                    .on_hover_text("Stops it and takes it off the list. The downloaded files stay where they are.")
+                    .clicked()
+                {
+                    choice = Some(Some(false));
+                }
+                let delete = egui::Button::new(egui::RichText::new("🗑 Delete the files too").color(egui::Color32::from_rgb(235, 110, 100)));
+                if ui
+                    .add_enabled(has_files, delete)
+                    .on_hover_text(format!(
+                        "Also moves this torrent's downloaded files to the {} (only its own files; you can restore them from there).",
+                        remove::BIN
+                    ))
+                    .clicked()
+                {
+                    choice = Some(Some(true));
+                }
+                if ui.button("Cancel").clicked() {
+                    choice = Some(None);
+                }
+            });
+        });
+        if modal.should_close() && choice.is_none() {
+            choice = Some(None);
+        }
+        match choice {
+            Some(Some(delete)) => {
+                self.confirm_remove = None;
+                self.remove_torrent(ctx, &hash, delete);
+            }
+            Some(None) => self.confirm_remove = None,
+            None => {}
+        }
+    }
+
+    /// Take a torrent off the list; with `delete`, its files go to the Recycle Bin too.
+    fn remove_torrent(&mut self, ctx: &egui::Context, hash: &str, delete: bool) {
+        let Some(i) = self.transfers.iter().position(|t| t.handle.info_hash().as_string() == hash) else { return };
+        let t = self.transfers.remove(i);
+        self.ledger.entries.remove(hash);
+        self.speed_hist.remove(hash);
+        self.covers.remove(hash);
+        self.save_ledger();
+        let root = t.handle.output_folder().to_path_buf();
+        let files: Vec<PathBuf> = if delete {
+            t.handle
+                .with_metadata(|m| m.file_infos.iter().filter(|f| !f.attrs.padding).map(|f| root.join(&f.relative_filename)).collect())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        // A torrent with several files has its own folder (it may go once empty); a single
+        // file sits in the shared save folder.
+        let own_root = files.len() > 1;
+        let protected: Vec<PathBuf> = [Some(self.folder.clone()), dirs::download_dir(), dirs::home_dir()].into_iter().flatten().collect();
+        let (session, inbox, ctx, name) = (self.session.clone(), self.inbox.clone(), ctx.clone(), t.name.clone());
+        self.rt.spawn(async move {
+            // Stopped first: Windows will not move a file the engine still has open.
+            if let Some(s) = session {
+                let _ = s.delete(t.handle.id().into(), false).await;
+            }
+            if !delete {
+                return;
+            }
+            let done = tokio::task::spawn_blocking(move || remove::trash_files(&files, &root, own_root, &protected)).await;
+            if let Ok(Err(e)) = done {
+                inbox.lock().unwrap().errors.push(format!("{name}: {e}"));
+            }
+            ctx.request_repaint();
+        });
     }
 
     /// "Choose folder…": where new downloads go (remembered for the next start).
@@ -2410,6 +2506,7 @@ impl eframe::App for App {
         self.retry_vpn(ctx);
         // Drawn before the central panels; as a modal it sits above all of them.
         self.details_ui(ctx);
+        self.remove_dialog(ctx);
         if self.view == View::Seeding {
             egui::CentralPanel::default().show(root, |ui| self.seeding_ui(ui));
             ctx.request_repaint_after(Duration::from_millis(1000));
@@ -2651,15 +2748,7 @@ impl eframe::App for App {
                 self.details = Some(details::Details::new(hash));
             }
             if let Some(i) = remove {
-                let t = self.transfers.remove(i);
-                self.ledger.entries.remove(&t.handle.info_hash().as_string());
-                self.speed_hist.remove(&t.handle.info_hash().as_string());
-                self.save_ledger();
-                if let Some(s) = self.session.clone() {
-                    self.rt.spawn(async move {
-                        let _ = s.delete(t.handle.id().into(), false).await;
-                    });
-                }
+                self.confirm_remove = Some(self.transfers[i].handle.info_hash().as_string());
             }
         });
 
@@ -3211,7 +3300,7 @@ fn transfer_row(
                     // Buttons are laid out first (right to left) so they always fit; the
                     // name and chips then get the width that's left, truncated if need be.
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("Remove").on_hover_text("Stop and remove from list (keeps files)").clicked() {
+                        if ui.small_button("Remove").on_hover_text("Take it off the list; you choose whether its files go too").clicked() {
                             on_remove();
                         }
                         ui.menu_button("Labels", |ui| {
@@ -3380,7 +3469,7 @@ fn actions_menu(
         }
     });
     ui.separator();
-    if ui.button("Remove").on_hover_text("Stop and remove from list (keeps files)").clicked() {
+    if ui.button("Remove…").on_hover_text("Take it off the list; you choose whether its files go too").clicked() {
         *out.remove = Some(i);
         ui.close();
     }
