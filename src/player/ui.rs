@@ -167,10 +167,10 @@ pub fn playlist(ui: &mut egui::Ui, p: &mut Player, files: &Files) {
             let row = ui.dnd_drag_source(id, pos, |ui| {
                 ui.horizontal(|ui| {
                     ui.set_width(ui.available_width());
-                    let n = RichText::new(format!("{:>2}", pos + 1)).monospace().weak();
-                    ui.label(if current { RichText::new("▶").color(Color32::from_rgb(90, 200, 120)) } else { n });
-                    let title = if current { RichText::new(&t.title).strong() } else { RichText::new(&t.title) };
-                    ui.label(title).on_hover_text(&t.path);
+                    // Right side first, then the number and the title in what is left, the
+                    // title cut at its END. Laid out the other way round a long title made
+                    // the row wider than the panel, and the panel (pinned to the window's
+                    // right edge) cut off the START: the track number and first words.
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if !current && ui.small_button("x").on_hover_text("Remove from the playlist").clicked() {
                             remove = Some(pos);
@@ -182,6 +182,13 @@ pub fn playlist(ui: &mut egui::Ui, p: &mut Player, files: &Files) {
                         if let Some(d) = t.duration {
                             ui.label(RichText::new(clock(d)).small().weak().monospace());
                         }
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            let n = RichText::new(format!("{:>2}", pos + 1)).monospace().weak();
+                            ui.label(if current { RichText::new("▶").color(Color32::from_rgb(90, 200, 120)) } else { n });
+                            let title = if current { RichText::new(&t.title).strong() } else { RichText::new(&t.title) };
+                            ui.add(egui::Label::new(title).truncate()).on_hover_text(format!("{}
+{}", t.title, t.path));
+                        });
                     });
                 });
             });
