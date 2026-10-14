@@ -23,6 +23,7 @@ type ManagedTorrentHandle = Arc<ManagedTorrent>;
 /// How soon a feed that failed to load is tried again.
 const FEED_RETRY: Duration = Duration::from_secs(60);
 
+mod assoc;
 mod autostart;
 mod cover;
 mod details;
@@ -30,6 +31,7 @@ mod diskguard;
 mod engine;
 mod history;
 mod info;
+mod instance;
 mod listview;
 mod mcp;
 mod meta;
@@ -106,6 +108,32 @@ fn main() -> eframe::Result<()> {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
+        }
+        return Ok(());
+    }
+
+    // `zentorrent --associate [on|off]`: open .torrent files and magnet links with ZenTorrent.
+    if args.get(1).map(String::as_str) == Some("--associate") {
+        if !assoc::supported() {
+            println!("opening .torrent files with ZenTorrent is a Windows setting");
+            return Ok(());
+        }
+        match args.get(2).map(String::as_str) {
+            Some(v @ ("on" | "off")) => {
+                if let Err(e) = assoc::set_wanted(v == "on") {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+            None => {}
+            Some(_) => {
+                eprintln!("usage: zentorrent --associate [on|off]");
+                std::process::exit(2);
+            }
+        }
+        println!("open .torrent files and magnet links with ZenTorrent: {}", if assoc::wanted() { "on" } else { "off" });
+        if let Some(other) = assoc::other_choice() {
+            println!("but Windows is set to open .torrent files with {other} (Settings → Apps → Default apps)");
         }
         return Ok(());
     }
@@ -291,8 +319,21 @@ fn main() -> eframe::Result<()> {
         std::process::exit(2);
     }
 
-    // Windows' start-up list follows the Settings switch and this exe's path.
+    // One ZenTorrent: a second start (a double-clicked .torrent or magnet link, the Start
+    // menu) hands over to the running one and ends here; so does Windows' start-up.
+    let autostarted = args.iter().any(|a| a == autostart::FLAG);
+    let open = instance::to_open(&args);
+    let listener = match instance::start(&open, !autostarted) {
+        instance::Start::Primary(l) => Some(l),
+        instance::Start::HandedOff => return Ok(()),
+        instance::Start::Alone => None,
+    };
+
+    // Windows' start-up list and the .torrent/magnet registration follow Settings and this exe's path.
     if let Err(e) = autostart::apply(autostart::wanted()) {
+        eprintln!("{e}");
+    }
+    if let Err(e) = assoc::apply(assoc::wanted()) {
         eprintln!("{e}");
     }
 
@@ -307,7 +348,7 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "ZenTorrent",
         opts,
-        Box::new(move |cc| Ok(Box::new(App::new(cc, rt, default_dir)))),
+        Box::new(move |cc| Ok(Box::new(App::new(cc, rt, default_dir, listener, open)))),
     )
 }
 
@@ -397,6 +438,8 @@ struct Transfer {
 struct Inbox {
     added: Vec<Transfer>,
     errors: Vec<String>,
+    /// .torrent files and magnet links from outside (Windows, a second start).
+    opens: Vec<String>,
     /// (feed url, items or error)
     feeds: Vec<(String, Result<Vec<rss::Item>, String>)>,
     update: Option<Upd>,
@@ -565,7 +608,13 @@ struct App {
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>, rt: tokio::runtime::Runtime, folder: PathBuf) -> Self {
+    fn new(
+        cc: &eframe::CreationContext<'_>,
+        rt: tokio::runtime::Runtime,
+        folder: PathBuf,
+        listener: Option<std::net::TcpListener>,
+        open: Vec<String>,
+    ) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
 
         let vpn_settings = vpn::VpnSettings::load();
@@ -644,6 +693,18 @@ impl App {
             media: HashMap::new(),
         };
         app.apply_global_limits();
+        // What this start was given, and what later starts hand over.
+        app.inbox.lock().unwrap().opens.extend(open);
+        if let Some(l) = listener {
+            let (inbox, ctx) = (app.inbox.clone(), cc.egui_ctx.clone());
+            instance::listen(l, move |req| {
+                inbox.lock().unwrap().opens.extend(req.open);
+                if req.show {
+                    bring_forward(&ctx);
+                }
+                ctx.request_repaint();
+            });
+        }
         app
     }
 
@@ -739,6 +800,24 @@ impl App {
         });
     }
 
+    /// A .torrent file (path) or a magnet link from outside: a double-click in Windows,
+    /// a second start, the command line.
+    fn open_item(&mut self, ctx: &egui::Context, item: String) {
+        self.view = View::Downloads;
+        if item.starts_with("magnet:") {
+            self.start(ctx, item.clone(), Source::Link(item));
+            return;
+        }
+        let path = PathBuf::from(&item);
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                let label = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                self.start(ctx, label, Source::Bytes(bytes));
+            }
+            Err(e) => self.errors.push(format!("{}: {e}", path.display())),
+        }
+    }
+
     /// "Choose folder…": where new downloads go (remembered for the next start).
     fn choose_folder(&mut self) {
         if let Some(dir) = rfd::FileDialog::new().set_directory(&self.folder).pick_folder() {
@@ -793,7 +872,7 @@ impl App {
             );
 
             if autostart::supported() {
-                section(ui, "Start-up & tray");
+                section(ui, "Windows");
                 let mut on = autostart::wanted();
                 if ui
                     .checkbox(&mut on, "Start ZenTorrent when Windows starts, so downloads and seeding carry on")
@@ -816,6 +895,28 @@ impl App {
                     } else {
                         None
                     };
+                }
+            }
+            if assoc::supported() {
+                let mut on = assoc::wanted();
+                if ui.checkbox(&mut on, "Open .torrent files and magnet links with ZenTorrent").changed() {
+                    if let Err(e) = assoc::set_wanted(on) {
+                        self.errors.push(e);
+                    }
+                }
+                if let (true, Some(other)) = (on, assoc::other_choice()) {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Windows is set to open .torrent files with {other}: a choice only you can change, in Windows' Default apps (pick ZenTorrent for .torrent)."
+                            ))
+                            .small()
+                            .color(egui::Color32::from_rgb(240, 170, 60)),
+                        );
+                        if ui.small_button("Open Default apps").clicked() {
+                            let _ = std::process::Command::new("explorer").arg("ms-settings:defaultapps").spawn();
+                        }
+                    });
                 }
             }
 
@@ -2406,6 +2507,10 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
         self.drain_inbox(ctx);
+        let opens = std::mem::take(&mut self.inbox.lock().unwrap().opens);
+        for item in opens {
+            self.open_item(ctx, item);
+        }
         self.mcp_tick(ctx);
         self.vpn_window(ctx);
         let due = match self.fv.last_refresh {
@@ -3717,6 +3822,18 @@ fn human(b: u64) -> String {
 /// librqbit reports speed in MiB/s under the name `mbps`.
 fn speed(mib_s: f64) -> String {
     if mib_s >= 1.0 { format!("{mib_s:.1} MB/s") } else { format!("{:.0} KB/s", mib_s * 1024.0) }
+}
+
+/// A second start asked for the window: back from the tray (or the taskbar), in front.
+fn bring_forward(ctx: &egui::Context) {
+    #[cfg(windows)]
+    tray::show(ctx);
+    #[cfg(not(windows))]
+    {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        ctx.request_repaint();
+    }
 }
 
 fn open_folder(p: &std::path::Path) -> std::io::Result<()> {
