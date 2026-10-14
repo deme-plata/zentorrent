@@ -14,6 +14,7 @@ pub mod gauge;
 pub mod ollama;
 pub mod organize;
 pub mod skills;
+mod text;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -210,12 +211,19 @@ impl Default for Moe {
     }
 }
 
-const STARTERS: &[(&str, &str)] = &[
-    ("Overview of my library", "Give me an overview of my library: what I have, what is still downloading, and what is playable."),
-    ("Top picks from my feeds", "Show me the top picks from my RSS feeds and their history: a varied mix of the best torrents, not one genre."),
-    ("Find trance in my feeds", "Find trance in my RSS feeds and history, most seeders first."),
-    ("Organize my music by genre", "Organize the music in my download folder into genre folders."),
-    ("Play something", "Play something from my library — pick something good and tell me what it is."),
+/// One-click questions: (icon, label, what it does, the question sent).
+const STARTERS: &[(&str, &str, &str, &str)] = &[
+    (
+        "✨",
+        "What can you do for me?",
+        "Five useful things it can do with your library",
+        "Now you have access to my data: what can you actually do with it? Name 5 killer things you can do for me with my downloads, media, RSS feeds and folders.",
+    ),
+    ("📖", "Overview of my library", "What you have, what is downloading, what plays", "Give me an overview of my library: what I have, what is still downloading, and what is playable."),
+    ("★", "Top picks from my feeds", "A varied mix of the best torrents in your feeds", "Show me the top picks from my RSS feeds and their history: a varied mix of the best torrents, not one genre."),
+    ("🔍", "Find trance in my feeds", "In your feeds and their history, most seeders first", "Find trance in my RSS feeds and history, most seeders first."),
+    ("📁", "Organize my music by genre", "Moves are shown first; nothing moves until you Apply", "Organize the music in my download folder into genre folders."),
+    ("▶", "Play something", "It picks something good from your library", "Play something from my library — pick something good and tell me what it is."),
 ];
 
 impl Moe {
@@ -573,24 +581,48 @@ impl Moe {
         let mut send: Option<String> = None;
         egui::Panel::bottom("moe-input").show(ui, |ui| {
             ui.add_space(6.0);
-            if !self.talked() {
+            // What the last answer offered to do next ("Organize my music"), one click each.
+            let last = self.lines.iter().rev().find_map(|l| if let Line::Moe(t) = l { Some(t.as_str()) } else { None });
+            let next = if self.busy { Vec::new() } else { last.map(text::follow_ups).unwrap_or_default() };
+            if !next.is_empty() {
                 ui.horizontal_wrapped(|ui| {
-                    for (label, prompt) in STARTERS {
-                        if ui.add_enabled(ready, egui::Button::new(*label)).clicked() {
-                            send = Some(prompt.to_string());
+                    ui.label(RichText::new("Try:").small().weak());
+                    for f in next {
+                        if ui.add_enabled(ready, egui::Button::new(RichText::new(&f).small())).on_hover_text("Ask this").clicked() {
+                            send = Some(f);
                         }
                     }
                 });
-                ui.add_space(4.0);
+                ui.add_space(2.0);
             }
+            let id = egui::Id::new("moe-input-text");
+            // Enter sends; Shift+Enter is a new line.
+            let enter = ready
+                && ui.memory(|m| m.has_focus(id))
+                && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
             ui.horizontal(|ui| {
+                ui.menu_button("💡", |ui| {
+                    ui.label(RichText::new("Ask Flux MoE").small().weak());
+                    for (icon, label, hint, prompt) in STARTERS {
+                        if ui.add_enabled(ready, egui::Button::new(format!("{icon}  {label}"))).on_hover_text(*hint).clicked() {
+                            send = Some(prompt.to_string());
+                            ui.close();
+                        }
+                    }
+                })
+                .response
+                .on_hover_text("Questions to start from");
                 let edit = ui.add_enabled(
                     ready,
-                    egui::TextEdit::singleline(&mut self.input).hint_text("Ask Flux MoE — e.g. “make a playlist of my newest trance”").desired_width(ui.available_width() - 70.0),
+                    egui::TextEdit::multiline(&mut self.input)
+                        .id(id)
+                        .desired_rows(1)
+                        .hint_text("Ask Flux MoE — e.g. “make a playlist of my newest trance”   (Shift+Enter: new line)")
+                        .desired_width(ui.available_width() - 70.0),
                 );
-                let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if (ui.add_enabled(ready, egui::Button::new("Send")).clicked() || enter) && !self.input.trim().is_empty() {
-                    send = Some(std::mem::take(&mut self.input));
+                if (ui.add_enabled(ready, egui::Button::new(RichText::new("Send").strong())).clicked() || enter) && !self.input.trim().is_empty() {
+                    send = Some(std::mem::take(&mut self.input).trim().to_string());
+                    edit.request_focus();
                 }
             });
             ui.add_space(4.0);
@@ -602,22 +634,36 @@ impl Moe {
         // ── transcript ──────────────────────────────────────────
         let mut decided: Option<(usize, bool)> = None;
         let mut grab: Option<(usize, usize)> = None;
+        let mut tile: Option<String> = None;
         egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
             if !self.talked() {
-                ui.add_space(20.0);
+                ui.add_space(16.0);
                 ui.label(
                     RichText::new(
-                        "Flux MoE knows your torrents, your RSS feeds and your folders. Ask it for an overview, to find \
-                         something in your feeds, to play music or video, to make a playlist, or to tidy a folder — moves \
-                         are always shown first, and you press Apply.",
+                        "Flux MoE knows your torrents, your RSS feeds and your folders, and runs on this computer: \
+                         nothing you ask leaves it. Moves are always shown first, and you press Apply.",
                     )
                     .weak(),
                 );
+                ui.add_space(10.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
+                    for (icon, label, hint, prompt) in STARTERS {
+                        let mut job = egui::text::LayoutJob::default();
+                        let body = egui::TextStyle::Body.resolve(ui.style());
+                        job.append(&format!("{icon}  {label}\n"), 0.0, egui::TextFormat::simple(body, ui.visuals().strong_text_color()));
+                        job.append(hint, 0.0, egui::TextFormat::simple(egui::TextStyle::Small.resolve(ui.style()), ui.visuals().weak_text_color()));
+                        let b = egui::Button::new(job).min_size(egui::vec2(290.0, 54.0)).corner_radius(10.0);
+                        if ui.add_enabled(ready, b).clicked() {
+                            tile = Some(prompt.to_string());
+                        }
+                    }
+                });
             }
             for line in &self.lines {
                 match line {
                     Line::User(t) => bubble(ui, t, Color32::from_rgb(40, 70, 110), true),
-                    Line::Moe(t) => bubble(ui, t, Color32::from_rgb(38, 38, 44), false),
+                    Line::Moe(t) => answer(ui, t, true),
                     Line::Tool(t) => {
                         ui.label(RichText::new(format!("  · {t}")).small().color(Color32::from_rgb(140, 170, 200)));
                     }
@@ -656,12 +702,16 @@ impl Moe {
                 }
             }
             if !self.live.is_empty() {
-                bubble(ui, &ollama::strip_thinking(&self.live), Color32::from_rgb(38, 38, 44), false);
+                answer(ui, &ollama::strip_thinking(&self.live), false);
             }
             if let Some(r) = &self.run {
                 progress_ui(ui, r, self.avg_tokens);
             }
         });
+
+        if tile.is_some() {
+            self.pending = tile;
+        }
 
         // A Download button in a result list: the click is the user's OK.
         if let Some((list, row)) = grab {
@@ -803,6 +853,18 @@ fn progress_ui(ui: &mut egui::Ui, r: &Run, avg_tokens: f64) {
             ui.label(RichText::new(parts.join(" · ")).small().color(color)).on_hover_text(tip);
         }
     });
+}
+
+/// An answer from Flux MoE: its Markdown shown formatted; Copy once it is finished.
+fn answer(ui: &mut egui::Ui, text: &str, done: bool) {
+    egui::Frame::new().fill(Color32::from_rgb(38, 38, 44)).corner_radius(8.0).inner_margin(egui::Margin::same(10)).show(ui, |ui| {
+        ui.set_max_width(ui.available_width() * 0.9);
+        text::show(ui, text);
+        if done && ui.small_button("📋 Copy").on_hover_text("Copy this answer").clicked() {
+            ui.ctx().copy_text(text.to_string());
+        }
+    });
+    ui.add_space(4.0);
 }
 
 fn bubble(ui: &mut egui::Ui, text: &str, fill: Color32, right: bool) {
