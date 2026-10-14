@@ -457,6 +457,9 @@ struct FeedView {
     /// Indexes into the history, best first, and what they were computed for.
     results: Vec<usize>,
     results_key: Option<(String, search::Sort, bool, u64, Option<String>, u64)>,
+    /// Measured height of each result row (0 = not drawn yet), and the width they were measured at.
+    row_h: Vec<f32>,
+    row_w: f32,
     in_flight: usize,
     last_refresh: Option<Instant>,
     /// A feed failed: re-read the failed ones at this time instead of
@@ -2270,8 +2273,8 @@ mod folder_tests {
     }
 }
 
-/// Rows drawn at most; past that the list says how many more matched.
-const MAX_ROWS: usize = 300;
+/// Height of an RSS result row not drawn yet (one line; rows with a poster are taller).
+const ROW_EST: f32 = 24.0;
 
 const SEARCH_HELP: &str = "Search your feeds:\n\
     trance live         both words (title counts most)\n\
@@ -3075,17 +3078,10 @@ impl App {
                 now,
             );
             self.fv.results_key = Some(key);
+            self.fv.row_h = vec![0.0; self.fv.results.len()];
         }
         let total = self.fv.results.len();
-        ui.label(
-            egui::RichText::new(if total > MAX_ROWS {
-                format!("{total} results · showing the first {MAX_ROWS}, narrow the search to see the rest")
-            } else {
-                format!("{total} result{}", if total == 1 { "" } else { "s" })
-            })
-            .weak()
-            .small(),
-        );
+        ui.label(egui::RichText::new(format!("{total} result{}", if total == 1 { "" } else { "s" })).weak().small());
 
         let many_feeds = self.store.feeds.len() > 1 || self.fv.scope_history;
         let mut pick: Option<usize> = None;
@@ -3094,119 +3090,149 @@ impl App {
         let can_lookup = ratings_on && self.meta_error.is_none();
         let mut to_lookup: Vec<(String, meta::Query)> = Vec::new();
         let mut to_poster: Vec<(String, String)> = Vec::new();
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            for &i in self.fv.results.iter().take(MAX_ROWS) {
-                let e = &self.feed_hist.entries[i];
-                // Genre is only known once OMDb has answered for this title; feed tags show next to it.
-                let omdb_genre = meta::guess(&e.title, &e.category)
-                    .and_then(|q| self.meta_cache.get(&q.key()).flatten())
-                    .map(|i| i.genre)
-                    .unwrap_or_default();
-                let genre = [omdb_genre, e.tags.iter().take(4).cloned().collect::<Vec<_>>().join(", ")]
-                    .into_iter()
-                    .filter(|s| !s.is_empty())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let mut sub = String::new();
-                if let Some(sz) = e.size {
-                    sub += &human(sz);
-                }
-                if !e.date.is_empty() {
-                    sub += &format!("  ·  {}", e.date);
-                } else {
-                    sub += &format!("  ·  seen {} ago", history::ago(now.saturating_sub(e.first_seen)));
-                }
-                if many_feeds {
-                    sub += &format!("  ·  {}", e.feed);
-                }
-                // Ratings: cached answer, or queue a lookup.
-                let info = match (ratings_on, meta::guess(&e.title, &e.category)) {
-                    (true, Some(q)) => {
-                        let k = q.key();
-                        match self.meta_cache.get(&k) {
-                            Some(found) => found,
-                            None => {
-                                if can_lookup && !self.meta_pending.contains(&k) && to_lookup.len() < 40 {
-                                    to_lookup.push((k, q));
+        // Only the rows on screen are laid out (a history holds thousands): each row's
+        // height is measured when it is drawn and kept; rows not drawn yet are estimated.
+        let width = ui.available_width();
+        if (width - self.fv.row_w).abs() > 0.5 {
+            self.fv.row_w = width;
+            self.fv.row_h.iter_mut().for_each(|h| *h = 0.0);
+        }
+        let heights: Vec<f32> = self.fv.row_h.iter().map(|&h| if h > 0.0 { h } else { ROW_EST }).collect();
+        let total_h: f32 = heights.iter().sum();
+        let mut measured: Vec<(usize, f32)> = Vec::new();
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show_viewport(ui, |ui, view| {
+            ui.set_height(total_h.max(1.0));
+            // The first row reaching into view, and where it starts.
+            let (mut first, mut top) = (0, 0.0);
+            while first < heights.len() && top + heights[first] < view.min.y {
+                top += heights[first];
+                first += 1;
+            }
+            let x = ui.max_rect().x_range();
+            let rect = egui::Rect::from_x_y_ranges(x, ui.max_rect().top() + top..=ui.max_rect().top() + view.max.y + ROW_EST);
+            ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                ui.skip_ahead_auto_ids(first);
+                let start = ui.cursor().top();
+                for (n, &i) in self.fv.results.iter().enumerate().skip(first) {
+                    if ui.cursor().top() - start + top > view.max.y {
+                        break;
+                    }
+                    let row_top = ui.cursor().top();
+                    'row: {
+                    let e = &self.feed_hist.entries[i];
+                    // Genre is only known once OMDb has answered for this title; feed tags show next to it.
+                    let omdb_genre = meta::guess(&e.title, &e.category)
+                        .and_then(|q| self.meta_cache.get(&q.key()).flatten())
+                        .map(|i| i.genre)
+                        .unwrap_or_default();
+                    let genre = [omdb_genre, e.tags.iter().take(4).cloned().collect::<Vec<_>>().join(", ")]
+                        .into_iter()
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let mut sub = String::new();
+                    if let Some(sz) = e.size {
+                        sub += &human(sz);
+                    }
+                    if !e.date.is_empty() {
+                        sub += &format!("  ·  {}", e.date);
+                    } else {
+                        sub += &format!("  ·  seen {} ago", history::ago(now.saturating_sub(e.first_seen)));
+                    }
+                    if many_feeds {
+                        sub += &format!("  ·  {}", e.feed);
+                    }
+                    // Ratings: cached answer, or queue a lookup.
+                    let info = match (ratings_on, meta::guess(&e.title, &e.category)) {
+                        (true, Some(q)) => {
+                            let k = q.key();
+                            match self.meta_cache.get(&k) {
+                                Some(found) => found,
+                                None => {
+                                    if can_lookup && !self.meta_pending.contains(&k) && to_lookup.len() < 40 {
+                                        to_lookup.push((k, q));
+                                    }
+                                    None
                                 }
-                                None
                             }
                         }
-                    }
-                    _ => None,
-                };
-                let Some(info) = info else {
-                    ui.horizontal_wrapped(|ui| {
+                        _ => None,
+                    };
+                    let Some(info) = info else {
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.small_button("⬇").on_hover_text("Download").clicked() {
+                                pick = Some(i);
+                            }
+                            ui.label(&e.title).on_hover_text(if e.description.is_empty() { "—" } else { e.description.as_str() });
+                            tags(ui, &e.category, &genre);
+                            swarm(ui, e, now);
+                            ui.label(egui::RichText::new(&sub).weak().small());
+                        });
+                        break 'row;
+                    };
+                    ui.horizontal(|ui| {
                         if ui.small_button("⬇").on_hover_text("Download").clicked() {
                             pick = Some(i);
                         }
-                        ui.label(&e.title).on_hover_text(if e.description.is_empty() { "—" } else { e.description.as_str() });
-                        tags(ui, &e.category, &genre);
-                        swarm(ui, e, now);
-                        ui.label(egui::RichText::new(&sub).weak().small());
-                    });
-                    continue;
-                };
-                ui.horizontal(|ui| {
-                    if ui.small_button("⬇").on_hover_text("Download").clicked() {
-                        pick = Some(i);
-                    }
-                    let (w, h) = (46.0, 68.0);
-                    match self.textures.get(&info.imdb_id) {
-                        Some(Some(t)) => {
-                            ui.add(egui::Image::new(t).fit_to_exact_size(egui::vec2(w, h)).corner_radius(3.0));
-                        }
-                        other => {
-                            let (r, _) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
-                            ui.painter().rect_filled(r, 3.0, ui.visuals().faint_bg_color);
-                            if other.is_none() {
-                                if let Some(p) = &info.poster {
-                                    to_poster.push((info.imdb_id.clone(), p.clone()));
+                        let (w, h) = (46.0, 68.0);
+                        match self.textures.get(&info.imdb_id) {
+                            Some(Some(t)) => {
+                                ui.add(egui::Image::new(t).fit_to_exact_size(egui::vec2(w, h)).corner_radius(3.0));
+                            }
+                            other => {
+                                let (r, _) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
+                                ui.painter().rect_filled(r, 3.0, ui.visuals().faint_bg_color);
+                                if other.is_none() {
+                                    if let Some(p) = &info.poster {
+                                        to_poster.push((info.imdb_id.clone(), p.clone()));
+                                    }
                                 }
                             }
                         }
-                    }
-                    ui.vertical(|ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.strong(format!("{} ({})", info.title, info.year));
-                            tags(ui, &e.category, &genre);
+                        ui.vertical(|ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.strong(format!("{} ({})", info.title, info.year));
+                                tags(ui, &e.category, &genre);
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                if let Some(r) = info.imdb_rating {
+                                    ui.label(
+                                        egui::RichText::new(format!(" IMDb {r:.1} "))
+                                            .strong()
+                                            .color(egui::Color32::BLACK)
+                                            .background_color(egui::Color32::from_rgb(245, 197, 24)),
+                                    )
+                                    .on_hover_text(format!("{} votes", info.imdb_votes));
+                                }
+                                if let Some(t) = info.rotten {
+                                    let (bg, word) = if t >= 60 {
+                                        (egui::Color32::from_rgb(250, 80, 50), "Fresh")
+                                    } else {
+                                        (egui::Color32::from_rgb(110, 170, 60), "Rotten")
+                                    };
+                                    ui.label(
+                                        egui::RichText::new(format!(" Rotten Tomatoes {t}% "))
+                                            .strong()
+                                            .color(egui::Color32::WHITE)
+                                            .background_color(bg),
+                                    )
+                                    .on_hover_text(format!("Tomatometer: {word}"));
+                                }
+                                if let Some(m) = info.metascore {
+                                    ui.label(egui::RichText::new(format!("Metascore {m}")).small());
+                                }
+                                ui.hyperlink_to("IMDb page", info.imdb_url());
+                                swarm(ui, e, now);
+                            });
+                            ui.label(egui::RichText::new(format!("{}   {sub}", e.title)).weak().small())
+                                .on_hover_text(if info.plot.is_empty() { "—".to_string() } else { info.plot.clone() });
                         });
-                        ui.horizontal_wrapped(|ui| {
-                            if let Some(r) = info.imdb_rating {
-                                ui.label(
-                                    egui::RichText::new(format!(" IMDb {r:.1} "))
-                                        .strong()
-                                        .color(egui::Color32::BLACK)
-                                        .background_color(egui::Color32::from_rgb(245, 197, 24)),
-                                )
-                                .on_hover_text(format!("{} votes", info.imdb_votes));
-                            }
-                            if let Some(t) = info.rotten {
-                                let (bg, word) = if t >= 60 {
-                                    (egui::Color32::from_rgb(250, 80, 50), "Fresh")
-                                } else {
-                                    (egui::Color32::from_rgb(110, 170, 60), "Rotten")
-                                };
-                                ui.label(
-                                    egui::RichText::new(format!(" Rotten Tomatoes {t}% "))
-                                        .strong()
-                                        .color(egui::Color32::WHITE)
-                                        .background_color(bg),
-                                )
-                                .on_hover_text(format!("Tomatometer: {word}"));
-                            }
-                            if let Some(m) = info.metascore {
-                                ui.label(egui::RichText::new(format!("Metascore {m}")).small());
-                            }
-                            ui.hyperlink_to("IMDb page", info.imdb_url());
-                            swarm(ui, e, now);
-                        });
-                        ui.label(egui::RichText::new(format!("{}   {sub}", e.title)).weak().small())
-                            .on_hover_text(if info.plot.is_empty() { "—".to_string() } else { info.plot.clone() });
                     });
-                });
-                ui.add_space(2.0);
-            }
+                    ui.add_space(2.0);
+                    }
+                    measured.push((n, ui.cursor().top() - row_top));
+                }
+            });
             if total == 0 {
                 let msg = if self.fv.in_flight > 0 && live_n == 0 {
                     "Reading feeds…".to_string()
@@ -3220,6 +3246,11 @@ impl App {
                 ui.label(egui::RichText::new(msg).weak());
             }
         });
+        for (n, h) in measured {
+            if let Some(x) = self.fv.row_h.get_mut(n) {
+                *x = h;
+            }
+        }
         let mut spent = false;
         for (key, query) in to_lookup {
             if !self.meta_cache.spend() {

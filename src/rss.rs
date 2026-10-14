@@ -10,6 +10,9 @@
 //! NEW item whose title matches is started automatically. Items already
 //! seen are remembered by link so a restart never re-downloads them.
 
+use regex::Regex;
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
 use std::{collections::HashSet, path::PathBuf};
 
 use quick_xml::{events::Event, Reader};
@@ -439,10 +442,8 @@ impl Cand {
             self.grabs = number_after(&description, r"(?:snatche?d?|completed|grabs|downloaded)");
         }
         if self.size.is_none() {
-            self.size = regex::Regex::new(r"(?i)\bsize\s*[:=]\s*([\d.,]+\s*[kmgt]?i?b)\b")
-                .ok()
-                .and_then(|re| re.captures(&description))
-                .and_then(|c| parse_size(c.get(1)?.as_str()));
+            static SIZE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bsize\s*[:=]\s*([\d.,]+\s*[kmgt]?i?b)\b").unwrap());
+            self.size = SIZE.captures(&description).and_then(|c| parse_size(c.get(1)?.as_str()));
         }
         if self.leechers.is_none() {
             if let (Some(p), Some(s)) = (self.peers, self.seeders) {
@@ -473,15 +474,24 @@ impl Cand {
     }
 }
 
+/// HTML tags, and scripts and styles with what is in them. Compiled once.
+static TAGS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)<(script|style)[^>]*>.*?</(script|style)>|<[^>]*>").unwrap());
+
 /// HTML in a description → one line of plain text.
 fn plain_text(html: &str) -> String {
-    let t = regex::Regex::new(r"(?s)<(script|style)[^>]*>.*?</(script|style)>|<[^>]*>").unwrap().replace_all(html, " ");
+    let t = TAGS.replace_all(html, " ");
     t.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// The number after a label: "Seeders: 12", "seeds=3", "Snatched 40 times".
 fn number_after(text: &str, label: &str) -> Option<u32> {
-    let re = regex::Regex::new(&format!(r"(?i)\b{label}\s*[:=]?\s*(\d{{1,9}})\b")).ok()?;
+    // One compiled pattern per label (a feed read asks for the same few on every item).
+    static CACHE: LazyLock<Mutex<HashMap<String, Option<Regex>>>> = LazyLock::new(Default::default);
+    let mut cache = CACHE.lock().unwrap();
+    let re = cache
+        .entry(label.to_string())
+        .or_insert_with(|| Regex::new(&format!(r"(?i)\b{label}\s*[:=]?\s*(\d{{1,9}})\b")).ok())
+        .as_ref()?;
     re.captures(text)?.get(1)?.as_str().parse().ok()
 }
 
@@ -669,9 +679,7 @@ pub fn check_torrent(body: &[u8]) -> anyhow::Result<()> {
 /// Short, readable version of a non-torrent reply (HTML tags stripped).
 fn describe(body: &[u8]) -> String {
     let text = String::from_utf8_lossy(&body[..body.len().min(4096)]);
-    let text = regex::Regex::new(r"(?s)<(script|style)[^>]*>.*?</(script|style)>|<[^>]*>")
-        .unwrap()
-        .replace_all(&text, " ");
+    let text = TAGS.replace_all(&text, " ");
     let mut out: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if out.chars().count() > 140 {
         out = out.chars().take(140).collect::<String>() + "…";

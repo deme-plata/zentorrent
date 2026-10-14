@@ -13,6 +13,8 @@
 //! - posters are size-capped (3 MB) and cached as files;
 //! - the key is never shown or logged.
 
+use regex::Regex;
+use std::sync::LazyLock;
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -69,6 +71,12 @@ impl Info {
 /// Returns None for things that are not films or series (music, games,
 /// software, sports dates, ...), so we never waste a lookup on them.
 pub fn guess(release: &str, category: &str) -> Option<Query> {
+    // Compiled once: `guess` runs for every feed row on every frame and for every
+    // history entry in a search (compiling them per call made a 6000-item history crawl).
+    static DAILY: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b(19|20)\d\d \d\d \d\d\b").unwrap());
+    static EPISODE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i) (S\d{1,2}(E\d{1,3})?|Season \d+) ").unwrap());
+    static YEAR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[ (\[]((?:19|20)\d\d)[ )\]]").unwrap());
+    static SPACES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").unwrap());
     let cat = category.to_lowercase();
     const SKIP: [&str; 12] =
         ["music", "mp3", "flac", "audio", "game", "app", "software", "ebook", "book", "xxx", "sport", "pc"];
@@ -80,17 +88,16 @@ pub fn guess(release: &str, category: &str) -> Option<Query> {
         .map(|c| if c == '.' || c == '_' { ' ' } else { c })
         .collect();
     // Daily shows / sports: 2026 09 26 → no single title to look up.
-    if regex::Regex::new(r"\b(19|20)\d\d \d\d \d\d\b").unwrap().is_match(&norm) {
+    if DAILY.is_match(&norm) {
         return None;
     }
     let padded = format!(" {norm} ");
-    let ep = regex::Regex::new(r"(?i) (S\d{1,2}(E\d{1,3})?|Season \d+) ").unwrap();
-    let ep_at = ep.find(&padded).map(|m| m.start());
+    let ep_at = EPISODE.find(&padded).map(|m| m.start());
     let limit = ep_at.unwrap_or(padded.len());
     // Year candidates: 1900–2027, standing alone or in brackets. Take the LAST
     // one before the episode marker that still leaves a title in front of it
     // ("Blade Runner 2049 (2017)", "1917 2019 1080p", "2001 A Space Odyssey 1968").
-    let yr = regex::Regex::new(r"[ (\[]((?:19|20)\d\d)[ )\]]").unwrap();
+    let yr = &*YEAR;
     let mut year_at = None;
     let mut pos = 0;
     while let Some(c) = yr.captures_at(&padded, pos) {
@@ -107,7 +114,7 @@ pub fn guess(release: &str, category: &str) -> Option<Query> {
         (None, None) => return None,
     };
     let series = ep_at.is_some() || cat.contains("tv");
-    let title = regex::Regex::new(r"\s+").unwrap().replace_all(padded[..cut].trim(), " ").to_string();
+    let title = SPACES.replace_all(padded[..cut].trim(), " ").to_string();
     let title = title.trim_end_matches(['-', '(', '[', ' ']).to_string();
     if !has_title(&title) {
         return None;
