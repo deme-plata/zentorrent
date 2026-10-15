@@ -37,6 +37,9 @@ pub struct Entry {
     pub goal_ratio: f64,
     #[serde(default)]
     pub goal_hours: f64,
+    /// The user's rating, 1–10 (Downloads list stars); 0 = not rated.
+    #[serde(default)]
+    pub rating: u8,
     /// librqbit's per-run counter as last seen (not saved: a new run starts at 0).
     #[serde(skip)]
     pub seen: u64,
@@ -135,6 +138,11 @@ impl Ledger {
     }
 
     /// Tag or un-tag a torrent; tagging also registers the label.
+    /// Rate a torrent 1–10; 0 clears the rating.
+    pub fn set_rating(&mut self, hash: &str, rating: u8) {
+        self.entries.entry(hash.to_string()).or_default().rating = rating.min(10);
+    }
+
     pub fn set_label(&mut self, hash: &str, label: &str, on: bool) {
         if on && !self.labels.iter().any(|l| l == label) {
             self.labels.push(label.to_string());

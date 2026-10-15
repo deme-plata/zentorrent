@@ -116,6 +116,8 @@ pub struct Facts {
     /// Tracker sites (see [`site`]), sorted and de-duplicated. Empty = DHT only.
     pub sites: Vec<String>,
     pub labels: Vec<String>,
+    /// The user's rating, 1–10; 0 = not rated.
+    pub rating: u8,
 }
 
 impl Facts {

@@ -27,10 +27,12 @@ pub enum Sort {
     Speed,
     Ratio,
     Status,
+    /// The user's own 1–10 rating.
+    Rating,
 }
 
 impl Sort {
-    const ALL: [Sort; 7] = [Sort::Added, Sort::Name, Sort::Size, Sort::Progress, Sort::Speed, Sort::Ratio, Sort::Status];
+    const ALL: [Sort; 8] = [Sort::Added, Sort::Name, Sort::Size, Sort::Progress, Sort::Speed, Sort::Ratio, Sort::Status, Sort::Rating];
     fn label(self) -> &'static str {
         match self {
             Sort::Added => "Added",
@@ -40,6 +42,7 @@ impl Sort {
             Sort::Speed => "Speed",
             Sort::Ratio => "Ratio",
             Sort::Status => "Status",
+            Sort::Rating => "Rating",
         }
     }
     /// Which way a fresh pick of this order goes: biggest / fastest first, names A→Z.
@@ -126,6 +129,8 @@ pub struct Key<'a> {
     /// Lower = needs attention first: error, downloading, paused, seeding, done.
     pub status: u8,
     pub media: Media,
+    /// The user's rating, 0–10.
+    pub rating: u8,
 }
 
 impl ListView {
@@ -161,6 +166,7 @@ impl ListView {
                 Sort::Speed => x.speed.total_cmp(&y.speed),
                 Sort::Ratio => x.ratio.total_cmp(&y.ratio),
                 Sort::Status => x.status.cmp(&y.status),
+                Sort::Rating => x.rating.cmp(&y.rating),
             }
             // Ties keep the order they were added in.
             .then_with(|| a.cmp(b))
@@ -253,6 +259,39 @@ fn layout_button(ui: &mut egui::Ui, on: bool, l: Layout) -> egui::Response {
     resp
 }
 
+/// Gold, for ratings.
+pub const GOLD: Color32 = Color32::from_rgb(245, 190, 40);
+
+/// Ten stars: the user's rating of a torrent, 1–10 (0 = not rated). Hovering shows what a
+/// click gives; returns the new rating on a click (clicking the current one clears it).
+pub fn stars(ui: &mut egui::Ui, rating: u8) -> Option<u8> {
+    let (size, gap) = (11.0, 1.5);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(10.0 * (size + gap), size + 3.0), egui::Sense::click());
+    let hover = resp.hover_pos().map(|p| (((p.x - rect.left()) / (size + gap)).floor() as i32 + 1).clamp(1, 10) as u8);
+    let shown = hover.unwrap_or(rating);
+    let dim = ui.visuals().weak_text_color().gamma_multiply(0.45);
+    for i in 1..=10u8 {
+        let c = egui::pos2(rect.left() + (i as f32 - 0.5) * (size + gap), rect.center().y);
+        let col = if i > shown {
+            dim
+        } else if hover.is_some() {
+            Color32::from_rgb(255, 220, 110)
+        } else {
+            GOLD
+        };
+        ui.painter().text(c, egui::Align2::CENTER_CENTER, "★", egui::FontId::proportional(size), col);
+    }
+    let tip = match hover {
+        Some(h) if h == rating => format!("Your rating: {h}/10 (click to clear)"),
+        Some(h) => format!("Rate it {h}/10"),
+        None if rating > 0 => format!("Your rating: {rating}/10"),
+        None => "Rate it 1–10".to_string(),
+    };
+    let clicked = resp.on_hover_text(tip).clicked();
+    let h = hover?;
+    clicked.then_some(if h == rating { 0 } else { h })
+}
+
 /// A colour per name, for artwork without a poster.
 pub fn tint(name: &str) -> Color32 {
     let h = name.bytes().fold(2166136261u32, |h, b| (h ^ b as u32).wrapping_mul(16777619));
@@ -291,7 +330,17 @@ mod tests {
     use super::*;
 
     fn key(name: &str, size: u64, speed: f64, media: Media) -> Option<Key<'_>> {
-        Some(Key { name, size, progress: 0.5, speed, ratio: 1.0, status: 1, media })
+        Some(Key { name, size, progress: 0.5, speed, ratio: 1.0, status: 1, media, rating: (size % 11) as u8 })
+    }
+
+    #[test]
+    fn sort_by_rating_best_first() {
+        // key() rates by size % 11: 8, 3, 0 (not rated), 10.
+        let keys = [key("a", 8, 0.0, Media::Audio), key("b", 3, 0.0, Media::Audio), key("c", 11, 0.0, Media::Audio), key("d", 10, 0.0, Media::Audio)];
+        let mut v = ListView::default();
+        v.sort = Sort::Rating;
+        v.desc = Sort::Rating.natural_desc();
+        assert_eq!(v.arrange(&keys), vec![3, 0, 1, 2], "10, 8, 3, then the unrated one");
     }
 
     #[test]

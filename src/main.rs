@@ -1178,6 +1178,7 @@ impl App {
                     size: s.total_bytes.max(e.map(|e| e.size).unwrap_or(0)),
                     sites,
                     labels: e.map(|e| e.labels.clone()).unwrap_or_default(),
+                    rating: e.map(|e| e.rating).unwrap_or(0),
                     hash,
                 }
             })
@@ -2820,6 +2821,7 @@ impl eframe::App for App {
                             ratio: f.ratio,
                             status: if f.error { 0 } else if !f.finished && !f.paused { 1 } else if f.paused { 2 } else if f.live { 3 } else { 4 },
                             media: medias[i],
+                            rating: f.rating,
                         })
                     })
                     .collect();
@@ -2844,16 +2846,17 @@ impl eframe::App for App {
             let mut relabel: Vec<(String, String, bool)> = Vec::new();
             let mut open_details: Option<String> = None;
             let mut play_req: Option<String> = None;
+            let mut rate_req: Option<(String, u8)> = None;
             let labels = self.ledger.labels.clone();
             let layout = self.list.layout;
             egui::ScrollArea::vertical().show(ui, |ui| {
-                let mut out = RowOut { relabel: &mut relabel, open_details: &mut open_details, play: &mut play_req, remove: &mut remove };
+                let mut out = RowOut { relabel: &mut relabel, open_details: &mut open_details, play: &mut play_req, remove: &mut remove, rate: &mut rate_req };
                 match layout {
                     listview::Layout::Cards => {
                         for &i in &order {
                             let (t, Some(f)) = (&self.transfers[i], self.facts.get(i)) else { continue };
                             let mut gone = false;
-                            transfer_row(ui, &self.rt, self.session.as_ref(), t, f, art.get(&i), &labels, out.relabel, out.open_details, out.play, || gone = true);
+                            transfer_row(ui, &self.rt, self.session.as_ref(), t, f, art.get(&i), &labels, out.relabel, out.open_details, out.play, out.rate, || gone = true);
                             if gone {
                                 *out.remove = Some(i);
                             }
@@ -2891,6 +2894,10 @@ impl eframe::App for App {
                 for (hash, label, on) in relabel {
                     self.ledger.set_label(&hash, &label, on);
                 }
+                self.save_ledger();
+            }
+            if let Some((hash, r)) = rate_req {
+                self.ledger.set_rating(&hash, r);
                 self.save_ledger();
             }
             if let Some(hash) = play_req {
@@ -3462,6 +3469,7 @@ fn transfer_row(
     relabel: &mut Vec<(String, String, bool)>,
     open_details: &mut Option<String>,
     play: &mut Option<String>,
+    rate: &mut Option<(String, u8)>,
     mut on_remove: impl FnMut(),
 ) {
     let s = t.handle.stats();
@@ -3571,7 +3579,14 @@ fn transfer_row(
                 if let Some(e) = &s.error {
                     line += &format!("  ·  error: {e}");
                 }
-                ui.label(egui::RichText::new(line).small().monospace());
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(line).small().monospace());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if let Some(r) = listview::stars(ui, f.rating) {
+                            *rate = Some((f.hash.clone(), r));
+                        }
+                    });
+                });
             });
         });
     });
@@ -3583,6 +3598,8 @@ struct RowOut<'a> {
     open_details: &'a mut Option<String>,
     play: &'a mut Option<String>,
     remove: &'a mut Option<usize>,
+    /// (info-hash, new rating 0–10)
+    rate: &'a mut Option<(String, u8)>,
 }
 
 /// Status of one torrent in a word, with its colour.
@@ -3646,6 +3663,13 @@ fn actions_menu(
             if ui.checkbox(&mut on, l.as_str()).changed() {
                 out.relabel.push((f.hash.clone(), l.clone(), on));
             }
+        }
+    });
+    let rate_label = if f.rating > 0 { format!("Rating: {}/10", f.rating) } else { "Rate…".to_string() };
+    ui.menu_button(rate_label, |ui| {
+        if let Some(r) = listview::stars(ui, f.rating) {
+            *out.rate = Some((f.hash.clone(), r));
+            ui.close();
         }
     });
     ui.separator();
@@ -3717,7 +3741,12 @@ fn compact_row(
 
     // The name gets what is left, cut with an ellipsis.
     let name_left = rect.left() + 44.0;
-    let name_w = (bar.left() - 14.0 - name_left).max(40.0);
+    // The user's rating, just left of the bar.
+    let rated = f.rating > 0;
+    if rated {
+        p.text(egui::pos2(bar.left() - 10.0, mid), egui::Align2::RIGHT_CENTER, format!("★{}", f.rating), egui::FontId::proportional(11.5), listview::GOLD);
+    }
+    let name_w = (bar.left() - if rated { 50.0 } else { 14.0 } - name_left).max(40.0);
     let mut job = egui::text::LayoutJob::single_section(t.name.clone(), egui::TextFormat::simple(egui::FontId::proportional(13.0), text));
     job.wrap = egui::text::TextWrapping::truncate_at_width(name_w);
     let galley = ui.fonts_mut(|fo| fo.layout_job(job));
@@ -3810,6 +3839,11 @@ fn thumb_tile(
     // Progress ring, bottom right of the artwork.
     let rc = egui::pos2(art.right() - 22.0, art.bottom() - 22.0);
     listview::ring(&p, rc, 14.0, frac, col);
+    if f.rating > 0 {
+        let badge = egui::Rect::from_min_size(art.min + egui::vec2(6.0, 6.0), egui::vec2(40.0, 18.0));
+        p.rect_filled(badge, 9.0, egui::Color32::from_black_alpha(170));
+        p.text(badge.center(), egui::Align2::CENTER_CENTER, format!("★ {}", f.rating), egui::FontId::proportional(11.5), listview::GOLD);
+    }
     let inner = if s.finished { "✔".to_string() } else { format!("{:.0}", frac * 100.0) };
     p.text(rc, egui::Align2::CENTER_CENTER, inner, egui::FontId::proportional(10.5), egui::Color32::WHITE);
     // ▶ on hover, for torrents that can play.
