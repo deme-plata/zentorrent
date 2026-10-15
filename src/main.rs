@@ -596,6 +596,9 @@ struct App {
     disk_at: Instant,
     disk_free: Option<f64>,
     space_paused: Vec<String>,
+    /// "Continue anyway" was pressed: downloads stop only at `diskguard::FLOOR_GB`
+    /// (until there is room again, then the normal guard is back).
+    space_anyway: bool,
     /// Kill switch on: the next try of the tunnel, and the one running.
     vpn_retry_at: Instant,
     vpn_retry: Option<tokio::task::JoinHandle<vpn::Vpn>>,
@@ -686,6 +689,7 @@ impl App {
             disk_at: Instant::now() - Duration::from_secs(60),
             disk_free: None,
             space_paused: Vec::new(),
+            space_anyway: false,
             vpn_retry_at: Instant::now() + VPN_RETRY,
             vpn_retry: None,
             waiting: Vec::new(),
@@ -1272,7 +1276,11 @@ impl App {
         }
         self.disk_at = Instant::now();
         self.disk_free = moe::ollama::free_disk_gb(&self.folder);
-        match diskguard::step(self.disk_free, !self.space_paused.is_empty()) {
+        // Room again: the normal guard is back for the next time the drive fills up.
+        if self.disk_free.is_some_and(|f| f >= diskguard::OK_GB) {
+            self.space_anyway = false;
+        }
+        match diskguard::step(self.disk_free, !self.space_paused.is_empty(), self.space_anyway) {
             diskguard::Step::Pause => {
                 let running: Vec<String> = self
                     .transfers
@@ -2644,15 +2652,51 @@ impl eframe::App for App {
             if let Some(err) = &self.session_error {
                 ui.colored_label(egui::Color32::LIGHT_RED, err);
             }
-            if !self.space_paused.is_empty() {
-                let free = self.disk_free.map(|f| format!("{f:.1} GB")).unwrap_or_else(|| "almost nothing".into());
+            let orange = egui::Color32::from_rgb(240, 170, 60);
+            let free = self.disk_free.map(|f| format!("{f:.1} GB")).unwrap_or_else(|| "almost nothing".into());
+            if !self.space_paused.is_empty() && self.space_anyway {
                 ui.colored_label(
-                    egui::Color32::from_rgb(240, 170, 60),
+                    orange,
                     format!(
-                        "⚠ The drive your downloads go to is nearly full ({free} free). ZenTorrent paused {} download(s) so Windows and your other programs keep working; they continue by themselves once {} GB are free. Free some space, or choose another Save to folder.",
+                        "⚠ The drive your downloads go to is full ({free} free). ZenTorrent paused {} download(s) at {} GB, also after Continue anyway, so Windows and your other programs keep working. Free some space, or choose another Save to folder; they continue by themselves once {} GB are free.",
                         self.space_paused.len(),
+                        diskguard::FLOOR_GB,
                         diskguard::OK_GB
                     ),
+                );
+            } else if !self.space_paused.is_empty() {
+                let mut go = false;
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(
+                        orange,
+                        format!(
+                            "⚠ The drive your downloads go to is nearly full ({free} free). ZenTorrent paused {} download(s) so Windows and your other programs keep working; they continue by themselves once {} GB are free. Free some space, or choose another Save to folder.",
+                            self.space_paused.len(),
+                            diskguard::OK_GB
+                        ),
+                    );
+                    go = ui
+                        .button("Continue anyway")
+                        .on_hover_text(format!(
+                            "Resume now and keep downloading until only {} GB are left. ZenTorrent stops there: at 0 bytes Windows and other programs stop working properly.",
+                            diskguard::FLOOR_GB
+                        ))
+                        .clicked();
+                });
+                if go {
+                    self.space_anyway = true;
+                    for h in std::mem::take(&mut self.space_paused) {
+                        self.set_paused(&h, false);
+                    }
+                }
+            } else if self.space_anyway && self.disk_free.is_some_and(|f| f < diskguard::LOW_GB) {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Continuing with little space: {free} free on the drive your downloads go to. ZenTorrent stops at {} GB.",
+                        diskguard::FLOOR_GB
+                    ))
+                    .small()
+                    .color(orange),
                 );
             }
             if busy > 0 {

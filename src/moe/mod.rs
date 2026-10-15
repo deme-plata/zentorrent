@@ -872,7 +872,11 @@ fn bubble(ui: &mut egui::Ui, text: &str, fill: Color32, right: bool) {
     ui.with_layout(layout, |ui| {
         egui::Frame::new().fill(fill).corner_radius(8.0).inner_margin(egui::Margin::same(8)).show(ui, |ui| {
             ui.set_max_width(ui.available_width() * 0.8);
-            ui.label(text);
+            // Top-down inside the bubble: in a question's right-to-left layout a label does
+            // not wrap, it grows to the left past the edge, and its start was cut off.
+            ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                ui.add(egui::Label::new(text).wrap().selectable(true));
+            });
         });
     });
     ui.add_space(4.0);
