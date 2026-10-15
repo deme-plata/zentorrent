@@ -36,6 +36,9 @@ finds nothing, say so plainly.
 user did not say.
 - To play, call play with the torrent's name (and a track if they asked for one). It starts at once.
 - Playlists: take the exact file paths from scan_folder or torrent_files — never make a path up. Then make_playlist.
+- \"Make a <mood> mix and play it\": scan_folder, pick the tracks, then call make_playlist with play=true — in the \
+same answer, without asking first. Only say a playlist is saved, or that something is playing, after the tool \
+returned it; saying it does not do it.
 - Organizing a folder:
   1. scan_folder first.
   2. Choose clear target folders. Music by genre (Trance, Progressive House, House, Techno, Drum & Bass, Dubstep, \
@@ -49,6 +52,46 @@ Apply and Cancel, IS the question. They press Apply. Never say files were \
 moved before they apply; the tool tells you when something was refused, and why.
 - Never ask for, show or repeat passwords, passkeys, cookies or links with keys in them.
 - If a request is unclear, ask one short question instead of guessing.";
+
+/// What an answer says was done without the tool that does it having been called this turn
+/// (`used`): the note that sends the model back to really do it, else None. Small models do
+/// this: on 2026-10-15 qwen3:4b only scanned, then wrote "Playlist saved … Now playing", and
+/// nothing played.
+pub fn unbacked_claim(answer: &str, used: &[String]) -> Option<String> {
+    use regex::Regex;
+    use std::sync::LazyLock;
+    static PLAY: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)\b(now playing|is (now )?playing|started playing|playing (it|them) now|spiller nu|afspiller nu)\b").unwrap()
+    });
+    static SAVED: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)(playlist (is |has been |was )?saved|saved (it )?as [^\n]{0,60}\.m3u8?|playliste(n)? (er )?gemt|gemt som)").unwrap()
+    });
+    static MOVED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\b(i('ve| have) moved|(files|folders) (were|have been) moved|er flyttet)\b").unwrap());
+    static DOWNLOAD: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)\b(started (the |your )?download|(is )?downloading (it |them )?now|henter nu)\b").unwrap());
+    let did = |t: &str| used.iter().any(|u| u == t);
+    let mut missing = Vec::new();
+    if PLAY.is_match(answer) && !did("play") && !did("make_playlist") {
+        missing.push("play (or make_playlist with play=true)");
+    }
+    if SAVED.is_match(answer) && !did("make_playlist") {
+        missing.push("make_playlist");
+    }
+    if MOVED.is_match(answer) && !did("propose_moves") {
+        missing.push("propose_moves");
+    }
+    if DOWNLOAD.is_match(answer) && !did("download") {
+        missing.push("download");
+    }
+    (!missing.is_empty()).then(|| {
+        format!(
+            "[ZenTorrent] Nothing happened: your answer says it was done, but you called no tool for it, so nothing was \
+             saved, moved or started. Do it now by calling {} with the exact paths and names the tools gave you — call \
+             the tool, do not describe it. If you cannot, say plainly that you did not do it.",
+            missing.join(" and ")
+        )
+    })
+}
 
 /// The system prompt for this library: the skill, plus where the user's files are.
 pub fn system(lib: &Library) -> String {

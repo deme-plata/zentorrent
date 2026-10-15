@@ -950,15 +950,31 @@ async fn agent(
 ) -> Result<Vec<Value>, String> {
     let tools = skills::tools();
     let first_new = messages.len();
+    // The tools called this turn, and whether the model was already sent back once for
+    // claiming something it did not do.
+    let mut used: Vec<String> = Vec::new();
+    let mut nudged = false;
     for _ in 0..MAX_STEPS {
         let reply = ollama::chat(base, model, &messages, &tools, cpu_only, |t| on(Ev::Text(t.to_string()))).await?;
         on(Ev::Stats(reply.stats));
         messages.push(json!({"role": "assistant", "content": reply.content, "tool_calls": reply.tool_calls}));
         if reply.tool_calls.is_empty() {
+            // "Now playing…" with no play: nothing happened. Send it back once to really do it.
+            match skills::unbacked_claim(&reply.content, &used) {
+                Some(note) if !nudged => {
+                    nudged = true;
+                    on(Ev::Tool("it said it was done without doing it — asked it to really do it".into()));
+                    messages.push(json!({"role": "user", "content": note}));
+                    continue;
+                }
+                Some(_) => on(Ev::Tool("it said it was done, but called no tool: nothing was started or saved".into())),
+                None => {}
+            }
             return Ok(messages.split_off(first_new));
         }
         for call in &reply.tool_calls {
             let name = call["function"]["name"].as_str().unwrap_or("");
+            used.push(name.to_string());
             // Some models send the arguments as a JSON string.
             let args = match &call["function"]["arguments"] {
                 Value::String(s) => serde_json::from_str(s).unwrap_or(Value::Null),
@@ -1114,6 +1130,58 @@ mod tests {
         assert!(evs.iter().any(|e| matches!(e, Ev::Action(Action::Download { title, .. }) if title == "Trance Classics 2026")));
         assert_eq!(out.last().unwrap()["content"], "Waiting for you to press Download.");
         assert_eq!(out.iter().filter(|m| m["role"] == "tool").count(), 2);
+    }
+
+    /// 2026-10-15: "workout mix do it now and play" — the model scanned, then wrote "Playlist
+    /// saved … Now playing" without calling make_playlist, and nothing played. Now it is
+    /// sent back, makes the playlist, and the player gets the files.
+    #[test]
+    fn a_claim_without_the_tool_is_sent_back_and_then_done() {
+        let dir = std::env::temp_dir().join(format!("zt-claim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("01 - Distant Space.flac"), dir.join("02 - Undeniable.flac"));
+        std::fs::write(&a, b"fLaC").unwrap();
+        std::fs::write(&b, b"fLaC").unwrap();
+        let (pa, pb) = (a.to_string_lossy().into_owned(), b.to_string_lossy().into_owned());
+        let (base, server) = fake_ollama(vec![
+            vec![json!({"message": {"content": "", "tool_calls": [{"function": {"name": "scan_folder", "arguments": {}}}]}, "done": true})],
+            vec![json!({"message": {"content": "Here's your Workout Mix. ✅ Playlist saved as Workout Mix.m3u8. Now playing: Distant Space!"}, "done": true})],
+            vec![json!({"message": {"content": "", "tool_calls": [{"function": {"name": "make_playlist",
+                "arguments": {"name": "Workout Mix", "files": [pa, pb], "play": true}}}]}, "done": true})],
+            vec![json!({"message": {"content": "Done — Workout Mix is playing."}, "done": true})],
+        ]);
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let events = Mutex::new(Vec::new());
+        let on = |e: Ev| events.lock().unwrap().push(e);
+        let memory = Mutex::new(Memory::default());
+        let lib = Library { folder: dir.clone(), ..Default::default() };
+        let msgs = vec![json!({"role": "system", "content": skills::SYSTEM}), json!({"role": "user", "content": "workout mix do it now and play"})];
+        rt.block_on(agent(&base, "qwen3:4b", msgs, true, &lib, &memory, &on)).unwrap();
+        let requests = server.join().unwrap();
+
+        assert_eq!(requests.len(), 4, "scan, false claim, the tool after the nudge, the answer");
+        let nudge = requests[2]["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap().to_string();
+        assert!(nudge.starts_with("[ZenTorrent] Nothing happened") && nudge.contains("make_playlist"), "{nudge}");
+        let evs = events.into_inner().unwrap();
+        assert!(evs.iter().any(|e| matches!(e, Ev::Tool(t) if t.contains("without doing it"))), "the user sees it was sent back");
+        assert!(
+            evs.iter().any(|e| matches!(e, Ev::Action(Action::PlayFiles { name, files }) if name == "Workout Mix" && files.len() == 2)),
+            "the player gets the playlist"
+        );
+        assert!(dir.join("Playlists/Workout Mix.m3u8").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn claims_need_their_tool() {
+        let said = "✅ Playlist saved as Workout Mix.m3u8 in your Downloads/Playlists/ folder. Now playing: \"Distant Space\"";
+        let note = skills::unbacked_claim(said, &["scan_folder".into()]).unwrap();
+        assert!(note.contains("play (or make_playlist with play=true)") && note.contains("make_playlist"));
+        assert_eq!(skills::unbacked_claim(said, &["make_playlist".into()]), None, "it did make (and play) it");
+        assert_eq!(skills::unbacked_claim("Would you like me to make a playlist and play it?", &[]), None, "an offer is not a claim");
+        assert!(skills::unbacked_claim("Jeg har lavet listen, den spiller nu.", &[]).is_some(), "Danish too");
+        assert!(skills::unbacked_claim("I've moved the albums into Trance.", &["scan_folder".into()]).is_some());
     }
 
     #[test]
