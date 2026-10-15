@@ -15,6 +15,7 @@ pub mod ffi;
 pub mod playlist;
 pub mod stream;
 pub mod ui;
+pub mod vis;
 
 use std::path::PathBuf;
 use std::sync::Arc;

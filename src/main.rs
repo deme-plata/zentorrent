@@ -2069,7 +2069,22 @@ impl App {
             return;
         }
         let pui = &mut self.pui;
+        // The music visualizer: the playing track's analysis (a downloaded audio file).
+        let track = p.queue.current().cloned();
+        let audio = track.as_ref().is_some_and(|t| matches!(t.kind, player::playlist::Kind::Audio) && t.archive.is_none());
+        let local = track.as_ref().filter(|t| audio && files.complete(t.file)).map(|t| p.queue.folder.join(&t.path));
+        let (time, playing) = p.live.lock().map(|l| (l.time, !l.paused)).unwrap_or((0.0, false));
+        let bands = pui.vis.bands(local.as_deref(), time, playing);
         egui::Panel::bottom("player").show(root, |ui| player::ui::bar(ui, p, pui, &files));
+        if audio && !pui.hide_vis {
+            let note = local.is_none().then_some("The visualizer starts once this track has downloaded.");
+            egui::Panel::bottom("visualizer")
+                .resizable(true)
+                .default_size(220.0)
+                .size_range(120.0..=520.0)
+                .show(root, |ui| player::vis::show(ui, &bands, note));
+            ctx.request_repaint_after(Duration::from_millis(33));
+        }
         if pui.show_playlist {
             egui::Panel::right("playlist").resizable(true).default_size(300.0).size_range(220.0..=520.0).show(root, |ui| {
                 player::ui::playlist(ui, p, &files)
@@ -2077,7 +2092,7 @@ impl App {
         }
         if pui.show_sound {
             let mut open = true;
-            player::ui::sound(ctx, p, &mut open);
+            player::ui::sound(ctx, p, &mut open, audio.then_some(&bands));
             pui.show_sound = open;
         }
     }

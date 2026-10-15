@@ -22,6 +22,9 @@ lofty = "0.22"
 hex = "0.4"
 # "Delete the files too": to the Recycle Bin / trash, not gone for good.
 trash = "5.2"
+# The music visualizer: decode the playing track and cut it into frequency bands.
+symphonia = { version = "0.5", features = ["mp3", "aac", "isomp4", "alac"] }
+rustfft = "6.4"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 regex = "1"
 anyhow = "1"

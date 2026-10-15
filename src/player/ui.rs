@@ -10,6 +10,9 @@ use super::playlist::Track;
 pub struct PlayerUi {
     pub show_playlist: bool,
     pub show_sound: bool,
+    /// The visualizer is shown for music unless turned off here.
+    pub hide_vis: bool,
+    pub vis: super::vis::Vis,
     /// Seek-slider position while it is being dragged.
     seek_drag: Option<f64>,
 }
@@ -91,6 +94,9 @@ pub fn bar(ui: &mut egui::Ui, p: &mut Player, pu: &mut PlayerUi, files: &Files) 
             }
             if ui.selectable_label(pu.show_playlist, "Playlist").clicked() {
                 pu.show_playlist = !pu.show_playlist;
+            }
+            if ui.selectable_label(!pu.hide_vis, "Visualizer").on_hover_text("The music, drawn as a swarm").clicked() {
+                pu.hide_vis = !pu.hide_vis;
             }
             if ui.selectable_label(pu.show_sound, "Sound").on_hover_text("Equalizer and sound settings").clicked() {
                 pu.show_sound = !pu.show_sound;
@@ -216,9 +222,14 @@ pub fn playlist(ui: &mut egui::Ui, p: &mut Player, files: &Files) {
 }
 
 /// The Sound window: 10-band equalizer with presets, and the other sound settings.
-pub fn sound(ctx: &egui::Context, p: &mut Player, open: &mut bool) {
+pub fn sound(ctx: &egui::Context, p: &mut Player, open: &mut bool, bands: Option<&[f32; super::vis::BANDS]>) {
     let mut apply = false;
     egui::Window::new("Sound").open(open).resizable(false).default_width(560.0).show(ctx, |ui| {
+        // What is playing, live, above the equalizer.
+        if let Some(b) = bands {
+            super::vis::spectrum(ui, b, 56.0);
+            ui.add_space(6.0);
+        }
         ui.horizontal(|ui| {
             ui.label("Preset");
             egui::ComboBox::from_id_salt("zt-eq-preset").selected_text(p.sound.preset.clone()).show_ui(ui, |ui| {
