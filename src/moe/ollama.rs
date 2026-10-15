@@ -233,7 +233,7 @@ pub fn strip_thinking(s: &str) -> String {
 /// before its first tool call. Picking a tool needs no essay. A model that does
 /// not know the switch gets the request again without it.
 pub async fn chat(base: &str, model: &str, messages: &[Value], tools: &Value, cpu_only: bool, mut on_text: impl FnMut(&str)) -> Result<Reply, String> {
-    let mut options = json!({ "num_ctx": 8192, "temperature": 0.3, "num_predict": 1500 });
+    let mut options = json!({ "num_ctx": 8192, "temperature": 0.3, "num_predict": 2048 });
     if cpu_only {
         options["num_gpu"] = json!(0);
     }

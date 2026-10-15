@@ -35,7 +35,8 @@ finds nothing, say so plainly.
 - “Best / top torrents” without a topic: search_feeds with NO query and sort=top. Never add a genre or a word the \
 user did not say.
 - To play, call play with the torrent's name (and a track if they asked for one). It starts at once.
-- Playlists: take the exact file paths from scan_folder or torrent_files — never make a path up. Then make_playlist.
+- Playlists: torrent_files and scan_folder give every playable file a number (id). make_playlist takes those \
+ids — a 30-track mix is 30 numbers, never paths. Never make up an id.
 - \"Make a <mood> mix and play it\": scan_folder, pick the tracks, then call make_playlist with play=true — in the \
 same answer, without asking first. Only say a playlist is saved, or that something is playing, after the tool \
 returned it; saying it does not do it.
@@ -127,8 +128,8 @@ pub fn tools() -> Value {
         tool("scan_folder", "Summarise a folder: each sub-folder with media (an album, film or season) with its embedded \
               tags, and loose media files. Default: the download folder.",
             json!({"path": {"type":"string","description":"folder to scan; omit for the download folder"}}), &[]),
-        tool("make_playlist", "Save a playlist (.m3u8 in the download folder's Playlists folder) from file paths that \
-              scan_folder or torrent_files returned, and optionally play it.",
+        tool("make_playlist", "Save a playlist (.m3u8 in the download folder's Playlists folder) from the file ids that \
+              torrent_files or scan_folder gave, and optionally play it (play=true).",
             json!({"name": {"type":"string"},
                    "files": {"type":"array","items":{"type":"string"},"description":"paths as the tools gave them"},
                    "play": {"type":"boolean"}}), &["name", "files"]),
@@ -241,6 +242,10 @@ impl Action {
 pub struct Memory {
     /// search_feeds ids → feed entries.
     pub results: Vec<history::Entry>,
+    /// Playable files the tools have shown, by id (id = index + 1): make_playlist takes the
+    /// ids, so the model writes "[3, 7, 12]" instead of 30 long paths (on 2026-10-15 a mix of
+    /// three albums' paths ran past the reply limit and the call arrived cut off).
+    pub files: Vec<PathBuf>,
     /// Folders the user's scans named: moves stay inside them.
     pub roots: Vec<PathBuf>,
 }
@@ -313,21 +318,34 @@ pub fn run(name: &str, args: &Value, lib: &Library, mem: &mut Memory) -> Outcome
         "torrent_files" => match find(lib, &s("torrent")) {
             Err(e) => error(e),
             Ok(t) => {
+                // Names relative to the torrent's folder (given once), an id per playable file,
+                // and no .nfo/.sfv/.jpg lines: a fraction of the tokens full paths cost.
+                let mut others = 0;
                 let files: Vec<Value> = t
                     .files
                     .iter()
                     .take(400)
-                    .map(|(p, len)| {
+                    .filter_map(|(p, len)| {
                         let kind = match kind_of(p) {
                             Some(playlist::Kind::Audio) => "audio",
                             Some(playlist::Kind::Video) => "video",
                             None if crate::player::archive::may_hold_media(p) => "archive",
-                            None => "other",
+                            None => {
+                                others += 1;
+                                return None;
+                            }
                         };
-                        json!({ "path": t.root.join(p).to_string_lossy(), "kind": kind, "mb": mb(*len) })
+                        let mut o = json!({ "name": p, "kind": kind, "mb": mb(*len) });
+                        if kind != "archive" {
+                            o["id"] = json!(file_id(mem, t.root.join(p)));
+                        }
+                        Some(o)
                     })
                     .collect();
-                data(json!({ "torrent": t.name, "files": files }), format!("listed the files of {}", t.name))
+                data(
+                    json!({ "torrent": t.name, "folder": t.root.to_string_lossy(), "files": files, "other_files": others }),
+                    format!("listed the files of {}", t.name),
+                )
             }
         },
         "search_feeds" => {
@@ -429,7 +447,17 @@ pub fn run(name: &str, args: &Value, lib: &Library, mem: &mut Memory) -> Outcome
             if !mem.roots.contains(&root) {
                 mem.roots.push(root.clone());
             }
-            let summary = organize::scan(&root);
+            let mut summary = organize::scan(&root);
+            // Loose tracks get an id too, for make_playlist.
+            if let Some(loose) = summary["loose_files"].as_array_mut() {
+                for o in loose {
+                    if let Some(f) = o["file"].as_str().map(|f| root.join(f)) {
+                        if kind_of(&f.to_string_lossy()).is_some() {
+                            o["id"] = json!(file_id(mem, f));
+                        }
+                    }
+                }
+            }
             let n = summary["media_files"].as_u64().unwrap_or(0);
             data(summary, format!("scanned {} ({n} media files)", root.display()))
         }
@@ -438,7 +466,15 @@ pub fn run(name: &str, args: &Value, lib: &Library, mem: &mut Memory) -> Outcome
             let name = if name.trim().is_empty() { "Flux MoE playlist".to_string() } else { name.trim().to_string() };
             let mut files = Vec::new();
             let mut skipped = Vec::new();
-            for f in args.get("files").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
+            for v in args.get("files").and_then(Value::as_array).into_iter().flatten() {
+                // An id (3 or "3") as the tools gave it, else a path.
+                let id = v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()));
+                let f = match (id, v.as_str()) {
+                    (Some(n), _) => mem.files.get((n as usize).wrapping_sub(1)).map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
+                    (None, Some(s)) => s.to_string(),
+                    (None, None) => continue,
+                };
+                let f = f.as_str();
                 let p = resolve(f, mem, lib);
                 if p.as_ref().is_some_and(|p| p.is_file() && kind_of(&p.to_string_lossy()).is_some()) {
                     files.push(p.unwrap());
@@ -447,7 +483,7 @@ pub fn run(name: &str, args: &Value, lib: &Library, mem: &mut Memory) -> Outcome
                 }
             }
             if files.is_empty() {
-                return error("none of those files exist — take the paths from scan_folder or torrent_files");
+                return error("none of those files exist — use the ids torrent_files or scan_folder gave");
             }
             let dir = lib.folder.join("Playlists");
             let path = dir.join(format!("{name}.m3u8"));
@@ -499,6 +535,17 @@ fn torrent_paths(t: &Torrent) -> Vec<PathBuf> {
 }
 
 /// A path the model wrote: absolute, or relative to the last scanned folder.
+/// The id of a playable file the tools show (the same file keeps its id in this chat).
+fn file_id(mem: &mut Memory, path: PathBuf) -> usize {
+    match mem.files.iter().position(|p| *p == path) {
+        Some(i) => i + 1,
+        None => {
+            mem.files.push(path);
+            mem.files.len()
+        }
+    }
+}
+
 fn resolve(p: &str, mem: &Memory, lib: &Library) -> Option<PathBuf> {
     let p = Path::new(p.trim());
     if p.is_absolute() {

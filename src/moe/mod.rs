@@ -954,8 +954,23 @@ async fn agent(
     // claiming something it did not do.
     let mut used: Vec<String> = Vec::new();
     let mut nudged = false;
+    let mut cut_off = false;
     for _ in 0..MAX_STEPS {
-        let reply = ollama::chat(base, model, &messages, &tools, cpu_only, |t| on(Ev::Text(t.to_string()))).await?;
+        let reply = match ollama::chat(base, model, &messages, &tools, cpu_only, |t| on(Ev::Text(t.to_string()))).await {
+            Ok(r) => r,
+            // A tool call cut off mid-way (Ollama: "invalid tool call arguments … unexpected end
+            // of JSON input"): once, ask for a shorter one instead of ending the answer.
+            Err(e) if e.contains("invalid tool call arguments") && !cut_off => {
+                cut_off = true;
+                on(Ev::Tool("its tool call was cut off — asked it for a shorter one".into()));
+                messages.push(json!({"role": "user", "content":
+                    "[ZenTorrent] Your last tool call was cut off before it ended, so it did not run. Call it again, \
+                     shorter: for make_playlist give the file ids (numbers) torrent_files or scan_folder returned, \
+                     not paths, and at most 40 tracks."}));
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         on(Ev::Stats(reply.stats));
         messages.push(json!({"role": "assistant", "content": reply.content, "tool_calls": reply.tool_calls}));
         if reply.tool_calls.is_empty() {
@@ -1170,6 +1185,56 @@ mod tests {
             "the player gets the playlist"
         );
         assert!(dir.join("Playlists/Workout Mix.m3u8").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 2026-10-15: "mix playlist from torrents and start play" — three torrent_files listings,
+    /// then make_playlist with the full paths, cut off ("unexpected end of JSON input").
+    /// Now the listing gives ids, a cut-off call is sent back once, and ids make the playlist.
+    #[test]
+    fn a_cut_off_tool_call_is_retried_and_ids_make_the_playlist() {
+        let dir = std::env::temp_dir().join(format!("zt-ids-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let album = dir.join("ASOT 1298");
+        std::fs::create_dir_all(&album).unwrap();
+        for f in ["01-intro.flac", "02-trance.flac", "album.nfo"] {
+            std::fs::write(album.join(f), b"x").unwrap();
+        }
+        let torrent = skills::Torrent {
+            hash: "h".into(),
+            name: "Armin van Buuren - A State of Trance 1298".into(),
+            state: "seeding".into(),
+            progress: 1.0,
+            files: vec![("01-intro.flac".into(), 1 << 20), ("02-trance.flac".into(), 1 << 20), ("album.nfo".into(), 100)],
+            root: album.clone(),
+            ..Default::default()
+        };
+        let (base, server) = fake_ollama(vec![
+            vec![json!({"message": {"content": "", "tool_calls": [{"function": {"name": "torrent_files", "arguments": {"torrent": "State of Trance"}}}]}, "done": true})],
+            // What Ollama says when the model's arguments were cut off.
+            vec![json!({"error": "llama-server returned invalid tool call arguments for \"make_playlist\": unexpected end of JSON input"})],
+            vec![json!({"message": {"content": "", "tool_calls": [{"function": {"name": "make_playlist",
+                "arguments": {"name": "Trance Mix", "files": [1, "2"], "play": true}}}]}, "done": true})],
+            vec![json!({"message": {"content": "Trance Mix is playing."}, "done": true})],
+        ]);
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let events = Mutex::new(Vec::new());
+        let on = |e: Ev| events.lock().unwrap().push(e);
+        let memory = Mutex::new(Memory::default());
+        let lib = Library { folder: dir.clone(), torrents: vec![torrent], ..Default::default() };
+        let msgs = vec![json!({"role": "system", "content": skills::SYSTEM}), json!({"role": "user", "content": "mix playlist from torrents and start play"})];
+        let r = rt.block_on(agent(&base, "qwen3:4b", msgs, true, &lib, &memory, &on));
+        let requests = server.join().unwrap();
+        assert!(r.is_ok(), "{r:?}");
+
+        // The listing: names and ids, no full paths, the .nfo only counted.
+        let listing = requests[1]["messages"].as_array().unwrap().iter().find(|m| m["role"] == "tool").unwrap()["content"].as_str().unwrap().to_string();
+        assert!(listing.contains("\"id\":1") && listing.contains("\"id\":2") && listing.contains("\"other_files\":1"), "{listing}");
+        assert!(!listing.contains(&album.join("01-intro.flac").to_string_lossy().to_string()), "no full paths per file: {listing}");
+        let retry = requests[2]["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap().to_string();
+        assert!(retry.contains("cut off") && retry.contains("ids"), "{retry}");
+        let evs = events.into_inner().unwrap();
+        assert!(evs.iter().any(|e| matches!(e, Ev::Action(Action::PlayFiles { files, .. }) if files == &[album.join("01-intro.flac"), album.join("02-trance.flac")])));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
