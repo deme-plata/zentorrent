@@ -225,16 +225,11 @@ impl Cache {
     }
 
     pub fn load() -> Self {
-        std::fs::read(Self::path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+        crate::db::load("omdb-cache", Some(&Self::path())).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
     }
 
     pub fn save(&self) {
-        let p = Self::path();
-        let _ = std::fs::create_dir_all(p.parent().unwrap());
-        let tmp = p.with_extension("json.tmp");
-        if std::fs::write(&tmp, serde_json::to_vec(self).unwrap_or_default()).is_ok() {
-            let _ = std::fs::rename(tmp, p);
-        }
+        let _ = crate::db::save("omdb-cache", &serde_json::to_vec(self).unwrap_or_default());
     }
 
     /// Some(answer) if we have a fresh cached answer (answer may be "not found").

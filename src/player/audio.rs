@@ -99,14 +99,11 @@ impl Sound {
     }
 
     pub fn load() -> Sound {
-        Self::path().and_then(|p| std::fs::read(p).ok()).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+        crate::db::load("player", Self::path().as_deref()).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
     }
 
     pub fn save(&self) {
-        if let Some(p) = Self::path() {
-            let _ = std::fs::create_dir_all(p.parent().unwrap());
-            let _ = std::fs::write(p, serde_json::to_vec_pretty(self).unwrap_or_default());
-        }
+        let _ = crate::db::save("player", &serde_json::to_vec_pretty(self).unwrap_or_default());
     }
 }
 

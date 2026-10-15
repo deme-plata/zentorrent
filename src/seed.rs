@@ -111,19 +111,11 @@ impl Ledger {
     }
 
     pub fn load() -> Self {
-        std::fs::read(Self::path())
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default()
+        crate::db::load("ledger", Some(&Self::path())).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
     }
 
     pub fn save(&self) -> anyhow::Result<()> {
-        let p = Self::path();
-        std::fs::create_dir_all(p.parent().unwrap())?;
-        let tmp = p.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
-        std::fs::rename(tmp, p)?;
-        Ok(())
+        crate::db::save("ledger", &serde_json::to_vec_pretty(self)?).map_err(anyhow::Error::msg)
     }
 
     /// The goal settings without the entries (cheap copy for borrow-free checks).

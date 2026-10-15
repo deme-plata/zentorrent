@@ -131,8 +131,7 @@ pub fn store_path() -> Option<PathBuf> {
 
 impl FeedStore {
     pub fn load() -> Self {
-        let mut s: FeedStore = store_path()
-            .and_then(|p| std::fs::read(p).ok())
+        let mut s: FeedStore = crate::db::load("feeds", store_path().as_deref())
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
         if s.refresh_minutes == 0 {
@@ -142,17 +141,7 @@ impl FeedStore {
     }
 
     pub fn save(&self) -> anyhow::Result<()> {
-        let path = store_path().ok_or_else(|| anyhow::anyhow!("no config dir"))?;
-        std::fs::create_dir_all(path.parent().unwrap())?;
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-        }
-        std::fs::rename(tmp, path)?;
-        Ok(())
+        crate::db::save("feeds", &serde_json::to_vec_pretty(self)?).map_err(anyhow::Error::msg)
     }
 }
 

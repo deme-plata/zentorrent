@@ -135,16 +135,13 @@ pub struct Key<'a> {
 
 impl ListView {
     pub fn load() -> Self {
-        let v: Option<serde_json::Value> = std::fs::read(crate::prefs_path()).ok().and_then(|b| serde_json::from_slice(&b).ok());
-        v.and_then(|v| serde_json::from_value(v["list"].clone()).ok()).unwrap_or_default()
+        serde_json::from_value(crate::prefs()["list"].clone()).unwrap_or_default()
     }
 
     fn save(&self) {
-        let path = crate::prefs_path();
-        let mut v: serde_json::Value = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_else(|| serde_json::json!({}));
+        let mut v = crate::prefs();
         v["list"] = serde_json::to_value(self).unwrap_or_default();
-        let _ = std::fs::create_dir_all(crate::seed::data_dir());
-        let _ = std::fs::write(&path, serde_json::to_vec_pretty(&v).unwrap_or_default());
+        crate::save_prefs(&v);
     }
 
     /// Indexes of the torrents to show, in order (`keys[i]` belongs to torrent `i`;

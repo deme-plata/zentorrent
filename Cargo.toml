@@ -25,6 +25,8 @@ trash = "5.2"
 # The music visualizer: decode the playing track and cut it into frequency bands.
 symphonia = { version = "0.5", features = ["mp3", "aac", "isomp4", "alac"] }
 rustfft = "6.4"
+# ZenTorrent's own data (settings, ledger, RSS, caches): flux-db from the public flux repo, pinned.
+flux-db = { git = "https://github.com/deme-plata/flux", rev = "a37b3771aaca568e4c96c79bd280955ec5df83e1" }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 regex = "1"
 anyhow = "1"

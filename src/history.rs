@@ -171,8 +171,7 @@ impl History {
     }
 
     pub fn load() -> Self {
-        let mut h: History = std::fs::read(Self::path())
-            .ok()
+        let mut h: History = crate::db::load("history", Some(&Self::path()))
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_else(|| History { enabled: true, ..Default::default() });
         h.reindex();
@@ -180,17 +179,8 @@ impl History {
     }
 
     pub fn save(&mut self) -> anyhow::Result<()> {
-        let p = Self::path();
-        std::fs::create_dir_all(p.parent().unwrap())?;
-        let tmp = p.with_extension("json.tmp");
         // Compact: tens of thousands of items; nobody reads this by hand.
-        std::fs::write(&tmp, serde_json::to_vec(self)?)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-        }
-        std::fs::rename(tmp, p)?;
+        crate::db::save("history", &serde_json::to_vec(self)?).map_err(anyhow::Error::msg)?;
         self.dirty = false;
         Ok(())
     }

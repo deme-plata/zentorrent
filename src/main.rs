@@ -26,6 +26,7 @@ const FEED_RETRY: Duration = Duration::from_secs(60);
 mod assoc;
 mod autostart;
 mod cover;
+mod db;
 mod details;
 mod diskguard;
 mod engine;
@@ -2306,38 +2307,39 @@ fn spawn_meta_worker(
     tx
 }
 
-/// Where "Save to" is remembered between runs.
-fn prefs_path() -> PathBuf {
-    seed::data_dir().join("prefs.json")
+/// All preferences, one JSON object in the store ("Save to", the list layout, the
+/// Windows switches…); prefs.json before 0.10.10.
+fn prefs() -> serde_json::Value {
+    db::load("prefs", Some(&seed::data_dir().join("prefs.json")))
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_else(|| serde_json::json!({}))
+}
+
+fn save_prefs(v: &serde_json::Value) {
+    if let Err(e) = db::save("prefs", &serde_json::to_vec_pretty(v).unwrap_or_default()) {
+        eprintln!("{e}");
+    }
 }
 
 /// The "Save to" folder the user last chose, if it still exists.
 fn saved_folder() -> Option<PathBuf> {
-    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(prefs_path()).ok()?).ok()?;
-    Some(PathBuf::from(v["save_to"].as_str()?)).filter(|p| p.is_dir())
+    Some(PathBuf::from(prefs()["save_to"].as_str()?)).filter(|p| p.is_dir())
 }
 
 fn remember_folder(dir: &std::path::Path) {
     set_pref("save_to", serde_json::json!(dir.to_string_lossy()));
 }
 
-/// One setting from prefs.json.
+/// One setting.
 fn pref(key: &str) -> Option<serde_json::Value> {
-    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(prefs_path()).ok()?).ok()?;
-    v.get(key).cloned()
+    prefs().get(key).cloned()
 }
 
-/// Change one setting in prefs.json, keeping the others.
+/// Change one setting, keeping the others.
 fn set_pref(key: &str, value: serde_json::Value) {
-    let path = prefs_path();
-    let mut v: serde_json::Value = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_else(|| serde_json::json!({}));
+    let mut v = prefs();
     v[key] = value;
-    let _ = std::fs::create_dir_all(seed::data_dir());
-    let tmp = path.with_extension("json.tmp");
-    // Written whole, then renamed: never a half-written prefs file.
-    if std::fs::write(&tmp, serde_json::to_vec_pretty(&v).unwrap_or_default()).is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
-    }
+    save_prefs(&v);
 }
 
 /// The folder a torrent's files go in: its own folder (named after the

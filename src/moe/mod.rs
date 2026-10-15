@@ -186,7 +186,7 @@ pub struct Moe {
 
 impl Default for Moe {
     fn default() -> Self {
-        let settings = std::fs::read(settings_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        let settings = crate::db::load("flux-moe", Some(&settings_path())).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         Moe {
             status: Status::Unknown,
             lines: Vec::new(),
@@ -229,7 +229,7 @@ const STARTERS: &[(&str, &str, &str, &str)] = &[
 impl Moe {
     fn save_settings(&self) {
         let _ = std::fs::create_dir_all(crate::seed::data_dir());
-        let _ = std::fs::write(settings_path(), serde_json::to_vec_pretty(&self.settings).unwrap_or_default());
+        let _ = crate::db::save("flux-moe", &serde_json::to_vec_pretty(&self.settings).unwrap_or_default());
     }
 
     fn push(events: &Arc<Mutex<Vec<Ev>>>, ctx: &egui::Context, ev: Ev) {
@@ -1007,7 +1007,7 @@ async fn agent(
 /// real local model and the real folder — but actions are only printed, never done.
 pub async fn ask(question: &str, lib: Library, cpu_only: bool) -> Result<(), String> {
     use std::io::Write;
-    let settings: Settings = std::fs::read(settings_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    let settings: Settings = crate::db::load("flux-moe", Some(&settings_path())).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
     let cpu_only = cpu_only || settings.cpu_only;
     // Installed but stopped (closed from the tray, or quit by itself): start it again.
     ollama::wake().await?;
