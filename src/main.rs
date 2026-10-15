@@ -44,6 +44,7 @@ mod search;
 mod seed;
 mod serve;
 mod sidebar;
+mod tabs;
 mod tray;
 mod tunnel;
 mod update;
@@ -2566,11 +2567,31 @@ impl eframe::App for App {
                 ui.heading("⚡ ZenTorrent");
                 ui.label(egui::RichText::new("egui · librqbit").weak());
                 ui.add_space(16.0);
-                ui.selectable_value(&mut self.view, View::Downloads, format!("Downloads ({})", self.transfers.len()));
-                ui.selectable_value(&mut self.view, View::Seeding, "Seeding & ratio");
-                ui.selectable_value(&mut self.view, View::Feeds, format!("RSS feeds ({})", self.store.feeds.len()));
-                ui.selectable_value(&mut self.view, View::Moe, "✨ Flux MoE").on_hover_text("Your media assistant: overview, feed search, play, playlists, tidy folders — runs on this computer");
-                ui.selectable_value(&mut self.view, View::Settings, "⚙ Settings").on_hover_text("Save folder, speed limits, VPN, ratings, updates, and About");
+                // Each tab's icon comes alive with what it stands for (see `tabs`).
+                let downloading = self.facts.iter().any(|f| !f.finished && f.down_mibs > 0.01);
+                let uploading = self.facts.iter().any(|f| f.up_mibs > 0.01);
+                let main_tabs = [
+                    (View::Downloads, tabs::Icon::Downloads, format!("Downloads ({})", self.transfers.len()), downloading, ""),
+                    (View::Seeding, tabs::Icon::Seeding, "Seeding & ratio".to_string(), uploading, "Upload, ratio and seed goals"),
+                    (View::Feeds, tabs::Icon::Feeds, format!("RSS feeds ({})", self.store.feeds.len()), self.fv.in_flight > 0, ""),
+                    (
+                        View::Moe,
+                        tabs::Icon::Moe,
+                        "Flux MoE".to_string(),
+                        self.moe.busy(),
+                        "Your media assistant: overview, feed search, play, playlists, tidy folders — runs on this computer",
+                    ),
+                    (View::Settings, tabs::Icon::Settings, "Settings".to_string(), false, "Save folder, speed limits, VPN, updates, and About"),
+                ];
+                for (view, icon, label, busy, tip) in main_tabs {
+                    let mut r = tabs::tab(ui, self.view == view, icon, &label, busy);
+                    if !tip.is_empty() {
+                        r = r.on_hover_text(tip);
+                    }
+                    if r.clicked() {
+                        self.view = view;
+                    }
+                }
                 ui.add_space(8.0);
                 self.vpn_badge(ui);
                 self.update_ui(ui, ctx);

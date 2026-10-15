@@ -396,6 +396,11 @@ impl Moe {
     }
 
     /// Has the user said anything yet (notes from setup don't count)?
+    /// An answer is being written right now.
+    pub fn busy(&self) -> bool {
+        self.busy
+    }
+
     fn talked(&self) -> bool {
         self.lines.iter().any(|l| matches!(l, Line::User(_)))
     }
