@@ -2954,6 +2954,9 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Some(p) = self.player.as_mut() {
+            p.marks.save();
+        }
         self.tick_ledger();
         let _ = self.ledger.save();
         if self.feed_hist.dirty {

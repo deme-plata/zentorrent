@@ -9,6 +9,7 @@
 //! * `ui`       — the now-playing bar, the playlist panel and the Sound window
 
 pub mod archive;
+pub mod bookmark;
 pub mod audio;
 pub mod engine;
 pub mod ffi;

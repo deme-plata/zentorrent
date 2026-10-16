@@ -442,6 +442,14 @@ pub struct Player {
     /// Why the player can't start (libmpv missing…), shown in the UI.
     pub error: Option<String>,
     repaint: Arc<dyn Fn() + Send + Sync>,
+    /// Where you were in films and long mixes (see `bookmark`).
+    pub marks: super::bookmark::Bookmarks,
+    /// A bookmark to jump to once this play-order position has loaded.
+    resume: Option<(usize, f64)>,
+    /// Shown in the player bar for a few seconds: "resumed at …".
+    pub resumed: Option<(f64, std::time::Instant)>,
+    /// When the playing track last changed (the player may still report the old time).
+    changed: std::time::Instant,
 }
 
 impl Player {
@@ -449,7 +457,20 @@ impl Player {
         // Lives as long as the process: mpv's stream callbacks point at it.
         let registry: &'static Registry =
             Box::leak(Box::new(Registry { rt, torrents: Mutex::new(Default::default()), archives: Mutex::new(Default::default()) }));
-        Player { mpv: None, registry, live: Default::default(), queue: Queue::default(), sound: Sound::load(), in_mpv: Vec::new(), error: None, repaint }
+        Player {
+            mpv: None,
+            registry,
+            live: Default::default(),
+            queue: Queue::default(),
+            sound: Sound::load(),
+            in_mpv: Vec::new(),
+            error: None,
+            repaint,
+            marks: super::bookmark::Bookmarks::load(),
+            resume: None,
+            resumed: None,
+            changed: std::time::Instant::now(),
+        }
     }
 
     pub fn active(&self) -> bool {
@@ -515,6 +536,9 @@ impl Player {
             Ok(()) => {
                 self.error = None;
                 self.queue.pos = Some(pos);
+                self.changed = std::time::Instant::now();
+                self.resumed = None;
+                self.resume = self.marks.get(&super::bookmark::key(&self.queue.hash, &track.path)).map(|at| (pos, at));
                 self.in_mpv = std::iter::once(pos).chain(next.map(|(p, _)| p)).collect();
                 if let Ok(mut l) = self.live.lock() {
                     l.mpv_pos = Some(0);
@@ -539,10 +563,12 @@ impl Player {
             self.mpv = None;
         }
         if close || gone {
+            self.marks.save();
             self.queue.pos = None;
             self.in_mpv.clear();
             return;
         }
+        self.bookmark();
         let pos = self.live.lock().unwrap().mpv_pos;
         let (Some(p), Some(m)) = (pos, self.mpv.as_ref()) else { return };
         let p = p as usize;
@@ -554,6 +580,9 @@ impl Player {
         let _ = m.cmd(&["playlist-clear"]); // keeps only the playing entry
         self.in_mpv = vec![now];
         self.queue.pos = Some(now);
+        self.changed = std::time::Instant::now();
+        let path = self.queue.tracks[self.queue.order[now]].path.clone();
+        self.resume = self.marks.get(&super::bookmark::key(&self.queue.hash, &path)).map(|at| (now, at));
         self.live.lock().unwrap().mpv_pos = Some(0);
         if let Some(n) = self.queue.after(now) {
             let t = self.queue.tracks[self.queue.order[n]].clone();
@@ -591,7 +620,48 @@ impl Player {
         }
     }
 
+    /// Note where the playing file is, and jump to its bookmark once it has loaded.
+    fn bookmark(&mut self) {
+        let Some(pos) = self.queue.pos else { return };
+        let Some(t) = self.queue.current() else { return };
+        let key = super::bookmark::key(&self.queue.hash, &t.path);
+        let video = matches!(t.kind, super::playlist::Kind::Video);
+        let (time, dur, paused) = {
+            let l = self.live.lock().unwrap();
+            (l.time, l.duration, l.paused)
+        };
+        let since = self.changed.elapsed();
+        if let Some((p, at)) = self.resume {
+            // This file has loaded (its length is known, it is at its start): carry on there.
+            if p == pos && since > std::time::Duration::from_millis(300) && dur > 0.0 && time < 5.0 {
+                self.resume = None;
+                if at < dur - 1.0 {
+                    self.seek(at);
+                    self.resumed = Some((at, std::time::Instant::now()));
+                }
+            }
+            return; // nothing is noted before the jump
+        }
+        // Right after a change the old file's time may still be reported.
+        if since > std::time::Duration::from_secs(2) && !paused && dur > 0.0 && time <= dur {
+            self.marks.note(&key, time, dur, video);
+        }
+        self.marks.maybe_save();
+    }
+
+    /// "Start over": back to the beginning, and the bookmark goes.
+    pub fn start_over(&mut self) {
+        if let Some(t) = self.queue.current() {
+            let key = super::bookmark::key(&self.queue.hash, &t.path);
+            self.marks.forget(&key);
+        }
+        self.resumed = None;
+        self.seek(0.0);
+        self.marks.save();
+    }
+
     pub fn stop(&mut self) {
+        self.marks.save();
         if let Some(m) = &self.mpv {
             let _ = m.cmd(&["stop"]);
         }

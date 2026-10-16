@@ -12,6 +12,8 @@ pub struct PlayerUi {
     pub show_sound: bool,
     /// The visualizer is shown for music unless turned off here.
     pub hide_vis: bool,
+    /// "Start over" was clicked: done at the next frame.
+    start_over: bool,
     pub vis: super::vis::Vis,
     /// Seek-slider position while it is being dragged.
     seek_drag: Option<f64>,
@@ -44,6 +46,9 @@ fn clock(s: f64) -> String {
 
 /// The now-playing bar.
 pub fn bar(ui: &mut egui::Ui, p: &mut Player, pu: &mut PlayerUi, files: &Files) {
+    if std::mem::take(&mut pu.start_over) {
+        p.start_over();
+    }
     let complete = |f: usize| files.complete(f);
     let live = p.live.lock().unwrap().clone();
     let Some(track) = p.queue.current().cloned() else { return };
@@ -73,6 +78,15 @@ pub fn bar(ui: &mut egui::Ui, p: &mut Player, pu: &mut PlayerUi, files: &Files) 
             let from_url = live.title.contains("zt://") || live.title.bytes().all(|c| c.is_ascii_digit());
             let title = if live.title.is_empty() || from_url { track.title.clone() } else { live.title.clone() };
             ui.add(egui::Label::new(RichText::new(title).strong()).truncate()).on_hover_text(&track.path);
+            // Just carried on from a bookmark: say so, with a way back to the start.
+            if let Some((at, _)) = p.resumed.filter(|(_, since)| since.elapsed().as_secs() < 12) {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("↻ resumed at {}", clock(at))).small().color(Color32::from_rgb(120, 190, 255)));
+                    if ui.small_button("Start over").on_hover_text("Back to the beginning; the bookmark goes").clicked() {
+                        pu.start_over = true;
+                    }
+                });
+            }
             let mut sub = p.queue.torrent.clone();
             if !live.artist.is_empty() {
                 sub = format!("{} · {sub}", live.artist);
@@ -187,6 +201,10 @@ pub fn playlist(ui: &mut egui::Ui, p: &mut Player, files: &Files) {
                         }
                         if let Some(d) = t.duration {
                             ui.label(RichText::new(clock(d)).small().weak().monospace());
+                        }
+                        if let Some(at) = p.marks.get(&super::bookmark::key(&p.queue.hash, &t.path)) {
+                            ui.label(RichText::new(format!("↻ {}", clock(at))).small().color(Color32::from_rgb(120, 190, 255)))
+                                .on_hover_text("Bookmarked: carries on here");
                         }
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                             let n = RichText::new(format!("{:>2}", pos + 1)).monospace().weak();
