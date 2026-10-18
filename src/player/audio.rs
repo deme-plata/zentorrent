@@ -252,6 +252,9 @@ struct Mpv {
 // The client API is thread-safe; the handle is only destroyed in Drop, after the event thread ended.
 unsafe impl Send for Mpv {}
 
+/// The video window's title (fixed: the main window finds it by this, see `tray::own_video_window`).
+pub const WINDOW_TITLE: &str = "ZenTorrent player  —  Esc or Q closes";
+
 impl Mpv {
     fn new(reg: &'static Registry, live: Arc<Mutex<Live>>, repaint: Arc<dyn Fn() + Send + Sync>) -> Result<Mpv, String> {
         let api = ffi::api()?;
@@ -283,7 +286,7 @@ impl Mpv {
             ("prefetch-playlist", "yes"),
             ("input-default-bindings", "yes"),
             ("input-vo-keyboard", "yes"),
-            ("title", "ZenTorrent player  —  Esc or Q closes"),
+            ("title", WINDOW_TITLE),
         ] {
             m.opt(k, v);
         }

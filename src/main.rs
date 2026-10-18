@@ -2629,6 +2629,10 @@ impl eframe::App for App {
             }
         }
         self.drop_hint(ctx);
+        // A video's window stays in front of this one while its buttons are clicked.
+        if self.player.is_some() {
+            tray::own_video_window(player::audio::WINDOW_TITLE);
+        }
         self.mcp_tick(ctx);
         self.vpn_window(ctx);
         let due = match self.fv.last_refresh {

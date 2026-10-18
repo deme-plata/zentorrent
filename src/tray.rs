@@ -71,7 +71,10 @@ mod imp {
     use std::sync::atomic::{AtomicIsize, Ordering};
     use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
     use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
-    use windows_sys::Win32::UI::WindowsAndMessaging::{IsIconic, SetForegroundWindow, ShowWindow, SW_HIDE, SW_RESTORE, SW_SHOW};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, GetWindowLongPtrW, IsIconic, SetForegroundWindow, SetWindowLongPtrW, ShowWindow, GWLP_HWNDPARENT, SW_HIDE,
+        SW_RESTORE, SW_SHOW,
+    };
 
     /// The main window's handle, set on the first frame (the tray handlers need it).
     static HWND: AtomicIsize = AtomicIsize::new(0);
@@ -131,6 +134,27 @@ mod imp {
         ctx.request_repaint();
     }
 
+    /// The video player's window (mpv's own, found by its `title`) belongs to the main
+    /// window: clicking the player's buttons in the main window no longer sends the video
+    /// behind it. An owned window stays in front of its owner only, not of other programs,
+    /// and is minimised with it. mpv makes a new window for each video, so this is done
+    /// whenever the window is there and not ours yet; cheap enough for every frame.
+    pub fn own_video_window(title: &str) {
+        let owner = HWND.load(Ordering::Relaxed);
+        if owner == 0 {
+            return;
+        }
+        let name: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
+        // SAFETY: a NUL-terminated UTF-16 title; a window handle of this process (libmpv
+        // runs in it); Win32 ignores a stale one.
+        unsafe {
+            let video = FindWindowW(std::ptr::null(), name.as_ptr());
+            if !video.is_null() && GetWindowLongPtrW(video, GWLP_HWNDPARENT) != owner {
+                SetWindowLongPtrW(video, GWLP_HWNDPARENT, owner);
+            }
+        }
+    }
+
     /// Off the screen and the taskbar; still running, in the tray. False before the
     /// window's handle is known.
     pub fn hide() -> bool {
@@ -154,6 +178,7 @@ mod imp {
     pub fn hide() -> bool {
         false
     }
+    pub fn own_video_window(_: &str) {}
 }
 
 pub use imp::*;
