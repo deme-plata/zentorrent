@@ -22,6 +22,10 @@ type ManagedTorrentHandle = Arc<ManagedTorrent>;
 
 /// How soon a feed that failed to load is tried again.
 const FEED_RETRY: Duration = Duration::from_secs(60);
+/// A feed download the site was too overloaded to give: tried again this often, this
+/// many times (two hours).
+const SITE_RETRY: Duration = Duration::from_secs(3 * 60);
+const SITE_TRIES: u32 = 40;
 
 mod assoc;
 mod autostart;
@@ -468,6 +472,8 @@ struct Inbox {
     covers: Vec<(String, PathBuf, Option<egui::ColorImage>)>,
     /// The same picture read large, for the Details banner.
     cover_large: Vec<(String, Option<egui::ColorImage>)>,
+    /// (label, .torrent URL, cookie) of feed downloads the site was too overloaded to give.
+    overloaded: Vec<(String, String, String)>,
     busy: usize,
     /// Result of the VPN window's "Test relay" (handshake + ping, ms).
     vpn_test: Option<Result<u128, String>>,
@@ -619,6 +625,10 @@ struct App {
     vpn_retry: Option<tokio::task::JoinHandle<vpn::Vpn>>,
     /// Downloads asked for while the kill switch held; started once the engine is up.
     waiting: Vec<(String, Source)>,
+    /// Feed downloads an overloaded site refused: (label, URL, cookie, when to try again).
+    site_retry: Vec<(String, String, String, Instant)>,
+    /// How often each of those has been refused (by URL).
+    site_tries: std::collections::HashMap<String, u32>,
     /// The Downloads list's layout, order and media filter.
     list: listview::ListView,
     /// What each torrent holds (video / music / other), by info-hash, once its file list is known.
@@ -708,6 +718,8 @@ impl App {
             vpn_retry_at: Instant::now() + VPN_RETRY,
             vpn_retry: None,
             waiting: Vec::new(),
+            site_retry: Vec::new(),
+            site_tries: Default::default(),
             list: listview::ListView::load(),
             media: HashMap::new(),
         };
@@ -1835,6 +1847,11 @@ impl App {
         // Through the VPN, every torrent loses its udp:// trackers before librqbit sees
         // it (they would bypass the tunnel), and .torrent URLs are fetched through it.
         let tunnelled = self.vpn.is_up();
+        // A feed download the site is too overloaded to give is kept and tried again.
+        let again = match &source {
+            Source::Fetch { url, cookie } => Some((label.clone(), url.clone(), cookie.clone())),
+            _ => None,
+        };
         inbox.lock().unwrap().busy += 1;
         self.rt.spawn(async move {
             let res = engine::add(session, http, tunnelled, folder, label, source).await;
@@ -1842,7 +1859,13 @@ impl App {
             ib.busy -= 1;
             match res {
                 Ok(t) => ib.added.push(t),
-                Err(e) => ib.errors.push(e),
+                Err(e) => match again.filter(|_| e.contains(rss::OVERLOADED)) {
+                    Some(a) => {
+                        ib.errors.push(format!("{e} — ZenTorrent tries again by itself every {} min", SITE_RETRY.as_secs() / 60));
+                        ib.overloaded.push(a);
+                    }
+                    None => ib.errors.push(e),
+                },
             }
             ctx.request_repaint();
         });
@@ -2268,6 +2291,22 @@ impl App {
                 }
             }
         }
+        let overloaded: Vec<_> = ib.overloaded.drain(..).collect();
+        for (label, url, cookie) in overloaded {
+            // Only the newest note about this download stays.
+            let note = |x: &String| x.starts_with(&format!("{label}: ")) && x.contains(rss::OVERLOADED);
+            self.errors.retain(|x| !note(x));
+            let tries = self.site_tries.entry(url.clone()).or_insert(0);
+            *tries += 1;
+            if *tries >= SITE_TRIES {
+                self.site_tries.remove(&url);
+                ib.errors.retain(|x| !note(x));
+                let hours = SITE_RETRY.as_secs() * SITE_TRIES as u64 / 3600;
+                ib.errors.push(format!("{label}: the site was still overloaded after {hours} hours; click it again later"));
+            } else if !self.site_retry.iter().any(|r| r.1 == url) {
+                self.site_retry.push((label, url, cookie, Instant::now() + SITE_RETRY));
+            }
+        }
         for e in &ib.errors {
             // The site wants a login: open that feed's login box.
             if e.contains("wants you logged in") {
@@ -2567,6 +2606,16 @@ impl eframe::App for App {
                 .collect();
             for i in failed {
                 self.refresh_feeds(ctx, Some(i));
+            }
+        }
+        // Feed downloads an overloaded site refused: again when their time comes.
+        let now = Instant::now();
+        if self.site_retry.iter().any(|r| r.3 <= now) {
+            let (due, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.site_retry).into_iter().partition(|r| r.3 <= now);
+            self.site_retry = later;
+            for (label, url, cookie, _) in due {
+                self.errors.retain(|x| !(x.starts_with(&format!("{label}: ")) && x.contains(rss::OVERLOADED)));
+                self.start(ctx, label, Source::Fetch { url, cookie });
             }
         }
         // Update check at start-up and every 6 hours (never during an install).
@@ -3475,6 +3524,12 @@ impl App {
                     format!("Nothing matches “{}”.", self.fv.query.trim())
                 } else if self.fv.scope_history && !self.feed_hist.enabled {
                     "History is off: tick “Remember every item” to start collecting.".to_string()
+                } else if !self.fv.scope_history && self.fv.status.values().any(|s| s.starts_with("error")) {
+                    format!(
+                        "The feed isn't answering right now (the red note at the feed says why); ZenTorrent keeps trying. \
+                         Your {} earlier items are under History.",
+                        self.feed_hist.entries.len()
+                    )
                 } else {
                     "No items.".to_string()
                 };

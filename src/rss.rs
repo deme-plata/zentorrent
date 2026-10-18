@@ -213,13 +213,21 @@ async fn fetch_once(client: &reqwest::Client, link: &str) -> Result<Vec<Item>, F
     let resp = req.send().await.map_err(net)?;
     let status = resp.status();
     let body = resp.text().await.map_err(net)?;
-    if status.is_server_error() {
-        return Err(Fail::Transient(anyhow::anyhow!("HTTP {status}")));
+    feed_reply(link, status.as_u16(), &body)
+}
+
+/// What a feed request's answer means.
+fn feed_reply(link: &str, status: u16, body: &str) -> Result<Vec<Item>, Fail> {
+    let feed_like = body.contains("<item") || body.contains("<entry");
+    // An overloaded site (a 5xx, or its "server load is very high" page) is not a bad
+    // link or passkey: it passes by itself, so it is tried again.
+    if status == 429 || (500..600).contains(&status) || (!feed_like && overloaded(body.as_bytes())) {
+        return Err(Fail::Transient(overloaded_error(link, body.as_bytes())));
     }
-    if !status.is_success() {
+    if !(200..300).contains(&status) {
         return Err(Fail::Final(anyhow::anyhow!("HTTP {status}")));
     }
-    parse_feed(&body).map_err(Fail::Final)
+    parse_feed(body).map_err(Fail::Final)
 }
 
 fn parse_feed(body: &str) -> anyhow::Result<Vec<Item>> {
@@ -641,11 +649,46 @@ pub async fn fetch_torrent(
     let resp = req.send().await?;
     let status = resp.status();
     let body = resp.bytes().await?.to_vec();
+    if body.first() != Some(&b'd') && (status.as_u16() == 429 || status.is_server_error() || overloaded(&body)) {
+        return Err(overloaded_error(url, &body));
+    }
     if !status.is_success() {
         anyhow::bail!("HTTP {status}: {}", describe(&body));
     }
     check_torrent(&body)?;
     Ok(body)
+}
+
+/// In the error text of a site that is overloaded or down: the UI keeps such a
+/// download and tries it again.
+pub const OVERLOADED: &str = "is overloaded or down right now";
+
+/// What overloaded sites say (TorrentBytes: "The server load is very high at the moment
+/// and returned an error 2002", its database not answering). Not a login problem and not
+/// a bad link: it passes by itself.
+const OVERLOAD_SIGNS: [&str; 9] = [
+    "server load is very high",
+    "too many connections",
+    "max_user_connections",
+    "error 2002",
+    "error 1040",
+    "temporarily unavailable",
+    "service unavailable",
+    "heavy load",
+    "overloaded",
+];
+
+/// Whether a reply that is not a feed or a .torrent is a site saying it is overloaded.
+pub fn overloaded(body: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(&body[..body.len().min(4096)]);
+    let text = TAGS.replace_all(&text, " ").to_lowercase();
+    OVERLOAD_SIGNS.iter().any(|s| text.contains(s))
+}
+
+/// Names the site (host only: links carry passkeys) and what it said.
+fn overloaded_error(url: &str, body: &[u8]) -> anyhow::Error {
+    let host = site_root(url).and_then(|r| r.split_once("://").map(|(_, h)| h.to_string())).unwrap_or_else(|| "the site".into());
+    anyhow::anyhow!("{host} {OVERLOADED}: the site's own error, not ZenTorrent's (it said: \"{}\")", describe(body))
 }
 
 /// A .torrent is a bencoded dictionary: it starts with `d`.
@@ -688,6 +731,25 @@ pub fn rule(feed: &Feed) -> Option<Result<regex::Regex, regex::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_overloaded_tracker_is_named_and_tried_again() {
+        let page = br#"<html><head><meta http-equiv="refresh" content="5"></head><body>Please <a href="/">click here</a>
+            if you are not redirected within a few seconds.<br>The server load is very high at the moment and returned
+            an error 2002. Retrying, please wait...</body></html>"#;
+        assert!(overloaded(page));
+        let e = overloaded_error("https://www.torrentbytes.net/download.php?id=1&passkey=secret", page).to_string();
+        assert!(e.starts_with("www.torrentbytes.net is overloaded") && e.contains(OVERLOADED), "{e}");
+        assert!(!e.contains("secret"), "no passkey in the message");
+        // The feed itself: tried again, not "check the link / passkey".
+        let s = std::str::from_utf8(page).unwrap();
+        assert!(matches!(feed_reply("https://www.torrentbytes.net/rss.php?passkey=secret", 200, s), Err(Fail::Transient(_))));
+        assert!(matches!(feed_reply("https://x.org/rss", 503, ""), Err(Fail::Transient(_))));
+        // A login page is still a login page, a feed still a feed.
+        assert!(!overloaded(b"<html>You must be registered and logged in to download</html>"));
+        assert!(matches!(feed_reply("https://x.org/rss", 200, "<html>Login</html>"), Err(Fail::Final(_))));
+        assert!(matches!(feed_reply("https://x.org/rss", 200, "<rss><channel><item><title>a</title><link>magnet:?xt=urn:btih:ab</link></item></channel></rss>"), Ok(v) if v.len() == 1));
+    }
 
     #[test]
     fn rss_enclosure_and_entities() {
