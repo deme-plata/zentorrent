@@ -31,6 +31,8 @@ pub struct JsonSessionPersistenceStore {
     db_filename: PathBuf,
     db_content: tokio::sync::RwLock<SerializedSessionDatabase>,
     spawner: BlockingSpawner,
+    // ZenTorrent patch: the lowest id not yet handed out (see `next_id`).
+    next_free: std::sync::atomic::AtomicUsize,
 }
 
 impl std::fmt::Debug for JsonSessionPersistenceStore {
@@ -67,6 +69,7 @@ impl JsonSessionPersistenceStore {
             output_folder,
             db_content: tokio::sync::RwLock::new(db),
             spawner,
+            next_free: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -251,8 +254,14 @@ impl BitVFactory for JsonSessionPersistenceStore {
 
 #[async_trait]
 impl SessionPersistenceStore for JsonSessionPersistenceStore {
+    // ZenTorrent patch: each id is handed out once. Upstream returned "highest stored id + 1",
+    // and a torrent is stored only after its add has finished, so adds running at the same
+    // time (several .torrent files dropped at once) all got the same id; `add_torrent_internal`
+    // then took every one after the first for that first torrent (AlreadyManaged) and they
+    // vanished without an error.
     async fn next_id(&self) -> anyhow::Result<TorrentId> {
-        Ok(self
+        use std::sync::atomic::Ordering;
+        let stored = self
             .db_content
             .read()
             .await
@@ -261,7 +270,18 @@ impl SessionPersistenceStore for JsonSessionPersistenceStore {
             .copied()
             .max()
             .map(|max| max + 1)
-            .unwrap_or(0))
+            .unwrap_or(0);
+        let mut cur = self.next_free.load(Ordering::Relaxed);
+        loop {
+            let id = cur.max(stored);
+            match self
+                .next_free
+                .compare_exchange(cur, id + 1, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => return Ok(id),
+                Err(now) => cur = now,
+            }
+        }
     }
 
     async fn delete(&self, id: TorrentId) -> anyhow::Result<()> {

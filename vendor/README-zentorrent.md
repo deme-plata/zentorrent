@@ -38,3 +38,10 @@ that open files sharing reads only. WinRAR could not extract finished RAR sets (
 cannot access the file because it is being used by another process", Viktor 2026-10-12, three
 torrents). Measured on Linux via /proc/<pid>/fdinfo: 0.8.4 seeding = O_RDWR on every file; patched
 = O_RDONLY on every file, including one downloaded during the run. Search "ZenTorrent patch".
+
+Fifth (2026-10-18), in `librqbit/src/session_persistence/json.rs`: `next_id` hands each id out once
+(`next_free`). Upstream returned "highest stored id + 1", and a torrent is stored only after its add
+has finished, so adds at the same moment all got the same id and `add_torrent_internal` returned the
+first torrent (AlreadyManaged) for the others: dropping three .torrent files on the window added one,
+the other two vanished without an error (traced 2026-10-18: three adds, all `Ok(id 11)`, same
+torrent). Search "ZenTorrent patch".

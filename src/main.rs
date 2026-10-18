@@ -33,6 +33,7 @@ mod cover;
 mod db;
 mod details;
 mod diskguard;
+mod drop;
 mod engine;
 mod history;
 mod info;
@@ -831,8 +832,34 @@ impl App {
         });
     }
 
+    /// While files are dragged over the window: say what dropping them does.
+    fn drop_hint(&self, ctx: &egui::Context) {
+        let hovered: Vec<Option<PathBuf>> = ctx.input(|i| i.raw.hovered_files.iter().map(|f| f.path.clone()).collect());
+        if hovered.is_empty() {
+            return;
+        }
+        let torrents = hovered.iter().flatten().filter(|p| drop::named_torrent(p)).count();
+        let rect = ctx.content_rect();
+        let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("drop-hint")));
+        painter.rect_filled(rect, 0.0, egui::Color32::from_black_alpha(170));
+        painter.rect_stroke(
+            rect.shrink(14.0),
+            14.0,
+            egui::Stroke::new(2.5, egui::Color32::from_rgb(90, 200, 120)),
+            egui::StrokeKind::Inside,
+        );
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            format!("⬇  {}", drop::hover_text(torrents, hovered.len())),
+            egui::FontId::proportional(26.0),
+            egui::Color32::WHITE,
+        );
+        ctx.request_repaint();
+    }
+
     /// A .torrent file (path) or a magnet link from outside: a double-click in Windows,
-    /// a second start, the command line.
+    /// a second start, the command line, a drop from Explorer.
     fn open_item(&mut self, ctx: &egui::Context, item: String) {
         self.view = View::Downloads;
         if item.starts_with("magnet:") {
@@ -2590,6 +2617,18 @@ impl eframe::App for App {
         for item in opens {
             self.open_item(ctx, item);
         }
+        // .torrent files dragged in from Explorer: any number at once, or a folder of them.
+        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
+        if !dropped.is_empty() {
+            let (found, other) = drop::torrents(&dropped);
+            if !other.is_empty() {
+                self.errors.push(format!("not a .torrent file, left out: {}", other.join(", ")));
+            }
+            for p in found {
+                self.open_item(ctx, p.to_string_lossy().into_owned());
+            }
+        }
+        self.drop_hint(ctx);
         self.mcp_tick(ctx);
         self.vpn_window(ctx);
         let due = match self.fv.last_refresh {
@@ -2629,7 +2668,6 @@ impl eframe::App for App {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.heading("⚡ ZenTorrent");
-                ui.label(egui::RichText::new("egui · librqbit").weak());
                 ui.add_space(16.0);
                 // Each tab's icon comes alive with what it stands for (see `tabs`).
                 let downloading = self.facts.iter().any(|f| !f.finished && f.down_mibs > 0.01);
@@ -2686,11 +2724,12 @@ impl eframe::App for App {
                     self.start(ctx, link.clone(), Source::Link(link));
                     self.link.clear();
                 }
-                if ui.button("Open .torrent…").clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Torrent", &["torrent"])
-                        .pick_file()
-                    {
+                if ui
+                    .button("Open .torrent…")
+                    .on_hover_text("Pick one or several .torrent files, or drag them from Explorer onto the window")
+                    .clicked()
+                {
+                    for path in rfd::FileDialog::new().add_filter("Torrent", &["torrent"]).pick_files().unwrap_or_default() {
                         match std::fs::read(&path) {
                             Ok(bytes) => {
                                 let label = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
