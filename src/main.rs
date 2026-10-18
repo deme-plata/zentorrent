@@ -7,7 +7,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -583,8 +583,15 @@ struct App {
     covers: HashMap<String, cover::State>,
     /// Started by Windows at log-in: to the tray (or minimized) on the first frame.
     start_minimized: bool,
-    /// Remove was clicked for this torrent (info-hash): ask whether its files go too.
-    confirm_remove: Option<String>,
+    /// Remove was clicked for these torrents (info-hashes): ask whether their files go too.
+    confirm_remove: Vec<String>,
+    /// Torrents selected in Downloads (info-hashes), and the one a Shift-click counts from.
+    sel: HashSet<String>,
+    sel_anchor: Option<String>,
+    /// Where each Downloads row was drawn last frame (clicks and the selection box use it).
+    row_rects: HashMap<String, egui::Rect>,
+    /// A selection box being drawn: where it started, and the selection it adds to (Ctrl).
+    band: Option<(egui::Pos2, HashSet<String>)>,
     /// The tray icon while "keep running in the tray" is on (Windows).
     tray: Option<tray::Tray>,
     /// The tray knows the window's handle (set on the first frame).
@@ -698,7 +705,11 @@ impl App {
             covers: HashMap::new(),
             cover_large: None,
             start_minimized: std::env::args().any(|a| a == autostart::FLAG),
-            confirm_remove: None,
+            confirm_remove: Vec::new(),
+            sel: HashSet::new(),
+            sel_anchor: None,
+            row_rects: HashMap::new(),
+            band: None,
             tray: (tray::supported() && tray::wanted())
                 .then(|| tray::create(&cc.egui_ctx).map_err(|e| eprintln!("{e}")).ok())
                 .flatten(),
@@ -759,21 +770,39 @@ impl App {
 
     /// Remove: from the list only, or with the torrent's files (to the Recycle Bin).
     fn remove_dialog(&mut self, ctx: &egui::Context) {
-        let Some(hash) = self.confirm_remove.clone() else { return };
-        let Some(t) = self.transfers.iter().find(|t| t.handle.info_hash().as_string() == hash) else {
-            self.confirm_remove = None;
+        if self.confirm_remove.is_empty() {
             return;
+        }
+        let picked: Vec<&Transfer> =
+            self.confirm_remove.iter().filter_map(|h| self.transfers.iter().find(|t| t.handle.info_hash().as_string() == *h)).collect();
+        if picked.is_empty() {
+            self.confirm_remove.clear();
+            return;
+        }
+        let n = picked.len();
+        let names: Vec<String> = picked.iter().map(|t| t.name.clone()).collect();
+        let got: u64 = picked.iter().map(|t| t.handle.stats().progress_bytes).sum();
+        let where_ = if n == 1 {
+            format!("{} downloaded, in {}", human(got), picked[0].handle.output_folder().display())
+        } else {
+            format!("{} downloaded in all", human(got))
         };
-        let (name, folder) = (t.name.clone(), t.handle.output_folder().display().to_string());
-        let got = t.handle.stats().progress_bytes;
-        let has_files = t.handle.with_metadata(|m| !m.file_infos.is_empty()).unwrap_or(false);
+        let has_files = picked.iter().any(|t| t.handle.with_metadata(|m| !m.file_infos.is_empty()).unwrap_or(false));
         let mut choice: Option<Option<bool>> = None;
         let modal = egui::Modal::new(egui::Id::new("zt-remove")).show(ctx, |ui| {
             ui.set_width(460.0);
-            ui.label(egui::RichText::new("Remove this torrent?").heading());
+            ui.label(egui::RichText::new(if n == 1 { "Remove this torrent?".to_string() } else { format!("Remove these {n} torrents?") }).heading());
             ui.add_space(4.0);
-            ui.label(egui::RichText::new(&name).strong());
-            ui.label(egui::RichText::new(format!("{} downloaded, in {folder}", human(got))).weak().small());
+            if n == 1 {
+                ui.label(egui::RichText::new(&names[0]).strong());
+            } else {
+                egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
+                    for name in &names {
+                        ui.label(egui::RichText::new(name).small());
+                    }
+                });
+            }
+            ui.label(egui::RichText::new(where_).weak().small());
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 if ui
@@ -804,10 +833,12 @@ impl App {
         }
         match choice {
             Some(Some(delete)) => {
-                self.confirm_remove = None;
-                self.remove_torrent(ctx, &hash, delete);
+                for h in std::mem::take(&mut self.confirm_remove) {
+                    self.remove_torrent(ctx, &h, delete);
+                    self.sel.remove(&h);
+                }
             }
-            Some(None) => self.confirm_remove = None,
+            Some(None) => self.confirm_remove.clear(),
             None => {}
         }
     }
@@ -1301,10 +1332,12 @@ impl App {
                         self.view = View::Downloads;
                     }
                 }
-                Action::Pause(hash) => self.set_paused(&hash, true),
-                Action::Resume(hash) => self.set_paused(&hash, false),
+                Action::Pause(hash) => self.with_selection(&hash).iter().for_each(|h| self.set_paused(h, true)),
+                Action::Resume(hash) => self.with_selection(&hash).iter().for_each(|h| self.set_paused(h, false)),
                 Action::Tag(hash, label) => {
-                    self.ledger.set_label(&hash, &label, true);
+                    for h in self.with_selection(&hash) {
+                        self.ledger.set_label(&h, &label, true);
+                    }
                     save = true;
                 }
                 Action::NewLabel(label) => {
@@ -1322,6 +1355,108 @@ impl App {
                 }
             }
         }
+        if save {
+            self.save_ledger();
+        }
+    }
+
+    /// A torrent dragged onto the sidebar: the whole selection when it is part of it.
+    fn with_selection(&self, hash: &str) -> Vec<String> {
+        if self.sel.contains(hash) { self.sel.iter().cloned().collect() } else { vec![hash.to_string()] }
+    }
+
+    /// The selected torrents, in the order the list shows them.
+    fn selected_in(&self, shown: &[String]) -> Vec<String> {
+        shown.iter().filter(|h| self.sel.contains(*h)).cloned().collect()
+    }
+
+    /// A click on a torrent in Downloads: it alone; Ctrl: in or out; Shift: the range from
+    /// the last one clicked.
+    fn select_click(&mut self, hash: &str, shown: &[String], ctx: &egui::Context) {
+        let m = ctx.input(|i| i.modifiers);
+        if m.shift {
+            let at = |h: &str| shown.iter().position(|x| x == h);
+            if let (Some(a), Some(b)) = (self.sel_anchor.as_deref().and_then(at), at(hash)) {
+                if !m.command {
+                    self.sel.clear();
+                }
+                self.sel.extend(shown[a.min(b)..=a.max(b)].iter().cloned());
+                return;
+            }
+        }
+        if m.command {
+            if !self.sel.remove(hash) {
+                self.sel.insert(hash.to_string());
+            }
+        } else {
+            self.sel.clear();
+            self.sel.insert(hash.to_string());
+        }
+        self.sel_anchor = Some(hash.to_string());
+    }
+
+    /// What can be done with the selected torrents, above the list.
+    fn selection_bar(&mut self, ui: &mut egui::Ui, shown: &[String]) {
+        let picked = self.selected_in(shown);
+        let n = picked.len();
+        let mut save = false;
+        egui::Frame::new()
+            .fill(egui::Color32::from_rgb(30, 46, 68))
+            .corner_radius(6.0)
+            .inner_margin(egui::Margin::symmetric(8, 4))
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new(format!("{n} selected")).strong());
+                    if ui.button("Pause").clicked() {
+                        picked.iter().for_each(|h| self.set_paused(h, true));
+                    }
+                    if ui.button("Resume").clicked() {
+                        picked.iter().for_each(|h| self.set_paused(h, false));
+                    }
+                    ui.menu_button("Labels", |ui| {
+                        if self.ledger.labels.is_empty() {
+                            ui.label(egui::RichText::new("Make a label in the sidebar first").weak());
+                        }
+                        for l in self.ledger.labels.clone() {
+                            let have = picked.iter().filter(|h| self.ledger.entries.get(*h).is_some_and(|e| e.labels.contains(&l))).count();
+                            let mut on = have == n;
+                            let text = if have > 0 && have < n { format!("{l}  ({have} of {n})") } else { l.clone() };
+                            if ui.checkbox(&mut on, text).clicked() {
+                                picked.iter().for_each(|h| self.ledger.set_label(h, &l, on));
+                                save = true;
+                            }
+                        }
+                    });
+                    ui.menu_button("Rating", |ui| {
+                        for r in (1..=10u8).rev() {
+                            if ui.button(format!("{r} ★")).clicked() {
+                                picked.iter().for_each(|h| self.ledger.set_rating(h, r));
+                                save = true;
+                                ui.close();
+                            }
+                        }
+                        if ui.button("No rating").clicked() {
+                            picked.iter().for_each(|h| self.ledger.set_rating(h, 0));
+                            save = true;
+                            ui.close();
+                        }
+                    });
+                    if ui.button(egui::RichText::new("Remove…").color(egui::Color32::from_rgb(235, 110, 100))).on_hover_text("Del").clicked() {
+                        self.confirm_remove = picked.clone();
+                    }
+                    if ui.button("Select all").on_hover_text("Ctrl+A").clicked() {
+                        self.sel = shown.iter().cloned().collect();
+                    }
+                    if ui.button("Clear").on_hover_text("Esc").clicked() {
+                        self.sel.clear();
+                    }
+                    ui.label(
+                        egui::RichText::new("Ctrl+click adds · Shift+click: a range · drag a box on empty space · drop on a label: all of them")
+                            .weak()
+                            .small(),
+                    );
+                });
+            });
         if save {
             self.save_ledger();
         }
@@ -3023,21 +3158,61 @@ impl eframe::App for App {
                 }
             }
 
+            // ── several at once: keys, and a bar for what is selected ──
+            let shown_hashes: Vec<String> = order.iter().map(|&i| self.transfers[i].handle.info_hash().as_string()).collect();
+            self.sel.retain(|h| shown_hashes.contains(h));
+            if !ctx.egui_wants_keyboard_input() && self.confirm_remove.is_empty() {
+                let (all, esc, del) = ctx.input(|i| {
+                    (i.modifiers.command && i.key_pressed(egui::Key::A), i.key_pressed(egui::Key::Escape), i.key_pressed(egui::Key::Delete))
+                });
+                if all {
+                    self.sel = shown_hashes.iter().cloned().collect();
+                }
+                if esc {
+                    self.sel.clear();
+                }
+                if del && !self.sel.is_empty() {
+                    self.confirm_remove = self.selected_in(&shown_hashes);
+                }
+            }
+            if !self.sel.is_empty() {
+                self.selection_bar(ui, &shown_hashes);
+                ui.add_space(2.0);
+            }
+
             let mut remove = None;
             let mut relabel: Vec<(String, String, bool)> = Vec::new();
             let mut open_details: Option<String> = None;
             let mut play_req: Option<String> = None;
             let mut rate_req: Option<(String, u8)> = None;
+            let mut row_click: Option<String> = None;
+            let mut under_click: Option<String> = None;
+            let mut bg: Option<egui::Response> = None;
+            let prev_rects = std::mem::take(&mut self.row_rects);
+            let mut rects: HashMap<String, egui::Rect> = HashMap::new();
+            let sel = self.sel.clone();
             let labels = self.ledger.labels.clone();
             let layout = self.list.layout;
+            // A mouse drag does not scroll here (only touch does): on empty space it draws a selection box.
             egui::ScrollArea::vertical().show(ui, |ui| {
-                let mut out = RowOut { relabel: &mut relabel, open_details: &mut open_details, play: &mut play_req, remove: &mut remove, rate: &mut rate_req };
+                // Behind every row: a click on empty space clears the selection, a drag there draws a box.
+                bg = Some(ui.interact(ui.clip_rect(), egui::Id::new("dl-bg"), egui::Sense::click_and_drag()));
+                let mut out = RowOut {
+                    relabel: &mut relabel,
+                    open_details: &mut open_details,
+                    play: &mut play_req,
+                    remove: &mut remove,
+                    rate: &mut rate_req,
+                    select: &mut row_click,
+                };
                 match layout {
                     listview::Layout::Cards => {
                         for &i in &order {
                             let (t, Some(f)) = (&self.transfers[i], self.facts.get(i)) else { continue };
                             let mut gone = false;
-                            transfer_row(ui, &self.rt, self.session.as_ref(), t, f, art.get(&i), &labels, out.relabel, out.open_details, out.play, out.rate, || gone = true);
+                            sel_row(ui, &f.hash, sel.contains(&f.hash), prev_rects.get(&f.hash).copied(), &mut under_click, &mut rects, |ui| {
+                                transfer_row(ui, &self.rt, self.session.as_ref(), t, f, art.get(&i), &labels, out.relabel, out.open_details, out.play, out.rate, || gone = true)
+                            });
                             if gone {
                                 *out.remove = Some(i);
                             }
@@ -3048,7 +3223,9 @@ impl eframe::App for App {
                         ui.spacing_mut().item_spacing.y = 1.0;
                         for (n, &i) in order.iter().enumerate() {
                             let (t, Some(f)) = (&self.transfers[i], self.facts.get(i)) else { continue };
-                            compact_row(ui, &self.rt, self.session.as_ref(), t, f, medias[i], art.get(&i), n % 2 == 1, &labels, i, &mut out);
+                            sel_row(ui, &f.hash, sel.contains(&f.hash), prev_rects.get(&f.hash).copied(), &mut under_click, &mut rects, |ui| {
+                                compact_row(ui, &self.rt, self.session.as_ref(), t, f, medias[i], art.get(&i), n % 2 == 1, &labels, i, &mut out)
+                            });
                         }
                     }
                     listview::Layout::Thumbs => {
@@ -3056,7 +3233,9 @@ impl eframe::App for App {
                             ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
                             for &i in &order {
                                 let (t, Some(f)) = (&self.transfers[i], self.facts.get(i)) else { continue };
-                                thumb_tile(ui, &self.rt, self.session.as_ref(), t, f, medias[i], art.get(&i), &labels, i, &mut out);
+                                sel_row(ui, &f.hash, sel.contains(&f.hash), prev_rects.get(&f.hash).copied(), &mut under_click, &mut rects, |ui| {
+                                    thumb_tile(ui, &self.rt, self.session.as_ref(), t, f, medias[i], art.get(&i), &labels, i, &mut out)
+                                });
                             }
                         });
                     }
@@ -3071,6 +3250,40 @@ impl eframe::App for App {
                     });
                 }
             });
+            self.row_rects = rects;
+            if let Some(h) = row_click.or(under_click) {
+                self.select_click(&h, &shown_hashes, ctx);
+            }
+            if let Some(bg) = bg {
+                let pos = ctx.input(|i| i.pointer.interact_pos());
+                if bg.drag_started() {
+                    // From where the button went down (a drag is only noticed a few pixels later).
+                    if let Some(p) = ctx.input(|i| i.pointer.press_origin()).or(pos) {
+                        let keep = if ctx.input(|i| i.modifiers.command) { self.sel.clone() } else { HashSet::new() };
+                        self.band = Some((p, keep));
+                    }
+                }
+                if let (Some((start, keep)), Some(p)) = (&self.band, pos) {
+                    let r = egui::Rect::from_two_pos(*start, p);
+                    let mut s = keep.clone();
+                    s.extend(self.row_rects.iter().filter(|(_, rr)| rr.intersects(r)).map(|(h, _)| h.clone()));
+                    self.sel = s;
+                    let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("dl-band"))).with_clip_rect(bg.rect);
+                    painter.rect(
+                        r,
+                        2.0,
+                        egui::Color32::from_rgba_unmultiplied(90, 160, 255, 36),
+                        egui::Stroke::new(1.0, egui::Color32::from_rgb(90, 160, 255)),
+                        egui::StrokeKind::Inside,
+                    );
+                }
+                if bg.drag_stopped() || !ctx.input(|i| i.pointer.primary_down()) {
+                    self.band = None;
+                }
+                if bg.clicked() && !ctx.input(|i| i.modifiers.command || i.modifiers.shift) {
+                    self.sel.clear();
+                }
+            }
             if !relabel.is_empty() {
                 for (hash, label, on) in relabel {
                     self.ledger.set_label(&hash, &label, on);
@@ -3088,7 +3301,7 @@ impl eframe::App for App {
                 self.details = Some(details::Details::new(hash));
             }
             if let Some(i) = remove {
-                self.confirm_remove = Some(self.transfers[i].handle.info_hash().as_string());
+                self.confirm_remove = vec![self.transfers[i].handle.info_hash().as_string()];
             }
         });
 
@@ -4050,6 +4263,41 @@ struct RowOut<'a> {
     remove: &'a mut Option<usize>,
     /// (info-hash, new rating 0–10)
     rate: &'a mut Option<(String, u8)>,
+    /// A click that selects (see `App::select_click`).
+    select: &'a mut Option<String>,
+}
+
+/// Around one torrent in Downloads: its selection highlight and its click target, both under
+/// the row so its own buttons keep working (where it was last frame), and where it is now.
+fn sel_row(
+    ui: &mut egui::Ui,
+    hash: &str,
+    selected: bool,
+    prev: Option<egui::Rect>,
+    clicked: &mut Option<String>,
+    rects: &mut HashMap<String, egui::Rect>,
+    draw: impl FnOnce(&mut egui::Ui),
+) {
+    let bg = ui.painter().add(egui::Shape::Noop);
+    if let Some(r) = prev {
+        if ui.interact(r, egui::Id::new(("dl-row", hash)), egui::Sense::click()).clicked() {
+            *clicked = Some(hash.to_string());
+        }
+    }
+    let rect = ui.scope(draw).response.rect;
+    if selected {
+        ui.painter().set(
+            bg,
+            egui::epaint::RectShape::new(
+                rect.expand(3.0),
+                7.0,
+                egui::Color32::from_rgba_unmultiplied(70, 130, 220, 70),
+                egui::Stroke::new(1.5, egui::Color32::from_rgb(90, 160, 255)),
+                egui::StrokeKind::Outside,
+            ),
+        );
+    }
+    rects.insert(hash.to_string(), rect);
 }
 
 /// Status of one torrent in a word, with its colour.
@@ -4218,8 +4466,13 @@ fn compact_row(
     }
     if resp.double_clicked() {
         *out.open_details = Some(f.hash.clone());
+    } else if resp.clicked() {
+        *out.select = Some(f.hash.clone());
     }
-    let resp = resp.on_hover_text(format!("{}\n\nDouble-click: details · right-click: actions · drag onto a label", t.name));
+    let resp = resp.on_hover_text(format!(
+        "{}\n\nClick: select (Ctrl / Shift: more) · double-click: details · right-click: actions · drag onto a label",
+        t.name
+    ));
     resp.context_menu(|ui| actions_menu(ui, rt, session, t, f, all_labels, i, out));
 }
 
@@ -4326,7 +4579,9 @@ fn thumb_tile(
         egui::DragAndDrop::set_payload(ui.ctx(), sidebar::Dragged(f.hash.clone()));
     }
     if resp.clicked() {
-        if over_play {
+        if ui.input(|i| i.modifiers.command || i.modifiers.shift) {
+            *out.select = Some(f.hash.clone());
+        } else if over_play {
             *out.play = Some(f.hash.clone());
         } else {
             *out.open_details = Some(f.hash.clone());
