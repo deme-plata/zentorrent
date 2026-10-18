@@ -39,7 +39,7 @@ fn rel(root: &Path, p: &Path) -> String {
 }
 
 /// Every media file under `root` (not following links), grouped by its folder.
-fn walk(root: &Path) -> Vec<(PathBuf, Vec<(PathBuf, u64)>)> {
+pub(super) fn walk(root: &Path) -> Vec<(PathBuf, Vec<(PathBuf, u64)>)> {
     let mut groups: std::collections::BTreeMap<PathBuf, Vec<(PathBuf, u64)>> = Default::default();
     let mut stack = vec![(root.to_path_buf(), 0usize)];
     let mut seen = 0;

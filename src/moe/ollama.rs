@@ -101,6 +101,25 @@ pub struct Reply {
     pub content: String,
     pub tool_calls: Vec<Value>,
     pub stats: Stats,
+    /// It was stopped for repeating itself (see `looping`); `content` has each line once.
+    pub looped: bool,
+}
+
+/// The same sentence for the third time: a small model talking in circles (2026-10-18:
+/// "I'll now scan your folder to get the full list…" for 2000 tokens, calling nothing).
+pub fn looping(text: &str) -> bool {
+    let mut seen: std::collections::HashMap<&str, u32> = Default::default();
+    text.lines().map(str::trim).filter(|l| l.chars().count() >= 20).any(|l| {
+        let n = seen.entry(l).or_insert(0);
+        *n += 1;
+        *n >= 3
+    })
+}
+
+/// `text` with each longer line kept once.
+pub fn once(text: &str) -> String {
+    let mut seen = std::collections::HashSet::new();
+    text.lines().filter(|l| l.trim().chars().count() < 20 || seen.insert(l.trim().to_string())).collect::<Vec<_>>().join("\n")
 }
 
 /// Ollama's own measurement of one reply (from its final stream line).
@@ -265,7 +284,7 @@ pub async fn chat(base: &str, model: &str, messages: &[Value], tools: &Value, cp
     }
     let mut reply = Reply::default();
     let mut buf = Vec::new();
-    while let Some(chunk) = r.chunk().await.map_err(|e| format!("the local model stopped: {e}"))? {
+    'read: while let Some(chunk) = r.chunk().await.map_err(|e| format!("the local model stopped: {e}"))? {
         buf.extend_from_slice(&chunk);
         while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = buf.drain(..=nl).collect();
@@ -276,6 +295,12 @@ pub async fn chat(base: &str, model: &str, messages: &[Value], tools: &Value, cp
             if let Some(t) = v["message"]["content"].as_str().filter(|t| !t.is_empty()) {
                 reply.content.push_str(t);
                 on_text(t);
+                // Going in circles: stop it (closing the stream stops Ollama too).
+                if t.contains('\n') && reply.tool_calls.is_empty() && looping(&reply.content) {
+                    reply.looped = true;
+                    reply.content = once(&reply.content);
+                    break 'read;
+                }
             }
             if let Some(calls) = v["message"]["tool_calls"].as_array() {
                 reply.tool_calls.extend(calls.iter().cloned());
@@ -675,6 +700,22 @@ pub fn fit(size_gb: f64, vram_gb: u64, free_gb: Option<f64>, drive: &str) -> Fit
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn talking_in_circles_is_noticed_and_said_once() {
+        // From Viktor's chat, 2026-10-18.
+        let (a, b, c) = (
+            "I'll now scan your folder to get the full list of media files with their IDs.",
+            "Please wait—scanning your downloads folder for media files...",
+            "Let me do that now.",
+        );
+        let twice = [a, b, c, a, b, c].join("\n");
+        assert!(!looping(&twice), "twice is not yet a loop");
+        let thrice = [a, b, c, a, b, c, a].join("\n");
+        assert!(looping(&thrice));
+        assert_eq!(once(&thrice), [a, b, c, c].join("\n"), "longer lines once; short ones as they were");
+        assert!(!looping("ok\nok\nok\nok"), "short lines (\"ok\", a list of numbers) are not a loop");
+    }
 
     #[test]
     fn the_model_goes_to_the_card_when_there_is_room() {

@@ -12,6 +12,7 @@
 
 pub mod gauge;
 pub mod ollama;
+pub mod mix;
 pub mod organize;
 pub mod skills;
 mod text;
@@ -69,6 +70,8 @@ enum Ev {
     /// Ollama is not installed; wait for the user's click before downloading it.
     NeedsSetup,
     Text(String),
+    /// The answer so far, replaced (its repeated lines taken out).
+    Live(String),
     /// Ollama's numbers for one model step.
     Stats(ollama::Stats),
     /// How much of the model is in graphics memory: (total, in VRAM) bytes.
@@ -350,6 +353,7 @@ impl Moe {
                     self.status = Status::Ready(m);
                 }
                 Ev::Setup(ollama::Setup::Failed(e)) => self.status = Status::Failed(e),
+                Ev::Live(t) => self.live = t,
                 Ev::Text(t) => {
                     self.live.push_str(&t);
                     if let Some(r) = &mut self.run {
@@ -1025,6 +1029,7 @@ async fn agent(
     let mut used: Vec<String> = Vec::new();
     let mut nudged = false;
     let mut cut_off = false;
+    let mut looped = false;
     for _ in 0..MAX_STEPS {
         let reply = match ollama::chat(base, model, &messages, &tools, cpu_only, |t| on(Ev::Text(t.to_string()))).await {
             Ok(r) => r,
@@ -1042,7 +1047,25 @@ async fn agent(
             Err(e) => return Err(e),
         };
         on(Ev::Stats(reply.stats));
+        if reply.looped {
+            on(Ev::Live(reply.content.clone()));
+        }
         messages.push(json!({"role": "assistant", "content": reply.content, "tool_calls": reply.tool_calls}));
+        // Talking in circles ("I'll scan the folder again…" over and over, calling nothing): it
+        // was stopped; once, tell it to act, then give up.
+        if reply.looped && reply.tool_calls.is_empty() {
+            if looped {
+                on(Ev::Tool("it kept repeating itself — stopped; nothing was done".into()));
+                return Ok(messages.split_off(first_new));
+            }
+            looped = true;
+            on(Ev::Tool("it started repeating itself — stopped it and asked it to act".into()));
+            messages.push(json!({"role": "user", "content":
+                "[ZenTorrent] You were repeating the same sentences without calling a tool, so nothing happened. \
+                 Call the tool now — for a mix or playlist by mood or genre that is make_mix with words describing \
+                 it — or answer in one or two sentences."}));
+            continue;
+        }
         if reply.tool_calls.is_empty() {
             // "Now playing…" with no play: nothing happened. Send it back once to really do it.
             match skills::unbacked_claim(&reply.content, &used) {

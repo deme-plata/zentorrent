@@ -38,11 +38,11 @@ It only proposes the rule; the user presses Add rule. If they did not say what, 
 - “Best / top torrents” without a topic: search_feeds with NO query and sort=top. Never add a genre or a word the \
 user did not say.
 - To play, call play with the torrent's name (and a track if they asked for one). It starts at once.
-- Playlists: torrent_files and scan_folder give every playable file a number (id). make_playlist takes those \
-ids — a 30-track mix is 30 numbers, never paths. Never make up an id.
-- \"Make a <mood> mix and play it\": scan_folder, pick the tracks, then call make_playlist with play=true — in the \
-same answer, without asking first. Only say a playlist is saved, or that something is playing, after the tool \
-returned it; saying it does not do it.
+- Any mix or playlist by mood, genre or artist (\"a chill mix\", \"workout playlist\", \"trance for tonight\"): call \
+make_mix with words describing it, and play=true when they want to hear it: ZenTorrent picks the tracks itself. Do \
+not scan first, and never list files or ids yourself.
+- make_playlist is only for exact tracks a tool listed with ids (e.g. the tracks of one album from torrent_files).
+- Only say a playlist is saved, or that something is playing, after the tool returned it; saying it does not do it.
 - Organizing a folder:
   1. scan_folder first.
   2. Choose clear target folders. Music by genre (Trance, Progressive House, House, Techno, Drum & Bass, Dubstep, \
@@ -75,10 +75,10 @@ pub fn unbacked_claim(answer: &str, used: &[String]) -> Option<String> {
         LazyLock::new(|| Regex::new(r"(?i)\b(started (the |your )?download|(is )?downloading (it |them )?now|henter nu)\b").unwrap());
     let did = |t: &str| used.iter().any(|u| u == t);
     let mut missing = Vec::new();
-    if PLAY.is_match(answer) && !did("play") && !did("make_playlist") {
+    if PLAY.is_match(answer) && !did("play") && !did("make_playlist") && !did("make_mix") {
         missing.push("play (or make_playlist with play=true)");
     }
-    if SAVED.is_match(answer) && !did("make_playlist") {
+    if SAVED.is_match(answer) && !did("make_playlist") && !did("make_mix") {
         missing.push("make_playlist");
     }
     if MOVED.is_match(answer) && !did("propose_moves") {
@@ -139,8 +139,15 @@ pub fn tools() -> Value {
         tool("scan_folder", "Summarise a folder: each sub-folder with media (an album, film or season) with its embedded \
               tags, and loose media files. Default: the download folder.",
             json!({"path": {"type":"string","description":"folder to scan; omit for the download folder"}}), &[]),
+        tool("make_mix", "Make a mix from the user's music and save it as a playlist; play=true starts it. Describe it in \
+              words (a mood, genres, artists); ZenTorrent picks the tracks itself from the download folder, a few per \
+              album. Use this for any mix or playlist by mood, genre or artist.",
+            json!({"describe": {"type":"string","description":"words for the music, e.g. chill ambient, workout, trance, Armin van Buuren"},
+                   "name": {"type":"string","description":"a short title, e.g. Chill evening"},
+                   "tracks": {"type":"integer","description":"how many tracks, default 25"},
+                   "play": {"type":"boolean"}}), &["describe"]),
         tool("make_playlist", "Save a playlist (.m3u8 in the download folder's Playlists folder) from the file ids that \
-              torrent_files or scan_folder gave, and optionally play it (play=true).",
+              torrent_files or scan_folder gave, and optionally play it (play=true). For a mix by mood or genre use make_mix.",
             json!({"name": {"type":"string"},
                    "files": {"type":"array","items":{"type":"string"},"description":"paths as the tools gave them"},
                    "play": {"type":"boolean"}}), &["name", "files"]),
@@ -509,6 +516,40 @@ pub fn run(name: &str, args: &Value, lib: &Library, mem: &mut Memory) -> Outcome
             let n = summary["media_files"].as_u64().unwrap_or(0);
             data(summary, format!("scanned {} ({n} media files)", root.display()))
         }
+        "make_mix" => {
+            let describe = s("describe");
+            let n = args.get("tracks").and_then(Value::as_u64).unwrap_or(25).clamp(5, 100) as usize;
+            let tracks = super::mix::index(&lib.folder, 5000);
+            if tracks.is_empty() {
+                return error(format!("there is no music in the download folder ({})", lib.folder.display()));
+            }
+            let (own, mood) = super::mix::wanted(&describe);
+            let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(7);
+            let (mut picked, matching) = super::mix::pick(&tracks, &own, &mood, n, seed);
+            let mut note = "";
+            if picked.is_empty() {
+                if !own.is_empty() {
+                    return error(format!("no music matching “{describe}” in {} — say so, or try other words", lib.folder.display()));
+                }
+                picked = super::mix::pick(&tracks, &[], &[], n, seed).0;
+                note = "no track's genre or name fitted the mood, so it is a varied mix of everything — say so";
+            }
+            let files: Vec<PathBuf> = picked.iter().map(|&i| tracks[i].path.clone()).collect();
+            let name = s("name");
+            let name = if name.trim().is_empty() { describe.trim().chars().take(40).collect::<String>() } else { name };
+            let (name, path) = match save_playlist(lib, &name, &files) {
+                Ok(v) => v,
+                Err(e) => return error(e),
+            };
+            let play = args.get("play").and_then(Value::as_bool).unwrap_or(false);
+            let examples: Vec<String> = files.iter().take(8).map(|f| playlist::title_from_path(&f.to_string_lossy())).collect();
+            Outcome {
+                for_model: json!({ "saved": path.to_string_lossy(), "tracks": files.len(), "fitting_tracks_in_library": matching,
+                                   "examples": examples, "playing": play, "note": note }),
+                receipt: format!("made the mix “{name}” ({} tracks){}", files.len(), if play { " ▶" } else { "" }),
+                action: play.then(|| Action::PlayFiles { name, files }),
+            }
+        }
         "make_playlist" => {
             let name = s("name").replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], " ");
             let name = if name.trim().is_empty() { "Flux MoE playlist".to_string() } else { name.trim().to_string() };
@@ -574,6 +615,20 @@ pub fn run(name: &str, args: &Value, lib: &Library, mem: &mut Memory) -> Outcome
         }
         other => error(format!("there is no tool called {other}")),
     }
+}
+
+/// Save `files` as `<download folder>/Playlists/<name>.m3u8`: the name it got, and where.
+fn save_playlist(lib: &Library, name: &str, files: &[PathBuf]) -> Result<(String, PathBuf), String> {
+    let name = name.replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], " ");
+    let name = if name.trim().is_empty() { "Flux MoE playlist".to_string() } else { name.trim().to_string() };
+    let dir = lib.folder.join("Playlists");
+    let path = dir.join(format!("{name}.m3u8"));
+    let mut text = String::from("#EXTM3U\n");
+    for f in files {
+        text += &format!("#EXTINF:-1,{}\n{}\n", playlist::title_from_path(&f.to_string_lossy()), f.to_string_lossy());
+    }
+    std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, text)).map_err(|e| format!("could not save the playlist: {e}"))?;
+    Ok((name, path))
 }
 
 /// Where a torrent's files are: its own folder, or its single file.
