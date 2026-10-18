@@ -99,10 +99,56 @@ pub fn restore(session: &Arc<Session>, ledger: &seed::Ledger, folder: &Path) -> 
         .collect()
 }
 
-/// Add a torrent. Through the VPN (`tunnelled`) every torrent loses its udp://
-/// trackers before librqbit sees it (they would bypass the tunnel), and .torrent
+/// A torrent read but not added yet: its files, to choose from (`add_listed`).
+pub struct Listed {
+    pub label: String,
+    pub name: String,
+    /// (the file's index in the torrent, its path inside it with `/` between folders, size).
+    /// Padding files are left out; the indexes stay the torrent's.
+    pub files: Vec<(usize, String, u64)>,
+    add: AddTorrent<'static>,
+    folder: PathBuf,
+    peers: Vec<std::net::SocketAddr>,
+}
+
+impl Listed {
+    /// Where it will be saved.
+    pub fn folder(&self) -> &std::path::Path {
+        &self.folder
+    }
+
+    #[cfg(test)]
+    pub fn for_test(name: &str, files: Vec<(usize, String, u64)>) -> Self {
+        Listed {
+            label: name.into(),
+            name: name.into(),
+            files,
+            add: AddTorrent::from_bytes(Vec::<u8>::new()),
+            folder: PathBuf::from("/dl").join(name),
+            peers: Vec::new(),
+        }
+    }
+}
+
+/// Read a torrent (a magnet's metadata comes from its peers) without adding it.
+pub enum Listing {
+    New(Listed),
+    /// It is in the list already.
+    Already(Transfer),
+}
+
+/// Add a torrent with all its files. Through the VPN (`tunnelled`) every torrent loses its
+/// udp:// trackers before librqbit sees it (they would bypass the tunnel), and .torrent
 /// URLs are fetched through it with `http`.
 pub async fn add(session: Arc<Session>, http: reqwest::Client, tunnelled: bool, folder: PathBuf, label: String, source: Source) -> Result<Transfer, String> {
+    match list(&session, http, tunnelled, folder, label, source).await? {
+        Listing::Already(t) => Ok(t),
+        Listing::New(l) => add_listed(session, l, None).await,
+    }
+}
+
+/// The first half of `add`: the torrent's files, nothing added yet.
+pub async fn list(session: &Arc<Session>, http: reqwest::Client, tunnelled: bool, folder: PathBuf, label: String, source: Source) -> Result<Listing, String> {
     let add = match (source, tunnelled) {
         (Source::Link(s), false) => Ok(AddTorrent::from_url(s)),
         (Source::Link(s), true) => vpn::tunnel_link(&http, &s).await,
@@ -120,25 +166,38 @@ pub async fn add(session: Arc<Session>, http: reqwest::Client, tunnelled: bool, 
     // (qBittorrent's default). librqbit only makes that folder itself when no
     // output_folder is given, and ZenTorrent always gives the chosen "Save to". So
     // first list the files, then add from the same bytes (no second metadata fetch).
-    let listed = session.add_torrent(add, Some(AddTorrentOptions { list_only: true, ..Default::default() })).await;
-    let (add, folder, peers) = match listed {
+    match session.add_torrent(add, Some(AddTorrentOptions { list_only: true, ..Default::default() })).await {
         Ok(AddTorrentResponse::ListOnly(l)) => {
-            let files = l.info.iter_file_details().count();
-            let dest = torrent_folder(&folder, files, l.info.name().as_deref());
-            (AddTorrent::from_bytes(l.torrent_bytes), dest, l.seen_peers)
+            let count = l.info.iter_file_details().count();
+            let files: Vec<(usize, String, u64)> = l
+                .info
+                .iter_file_details()
+                .enumerate()
+                .filter(|(_, f)| !f.attrs().padding)
+                .map(|(i, f)| (i, f.filename.to_vec().join("/"), f.len))
+                .collect();
+            let name = l.info.name().map(|n| n.into_owned()).unwrap_or_else(|| label.clone());
+            let folder = torrent_folder(&folder, count, l.info.name().as_deref());
+            Ok(Listing::New(Listed { label, name, files, add: AddTorrent::from_bytes(l.torrent_bytes), folder, peers: l.seen_peers }))
         }
         // Already in the list (or added anyway): nothing more to do.
         Ok(AddTorrentResponse::Added(_, handle)) | Ok(AddTorrentResponse::AlreadyManaged(_, handle)) => {
             let name = handle.name().unwrap_or(label);
             let folder = handle.output_folder().to_path_buf();
-            return Ok(Transfer { name, folder, handle });
+            Ok(Listing::Already(Transfer { name, folder, handle }))
         }
-        Err(e) => return Err(crate::vpn::explain(format!("{label}: {e:#}"), tunnelled)),
-    };
+        Err(e) => Err(crate::vpn::explain(format!("{label}: {e:#}"), tunnelled)),
+    }
+}
+
+/// The second half of `add`: start it, with only the files in `only` (None: all of them).
+pub async fn add_listed(session: Arc<Session>, l: Listed, only: Option<Vec<usize>>) -> Result<Transfer, String> {
+    let Listed { label, add, folder, peers, .. } = l;
     let opts = AddTorrentOptions {
         output_folder: Some(folder.to_string_lossy().into_owned()),
         overwrite: true,
         initial_peers: (!peers.is_empty()).then_some(peers),
+        only_files: only,
         ..Default::default()
     };
     match session.add_torrent(add, Some(opts)).await {

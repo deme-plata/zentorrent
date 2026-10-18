@@ -43,6 +43,7 @@ mod listview;
 mod mcp;
 mod meta;
 mod moe;
+mod pick;
 mod player;
 mod remove;
 mod repair;
@@ -476,6 +477,8 @@ struct Inbox {
     cover_large: Vec<(String, Option<egui::ColorImage>)>,
     /// (label, .torrent URL, cookie) of feed downloads the site was too overloaded to give.
     overloaded: Vec<(String, String, String)>,
+    /// Torrents read, waiting for the user to choose their files.
+    listed: Vec<engine::Listed>,
     busy: usize,
     /// Result of the VPN window's "Test relay" (handshake + ping, ms).
     vpn_test: Option<Result<u128, String>>,
@@ -588,6 +591,8 @@ struct App {
     /// Torrents selected in Downloads (info-hashes), and the one a Shift-click counts from.
     sel: HashSet<String>,
     sel_anchor: Option<String>,
+    /// Torrents the user added, waiting in the "Choose what to download" window.
+    picks: Vec<pick::Pick>,
     /// Where each Downloads row was drawn last frame (clicks and the selection box use it).
     row_rects: HashMap<String, egui::Rect>,
     /// A selection box being drawn: where it started, and the selection it adds to (Ctrl).
@@ -708,6 +713,7 @@ impl App {
             confirm_remove: Vec::new(),
             sel: HashSet::new(),
             sel_anchor: None,
+            picks: Vec::new(),
             row_rects: HashMap::new(),
             band: None,
             tray: (tray::supported() && tray::wanted())
@@ -911,14 +917,14 @@ impl App {
     fn open_item(&mut self, ctx: &egui::Context, item: String) {
         self.view = View::Downloads;
         if item.starts_with("magnet:") {
-            self.start(ctx, vpn::link_label(&item), Source::Link(item));
+            self.start_asking(ctx, vpn::link_label(&item), Source::Link(item));
             return;
         }
         let path = PathBuf::from(&item);
         match std::fs::read(&path) {
             Ok(bytes) => {
                 let label = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
-                self.start(ctx, label, Source::Bytes(bytes));
+                self.start_asking(ctx, label, Source::Bytes(bytes));
             }
             Err(e) => self.errors.push(format!("{}: {e}", path.display())),
         }
@@ -1002,6 +1008,17 @@ impl App {
                         None
                     };
                 }
+            }
+            let mut ask = ask_files();
+            if ui
+                .checkbox(&mut ask, "Choose which files to download when adding a torrent")
+                .on_hover_text(
+                    "A torrent with several files shows its folders and files first, all ticked: untick what you \
+                     don't want. Auto-download rules always take everything.",
+                )
+                .changed()
+            {
+                set_pref("ask_files", serde_json::json!(ask));
             }
             if assoc::supported() {
                 let mut on = assoc::wanted();
@@ -2004,6 +2021,81 @@ impl App {
         }
     }
 
+    /// A torrent the user added: with several files, they choose which first (all ticked;
+    /// see `pick`). Off under Settings, or no engine: as `start`.
+    fn start_asking(&mut self, ctx: &egui::Context, label: String, source: Source) {
+        let Some(session) = self.session.clone().filter(|_| ask_files()) else {
+            return self.start(ctx, label, source);
+        };
+        let (folder, inbox, ctx, http, tunnelled) = (self.folder.clone(), self.inbox.clone(), ctx.clone(), self.http.clone(), self.vpn.is_up());
+        let again = match &source {
+            Source::Fetch { url, cookie } => Some((label.clone(), url.clone(), cookie.clone())),
+            _ => None,
+        };
+        inbox.lock().unwrap().busy += 1;
+        self.rt.spawn(async move {
+            let res = match engine::list(&session, http, tunnelled, folder, label, source).await {
+                Ok(engine::Listing::Already(t)) => Ok(Some(t)),
+                Ok(engine::Listing::New(l)) if l.files.len() > 1 => {
+                    inbox.lock().unwrap().listed.push(l);
+                    Ok(None)
+                }
+                // One file: nothing to choose.
+                Ok(engine::Listing::New(l)) => engine::add_listed(session, l, None).await.map(Some),
+                Err(e) => Err(e),
+            };
+            let mut ib = inbox.lock().unwrap();
+            ib.busy -= 1;
+            match res {
+                Ok(Some(t)) => ib.added.push(t),
+                Ok(None) => {}
+                Err(e) => match again.filter(|_| e.contains(rss::OVERLOADED)) {
+                    Some(a) => {
+                        ib.errors.push(format!("{e} — ZenTorrent tries again by itself every {} min", SITE_RETRY.as_secs() / 60));
+                        ib.overloaded.push(a);
+                    }
+                    None => ib.errors.push(e),
+                },
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    /// The "Choose what to download" window, one torrent at a time.
+    fn pick_dialog(&mut self, ctx: &egui::Context) {
+        let waiting = self.picks.len().saturating_sub(1);
+        let Some(p) = self.picks.first_mut() else { return };
+        let mut ask = ask_files();
+        let choice = pick::show(ctx, p, &mut ask, waiting);
+        if ask != ask_files() {
+            set_pref("ask_files", serde_json::json!(ask));
+        }
+        match choice {
+            Some(true) => {
+                let p = self.picks.remove(0);
+                let only = p.only();
+                let Some(session) = self.session.clone() else { return };
+                let (inbox, ctx) = (self.inbox.clone(), ctx.clone());
+                inbox.lock().unwrap().busy += 1;
+                self.rt.spawn(async move {
+                    let res = engine::add_listed(session, p.listed, only).await;
+                    let mut ib = inbox.lock().unwrap();
+                    ib.busy -= 1;
+                    match res {
+                        Ok(t) => ib.added.push(t),
+                        Err(e) => ib.errors.push(e),
+                    }
+                    ctx.request_repaint();
+                });
+                self.view = View::Downloads;
+            }
+            Some(false) => {
+                self.picks.remove(0);
+            }
+            None => {}
+        }
+    }
+
     /// Start a torrent in the background. `source` is a magnet link, an
     /// http(s) URL to a .torrent file, or the raw bytes of a .torrent file.
     fn start(&mut self, ctx: &egui::Context, label: String, source: Source) {
@@ -2417,6 +2509,9 @@ impl App {
         if let Some(u) = ib.update.take() {
             self.upd = u;
         }
+        for l in ib.listed.drain(..) {
+            self.picks.push(pick::Pick::new(l));
+        }
         for t in ib.added.drain(..) {
             let id = t.handle.id();
             if !self.transfers.iter().any(|x| x.handle.id() == id) {
@@ -2566,6 +2661,11 @@ fn saved_folder() -> Option<PathBuf> {
 
 fn remember_folder(dir: &std::path::Path) {
     set_pref("save_to", serde_json::json!(dir.to_string_lossy()));
+}
+
+/// Whether adding a torrent with several files asks which to download (on unless turned off).
+fn ask_files() -> bool {
+    pref("ask_files").and_then(|v| v.as_bool()).unwrap_or(true)
 }
 
 /// One setting.
@@ -2884,7 +2984,7 @@ impl eframe::App for App {
                     || (edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
                 if go && !self.link.trim().is_empty() {
                     let link = self.link.trim().to_string();
-                    self.start(ctx, vpn::link_label(&link), Source::Link(link));
+                    self.start_asking(ctx, vpn::link_label(&link), Source::Link(link));
                     self.link.clear();
                 }
                 if ui
@@ -2896,7 +2996,7 @@ impl eframe::App for App {
                         match std::fs::read(&path) {
                             Ok(bytes) => {
                                 let label = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
-                                self.start(ctx, label, Source::Bytes(bytes));
+                                self.start_asking(ctx, label, Source::Bytes(bytes));
                             }
                             Err(e) => self.errors.push(format!("{}: {e}", path.display())),
                         }
@@ -2926,6 +3026,7 @@ impl eframe::App for App {
         // Drawn before the central panels; as a modal it sits above all of them.
         self.details_ui(ctx);
         self.remove_dialog(ctx);
+        self.pick_dialog(ctx);
         if self.view == View::Seeding {
             egui::CentralPanel::default().show(root, |ui| self.seeding_ui(ui));
             ctx.request_repaint_after(Duration::from_millis(1000));
@@ -4071,7 +4172,7 @@ impl App {
                 self.fv.status.insert(u.clone(), format!("starting “{title}” — see Downloads"));
                 self.fv.last_pick = Some(u);
             }
-            self.start(ctx, title, Source::from_feed(link, &cookie));
+            self.start_asking(ctx, title, Source::from_feed(link, &cookie));
         }
     }
 }
