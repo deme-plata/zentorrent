@@ -28,6 +28,7 @@ const SITE_RETRY: Duration = Duration::from_secs(3 * 60);
 const SITE_TRIES: u32 = 40;
 
 mod assoc;
+mod autodl;
 mod autostart;
 mod cover;
 mod db;
@@ -535,6 +536,22 @@ struct FeedView {
     login_busy: bool,
     /// Feed of the last ⬇ click, to open its login box if the site refuses.
     last_pick: Option<String>,
+    /// The auto-download rule being made or changed.
+    rule_edit: Option<RuleEdit>,
+}
+
+/// The auto-download rule editor.
+struct RuleEdit {
+    rule: autodl::Rule,
+    /// The rule it changes; None = a new one.
+    index: Option<usize>,
+    /// The name follows what is typed until the user names it.
+    auto_name: bool,
+    /// What it would have caught (history indexes, newest first), and what that was worked out for.
+    preview: Result<Vec<usize>, String>,
+    preview_key: Option<(String, autodl::Quality, String, bool, u64)>,
+    /// Also download the matching items the feeds list right now.
+    also_now: bool,
 }
 
 /// How often a tunnel that is down is tried again (kill switch on).
@@ -2094,6 +2111,11 @@ impl App {
                         .unwrap_or_default();
                     self.start(ctx, title, Source::from_feed(link, &cookie));
                 }
+                // Flux MoE's auto-download rule, after Add rule.
+                Action::Rule { rule, .. } => {
+                    self.store.rules.push(rule);
+                    self.save_feeds();
+                }
                 // Moves are done by the tab itself (files only, after Apply).
                 Action::Moves { .. } => {}
                 // Result lists are shown in the tab; their Download buttons send Download.
@@ -2221,12 +2243,14 @@ impl App {
                 Ok(items) => {
                     let stamp = format!("{} items · {}", items.len(), clock());
                     if let Some(f) = self.store.feeds.iter_mut().find(|f| f.url == url) {
-                        let auto: Vec<rss::Item> = f.absorb(&items).into_iter().cloned().collect();
+                        let fresh = f.fresh(&items, history::now());
                         dirty = true;
                         let cookie = rss::feed_cookie(&f.cookie, &f.url);
-                        for it in auto {
-                            self.fv.status.insert(url.clone(), format!("auto-downloading “{}”", it.title));
-                            self.start(ctx, it.title.clone(), Source::from_feed(it.link.clone(), &cookie));
+                        // The auto-download rules: what they want of the new items.
+                        for (ri, e) in autodl::pick(&mut self.store.rules, &fresh, history::now()) {
+                            let rule = self.store.rules[ri].name.clone();
+                            self.fv.status.insert(url.clone(), format!("auto-downloading “{}” (rule {rule})", e.title));
+                            self.start(ctx, e.title.clone(), Source::from_feed(e.link.clone(), &cookie));
                         }
                     }
                     self.fv.status.entry(url.clone()).and_modify(|s| {
@@ -3078,6 +3102,220 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// The auto-download rules in the RSS tab: one line each, and the editor.
+    fn rules_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let n = self.store.rules.len();
+        let on = self.store.rules.iter().filter(|r| r.enabled).count();
+        let head = if n == 0 { "⚡ Auto-download".to_string() } else { format!("⚡ Auto-download  ·  {on} of {n} rule{} on", if n == 1 { "" } else { "s" }) };
+        let names: HashMap<String, String> = self.store.feeds.iter().map(|f| (history::feed_key(&f.url), f.name.clone())).collect();
+        let now = history::now();
+        let (mut changed, mut edit, mut remove, mut new) = (false, None, None, false);
+        egui::CollapsingHeader::new(egui::RichText::new(head).strong()).id_salt("autodl-rules").default_open(true).show(ui, |ui| {
+            if n == 0 {
+                ui.label(
+                    egui::RichText::new(
+                        "New items in your feeds can download by themselves: the next episodes of a show, a season, an \
+                         artist. Make a rule here, right-click an item below and pick “Auto-download more like this…”, or ask Flux MoE.",
+                    )
+                    .weak()
+                    .small(),
+                );
+            }
+            for (i, r) in self.store.rules.iter_mut().enumerate() {
+                ui.horizontal_wrapped(|ui| {
+                    changed |= ui.checkbox(&mut r.enabled, "").on_hover_text("On / off").changed();
+                    let name = egui::RichText::new(&r.name).strong();
+                    ui.label(if r.enabled { name } else { name.weak() });
+                    let what = if r.regex { format!("pattern  {}", r.query) } else { autodl::plan(&r.query, r.quality).describe() };
+                    ui.label(egui::RichText::new(what).small().color(egui::Color32::from_rgb(140, 170, 200)));
+                    let feed = if r.feed_key.is_empty() { "all feeds".to_string() } else { names.get(&r.feed_key).cloned().unwrap_or_else(|| "a removed feed".into()) };
+                    ui.label(egui::RichText::new(feed).weak().small());
+                    let stats = if r.hits == 0 {
+                        "nothing yet".to_string()
+                    } else {
+                        format!("{} downloaded · last {} ago", r.hits, history::ago(now.saturating_sub(r.last_at)))
+                    };
+                    ui.label(egui::RichText::new(stats).weak().small()).on_hover_text(if r.last.is_empty() { "—" } else { r.last.as_str() });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("Remove").on_hover_text("Remove this rule").clicked() {
+                            remove = Some(i);
+                        }
+                        if ui.small_button("Edit").clicked() {
+                            edit = Some(i);
+                        }
+                    });
+                });
+            }
+            ui.horizontal_wrapped(|ui| {
+                new = ui.button("+ New rule…").clicked();
+                ui.label(egui::RichText::new("or right-click an item below: “Auto-download more like this…”").weak().small());
+            });
+        });
+        if changed {
+            self.save_feeds();
+        }
+        if let Some(i) = remove {
+            self.store.rules.remove(i);
+            self.save_feeds();
+        }
+        if let Some(i) = edit {
+            let r = self.store.rules[i].clone();
+            self.edit_rule(r, Some(i));
+        }
+        if new {
+            self.edit_rule(autodl::new_rule(), None);
+        }
+        self.rule_editor(ctx);
+    }
+
+    /// Open the rule editor on `rule` (`index`: the rule it changes).
+    fn edit_rule(&mut self, rule: autodl::Rule, index: Option<usize>) {
+        self.view = View::Feeds;
+        self.fv.rule_edit = Some(RuleEdit { rule, index, auto_name: index.is_none(), preview: Ok(Vec::new()), preview_key: None, also_now: false });
+    }
+
+    /// The rule editor window: what to download, quality, feed, and what it would catch.
+    fn rule_editor(&mut self, ctx: &egui::Context) {
+        let Some(ed) = self.fv.rule_edit.as_mut() else { return };
+        let entries = &self.feed_hist.entries;
+        let key = (ed.rule.query.clone(), ed.rule.quality, ed.rule.feed_key.clone(), ed.rule.regex, self.feed_hist.version);
+        if ed.preview_key.as_ref() != Some(&key) {
+            ed.preview = autodl::preview(&ed.rule, entries);
+            ed.preview_key = Some(key);
+        }
+        let feeds: Vec<(String, String)> = self.store.feeds.iter().map(|f| (history::feed_key(&f.url), f.name.clone())).collect();
+        let (mut open, mut save, mut cancel) = (true, false, false);
+        let title = if ed.index.is_some() { "Edit auto-download rule" } else { "New auto-download rule" };
+        egui::Window::new(title)
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(560.0)
+            .default_pos(ctx.content_rect().center_top() + egui::vec2(-280.0, 110.0))
+            .show(ctx, |ui| {
+            ui.label(egui::RichText::new("What to download").strong());
+            let hint = if ed.rule.regex {
+                "a regular expression on the title, e.g.  debian.*netinst"
+            } else {
+                "e.g.  the bear s04 1080p   ·   severance s02e05+   ·   above beyond flac -remix"
+            };
+            let q = ui.add(egui::TextEdit::singleline(&mut ed.rule.query).hint_text(hint).desired_width(f32::INFINITY)).on_hover_text(autodl::HELP);
+            let mut renamed = q.changed();
+            ui.horizontal_wrapped(|ui| {
+                ui.add_enabled_ui(!ed.rule.regex, |ui| {
+                    egui::ComboBox::from_id_salt("rule-quality").selected_text(ed.rule.quality.label()).show_ui(ui, |ui| {
+                        for qual in autodl::Quality::ALL {
+                            renamed |= ui.selectable_value(&mut ed.rule.quality, qual, qual.label()).changed();
+                        }
+                    });
+                });
+                let feed_name = if ed.rule.feed_key.is_empty() {
+                    "All feeds".to_string()
+                } else {
+                    feeds.iter().find(|(k, _)| *k == ed.rule.feed_key).map(|(_, n)| n.clone()).unwrap_or_else(|| "a removed feed".into())
+                };
+                egui::ComboBox::from_id_salt("rule-feed").selected_text(feed_name).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut ed.rule.feed_key, String::new(), "All feeds");
+                    for (k, n) in &feeds {
+                        ui.selectable_value(&mut ed.rule.feed_key, k.clone(), n);
+                    }
+                });
+                ui.checkbox(&mut ed.rule.once_per_episode, "Each episode once").on_hover_text(
+                    "When a 720p and a 1080p release of an episode both turn up, only the first one is downloaded \
+                     (also when another rule got it)",
+                );
+            });
+            if renamed && ed.auto_name && !ed.rule.regex {
+                ed.rule.name = autodl::name_for(&ed.rule.query, ed.rule.quality);
+            }
+            ui.horizontal(|ui| {
+                ui.label("Name");
+                if ui.add(egui::TextEdit::singleline(&mut ed.rule.name).desired_width(260.0)).changed() {
+                    ed.auto_name = false;
+                }
+                ui.checkbox(&mut ed.rule.enabled, "On");
+            });
+            ui.collapsing("Advanced", |ui| {
+                ui.checkbox(&mut ed.rule.regex, "A regular expression instead (on the title, any case)");
+            });
+            ui.separator();
+            match &ed.preview {
+                // Nothing typed yet: a hint, not an error.
+                Err(_) if ed.rule.query.trim().is_empty() => {
+                    ui.label(egui::RichText::new("Type a show, an artist or other words from the title; the matches show here.").weak());
+                }
+                Err(e) => {
+                    ui.colored_label(egui::Color32::LIGHT_RED, e);
+                }
+                Ok(hits) => {
+                    if !ed.rule.regex {
+                        let plan = autodl::plan(&ed.rule.query, ed.rule.quality);
+                        ui.label(egui::RichText::new(format!("Understood as:  {}", plan.describe())).color(egui::Color32::from_rgb(140, 170, 200)));
+                    }
+                    if hits.is_empty() {
+                        ui.label(egui::RichText::new("Nothing ZenTorrent has seen in your feeds matches yet; it will catch new items that do.").weak());
+                    } else {
+                        ui.label(format!("{} of the {} items seen in your feeds match — newest:", hits.len(), entries.len()));
+                        egui::ScrollArea::vertical().id_salt("rule-preview").max_height(180.0).show(ui, |ui| {
+                            for &i in hits.iter().take(40) {
+                                let e = &entries[i];
+                                let live = if e.in_feed { "in the feed now" } else { "history" };
+                                ui.label(egui::RichText::new(format!("{}    · {} · {live}", e.title, e.feed)).small());
+                            }
+                            if hits.len() > 40 {
+                                ui.label(egui::RichText::new(format!("…and {} more", hits.len() - 40)).weak().small());
+                            }
+                        });
+                        let live = hits.iter().filter(|&&i| entries[i].in_feed).count();
+                        if live > 0 {
+                            ui.checkbox(&mut ed.also_now, format!("Also download the {live} in the feeds right now"));
+                        }
+                    }
+                }
+            }
+            ui.separator();
+            ui.horizontal(|ui| {
+                let ok = ed.preview.is_ok() && !ed.rule.name.trim().is_empty();
+                save = ui.add_enabled(ok, egui::Button::new(egui::RichText::new("Save rule").strong())).clicked();
+                cancel = ui.button("Cancel").clicked();
+                ui.label(egui::RichText::new("Only new items download by themselves.").weak().small());
+            });
+        });
+        if cancel || !open {
+            self.fv.rule_edit = None;
+            return;
+        }
+        if !save {
+            return;
+        }
+        let ed = self.fv.rule_edit.take().unwrap();
+        let idx = match ed.index.filter(|&i| i < self.store.rules.len()) {
+            Some(i) => {
+                self.store.rules[i] = ed.rule;
+                i
+            }
+            None => {
+                self.store.rules.push(ed.rule);
+                self.store.rules.len() - 1
+            }
+        };
+        if ed.also_now {
+            let live: Vec<history::Entry> =
+                ed.preview.unwrap_or_default().iter().map(|&i| &self.feed_hist.entries[i]).filter(|e| e.in_feed).cloned().collect();
+            for (_, e) in autodl::pick(&mut self.store.rules[idx..=idx], &live, history::now()) {
+                let cookie = self
+                    .store
+                    .feeds
+                    .iter()
+                    .find(|f| history::feed_key(&f.url) == e.feed_key)
+                    .map(|f| rss::feed_cookie(&f.cookie, &f.url))
+                    .unwrap_or_default();
+                self.start(ctx, e.title.clone(), Source::from_feed(e.link.clone(), &cookie));
+            }
+        }
+        self.save_feeds();
+    }
+
     /// What is kept on quitting: bookmarks, the ratio ledger, RSS history.
     fn save_all(&mut self) {
         if let Some(p) = self.player.as_mut() {
@@ -3253,24 +3491,6 @@ impl App {
             });
             if sel {
                 ui.horizontal(|ui| {
-                    changed |= ui.checkbox(&mut f.auto_enabled, "Auto-download new items matching").changed();
-                    let r = ui.add(
-                        egui::TextEdit::singleline(&mut f.auto_regex)
-                            .hint_text("e.g.  debian.*netinst|ubuntu")
-                            .desired_width(260.0),
-                    );
-                    changed |= r.lost_focus();
-                    match rss::rule(f) {
-                        Some(Err(_)) => {
-                            ui.colored_label(egui::Color32::LIGHT_RED, "invalid pattern");
-                        }
-                        Some(Ok(_)) => {
-                            ui.label(egui::RichText::new("only items that appear after now").weak().small());
-                        }
-                        None => {}
-                    }
-                });
-                ui.horizontal(|ui| {
                     ui.label("Log in to the tracker:").on_hover_text(
                         "Needed when the site says \"registered users only\". ZenTorrent logs in once and keeps \
                          only the session cookie. Your password is not saved.",
@@ -3335,6 +3555,8 @@ impl App {
             self.fv.selected = None;
             self.save_feeds();
         }
+        ui.separator();
+        self.rules_ui(ui, ctx);
         ui.separator();
 
         // ── items: search over what the feeds list now, or the whole history ─
@@ -3412,6 +3634,8 @@ impl App {
 
         let many_feeds = self.store.feeds.len() > 1 || self.fv.scope_history;
         let mut pick: Option<usize> = None;
+        // Right-click on an item's title → "Auto-download more like this".
+        let mut like: Option<usize> = None;
         // Cached ratings always show; NEW lookups stop while the key is refused.
         let ratings_on = self.store.show_ratings && !self.store.omdb_key.trim().is_empty();
         let can_lookup = ratings_on && self.meta_error.is_none();
@@ -3490,7 +3714,14 @@ impl App {
                             if ui.small_button("⬇").on_hover_text("Download").clicked() {
                                 pick = Some(i);
                             }
-                            ui.label(&e.title).on_hover_text(if e.description.is_empty() { "—" } else { e.description.as_str() });
+                            let t = ui
+                                .add(egui::Label::new(&e.title).sense(egui::Sense::click()))
+                                .on_hover_text(if e.description.is_empty() { "—" } else { e.description.as_str() });
+                            match item_menu(&t, &e.title) {
+                                Some(ItemAct::Download) => pick = Some(i),
+                                Some(ItemAct::Like) => like = Some(i),
+                                None => {}
+                            }
                             tags(ui, &e.category, &genre);
                             swarm(ui, e, now);
                             ui.label(egui::RichText::new(&sub).weak().small());
@@ -3518,7 +3749,15 @@ impl App {
                         }
                         ui.vertical(|ui| {
                             ui.horizontal_wrapped(|ui| {
-                                ui.strong(format!("{} ({})", info.title, info.year));
+                                let t = ui.add(
+                                    egui::Label::new(egui::RichText::new(format!("{} ({})", info.title, info.year)).strong())
+                                        .sense(egui::Sense::click()),
+                                );
+                                match item_menu(&t, &e.title) {
+                                    Some(ItemAct::Download) => pick = Some(i),
+                                    Some(ItemAct::Like) => like = Some(i),
+                                    None => {}
+                                }
                                 tags(ui, &e.category, &genre);
                             });
                             ui.horizontal_wrapped(|ui| {
@@ -3604,6 +3843,10 @@ impl App {
             self.textures.insert(imdb_id.clone(), None);
             let _ = self.meta_jobs.send(MetaJob::Poster { imdb_id, url });
         }
+        if let Some(i) = like {
+            let rule = autodl::like(&self.feed_hist.entries[i]);
+            self.edit_rule(rule, None);
+        }
         if let Some(i) = pick {
             // The feed's log-in cookie; a feed removed since has none.
             let e = &self.feed_hist.entries[i];
@@ -3618,6 +3861,36 @@ impl App {
             self.start(ctx, title, Source::from_feed(link, &cookie));
         }
     }
+}
+
+/// What the right-click menu on a feed item's title asks for.
+enum ItemAct {
+    Download,
+    Like,
+}
+
+/// The right-click menu on a feed item's title.
+fn item_menu(r: &egui::Response, title: &str) -> Option<ItemAct> {
+    let mut act = None;
+    r.context_menu(|ui| {
+        if ui.button("⬇  Download").clicked() {
+            act = Some(ItemAct::Download);
+            ui.close();
+        }
+        if ui
+            .button("⚡  Auto-download more like this…")
+            .on_hover_text("A rule that downloads new episodes (or releases) like this one by themselves")
+            .clicked()
+        {
+            act = Some(ItemAct::Like);
+            ui.close();
+        }
+        if ui.button("Copy title").clicked() {
+            ui.ctx().copy_text(title.to_string());
+            ui.close();
+        }
+    });
+    act
 }
 
 /// Current UTC time as HH:MM, for "last read" stamps.

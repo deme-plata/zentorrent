@@ -103,6 +103,15 @@ impl mcp::Host for Headless {
                     .unwrap_or_default();
                 self.add(title, Source::from_feed(link, &cookie))
             }
+            Action::Rule { rule, .. } => {
+                // The feed loop reads the store each round and keeps rules added meanwhile.
+                let mut store = rss::FeedStore::load();
+                let name = rule.name.clone();
+                store.rules.push(rule);
+                store.save().map_err(|e| format!("{e:#}"))?;
+                println!("auto-download rule added: {name}");
+                Ok(format!("added the auto-download rule {name}"))
+            }
             Action::Moves { moves, .. } => {
                 let (n, problems) = moe::organize::apply(&moves);
                 let msg = format!("moved {n}{}", if problems.is_empty() { String::new() } else { format!("; problems: {}", problems.join("; ")) });
@@ -204,11 +213,11 @@ async fn feeds(host: Arc<Headless>) {
         for f in store.feeds.iter_mut() {
             match rss::fetch(&host.http, &f.url).await {
                 Ok(items) => {
-                    let auto: Vec<rss::Item> = f.absorb(&items).into_iter().cloned().collect();
+                    let fresh = f.fresh(&items, history::now());
                     host.history.lock().unwrap().absorb(&f.name, &f.url, &items, history::now());
                     let cookie = rss::feed_cookie(&f.cookie, &f.url);
-                    for it in auto {
-                        println!("auto-download ({}): {}", f.name, it.title);
+                    for (ri, it) in crate::autodl::pick(&mut store.rules, &fresh, history::now()) {
+                        println!("auto-download ({}, rule {}): {}", f.name, store.rules[ri].name, it.title);
                         let (h, title, src) = (host.clone(), it.title.clone(), Source::from_feed(it.link.clone(), &cookie));
                         // add() blocks on the runtime: run it off the async workers.
                         let _ = tokio::task::spawn_blocking(move || {
@@ -220,6 +229,12 @@ async fn feeds(host: Arc<Headless>) {
                     }
                 }
                 Err(e) => eprintln!("feed {}: {e:#}", f.name),
+            }
+        }
+        // A rule added while the feeds were read (Flux MoE over MCP) is kept.
+        for r in rss::FeedStore::load().rules {
+            if !store.rules.iter().any(|x| x.name == r.name && x.query == r.query) {
+                store.rules.push(r);
             }
         }
         if let Err(e) = store.save() {

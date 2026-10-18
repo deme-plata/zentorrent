@@ -226,7 +226,25 @@ const STARTERS: &[(&str, &str, &str, &str)] = &[
     ("▶", "Play something", "It picks something good from your library", "Play something from my library — pick something good and tell me what it is."),
 ];
 
+/// Templates: a click puts the start of a request in the input box, for the user to finish.
+const TEMPLATES: &[(&str, &str, &str, &str)] = &[(
+    "⚡",
+    "Set up an RSS auto-download",
+    "A rule that downloads new episodes or releases by themselves — type the show or artist",
+    "Auto-download new episodes of ",
+)];
+
 impl Moe {
+    /// Put a template in the input box, cursor at its end.
+    fn template(&mut self, ui: &egui::Ui, text: &str) {
+        self.input = text.to_string();
+        let id = egui::Id::new("moe-input-text");
+        let mut st = egui::text_edit::TextEditState::load(ui.ctx(), id).unwrap_or_default();
+        st.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(text.chars().count()))));
+        st.store(ui.ctx(), id);
+        ui.memory_mut(|m| m.request_focus(id));
+    }
+
     fn save_settings(&self) {
         let _ = std::fs::create_dir_all(crate::seed::data_dir());
         let _ = crate::db::save("flux-moe", &serde_json::to_vec_pretty(&self.settings).unwrap_or_default());
@@ -584,6 +602,7 @@ impl Moe {
         // ── input (bottom) ──────────────────────────────────────
         let ready = matches!(self.status, Status::Ready(_)) && !self.busy;
         let mut send: Option<String> = None;
+        let mut template: Option<String> = None;
         egui::Panel::bottom("moe-input").show(ui, |ui| {
             ui.add_space(6.0);
             // What the last answer offered to do next ("Organize my music"), one click each.
@@ -614,6 +633,14 @@ impl Moe {
                             ui.close();
                         }
                     }
+                    ui.separator();
+                    ui.label(RichText::new("Start from a template").small().weak());
+                    for (icon, label, hint, text) in TEMPLATES {
+                        if ui.add_enabled(ready, egui::Button::new(format!("{icon}  {label}…"))).on_hover_text(*hint).clicked() {
+                            template = Some(text.to_string());
+                            ui.close();
+                        }
+                    }
                 })
                 .response
                 .on_hover_text("Questions to start from");
@@ -635,11 +662,15 @@ impl Moe {
         if send.is_some() {
             self.pending = send;
         }
+        if let Some(t) = template.take() {
+            self.template(ui, &t);
+        }
 
         // ── transcript ──────────────────────────────────────────
         let mut decided: Option<(usize, bool)> = None;
         let mut grab: Option<(usize, usize)> = None;
         let mut tile: Option<String> = None;
+        let mut template: Option<String> = None;
         egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
             if !self.talked() {
                 ui.add_space(16.0);
@@ -661,6 +692,16 @@ impl Moe {
                         let b = egui::Button::new(job).min_size(egui::vec2(290.0, 54.0)).corner_radius(10.0);
                         if ui.add_enabled(ready, b).clicked() {
                             tile = Some(prompt.to_string());
+                        }
+                    }
+                    for (icon, label, hint, text) in TEMPLATES {
+                        let mut job = egui::text::LayoutJob::default();
+                        let body = egui::TextStyle::Body.resolve(ui.style());
+                        job.append(&format!("{icon}  {label}…\n"), 0.0, egui::TextFormat::simple(body, Color32::from_rgb(250, 200, 40)));
+                        job.append(hint, 0.0, egui::TextFormat::simple(egui::TextStyle::Small.resolve(ui.style()), ui.visuals().weak_text_color()));
+                        let b = egui::Button::new(job).min_size(egui::vec2(290.0, 54.0)).corner_radius(10.0);
+                        if ui.add_enabled(ready, b).on_hover_text("Fills in the start; you finish it and press Send").clicked() {
+                            template = Some(text.to_string());
                         }
                     }
                 });
@@ -717,6 +758,9 @@ impl Moe {
         if tile.is_some() {
             self.pending = tile;
         }
+        if let Some(t) = template {
+            self.template(ui, &t);
+        }
 
         // A Download button in a result list: the click is the user's OK.
         if let Some((list, row)) = grab {
@@ -735,6 +779,10 @@ impl Moe {
                         let (n, problems) = organize::apply(moves);
                         card.state = CardState::Done(format!("Moved {n}.{}", if problems.is_empty() { String::new() } else { format!(" Problems: {}", problems.join("; ")) }));
                         self.can_undo = organize::can_undo();
+                    }
+                    Action::Rule { rule, .. } => {
+                        card.state = CardState::Done(format!("Rule “{}” added — it is in the RSS feeds tab, under ⚡ Auto-download.", rule.name));
+                        actions.push(card.action.clone());
                     }
                     other => {
                         actions.push(other.clone());
@@ -901,6 +949,24 @@ fn card_ui(ui: &mut egui::Ui, i: usize, c: &Card) -> Option<bool> {
                     ui.label(RichText::new(format!("from {from}")).small().weak());
                 }
             }
+            Action::Rule { rule, matched, examples } => {
+                ui.label(RichText::new("Add this auto-download rule?").strong());
+                ui.label(RichText::new(&rule.name).strong().color(Color32::from_rgb(250, 200, 40)));
+                ui.label(RichText::new(format!("Understood as:  {}", crate::autodl::plan(&rule.query, rule.quality).describe())).small());
+                ui.label(
+                    RichText::new(if *matched == 0 {
+                        "Nothing seen in your feeds matches yet; it will catch new items that do.".to_string()
+                    } else {
+                        format!("It would have caught {matched} item{} seen so far, e.g.:", if *matched == 1 { "" } else { "s" })
+                    })
+                    .small()
+                    .weak(),
+                );
+                for t in examples.iter().take(3) {
+                    ui.label(RichText::new(format!("  · {t}")).small().weak());
+                }
+                ui.label(RichText::new("From now on, new items that match download by themselves.").small().weak());
+            }
             Action::Moves { root, moves } => {
                 ui.label(RichText::new(format!("Move {} item{} in {}", moves.len(), if moves.len() == 1 { "" } else { "s" }, root.display())).strong());
                 egui::ScrollArea::vertical().id_salt(("moves", i)).max_height(220.0).show(ui, |ui| {
@@ -916,7 +982,11 @@ fn card_ui(ui: &mut egui::Ui, i: usize, c: &Card) -> Option<bool> {
         match &c.state {
             CardState::Waiting => {
                 ui.horizontal(|ui| {
-                    let go = if matches!(c.action, Action::Download { .. }) { "Download" } else { "Apply" };
+                    let go = match c.action {
+                        Action::Download { .. } => "Download",
+                        Action::Rule { .. } => "Add rule",
+                        _ => "Apply",
+                    };
                     if ui.button(RichText::new(go).strong()).clicked() {
                         out = Some(true);
                     }

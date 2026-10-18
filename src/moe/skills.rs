@@ -32,6 +32,9 @@ How you work:
 finds nothing, say so plainly.
 - Reply in the user's language (Danish or English), short and warm. Lists for results; no tables wider than the screen.
 - Feed results carry a number (id). To download one, call download with that id — the user confirms in the app.
+- \"Download new episodes of X\", \"always get X\", \"set up a filter / rule\": call auto_download with the show or \
+artist as they named it. Add a season, an episode or a quality only if they said one: never guess a season number. \
+It only proposes the rule; the user presses Add rule. If they did not say what, ask one short question.
 - “Best / top torrents” without a topic: search_feeds with NO query and sort=top. Never add a genre or a word the \
 user did not say.
 - To play, call play with the torrent's name (and a track if they asked for one). It starts at once.
@@ -123,6 +126,14 @@ pub fn tools() -> Value {
                    "limit": {"type":"integer","description":"max results, default 15"}}), &[]),
         tool("download", "Ask the user to confirm downloading a feed result (by its id from search_feeds).",
             json!({"id": {"type":"integer"}}), &["id"]),
+        tool("auto_download", "Propose an auto-download rule for the RSS feeds: from now on, NEW items that match \
+              download by themselves (the next episodes of a show, a season, an artist). The user sees how it is \
+              understood and what it would have caught so far, and confirms with Add rule.",
+            json!({"query": {"type":"string","description":"the show or artist exactly as the user named it, e.g. severance. \
+                                Add a season (s02), one episode (s02e05) or from-an-episode-on (s02e05+) ONLY if the \
+                                user said one: \"new episodes of X\" is just X. -word leaves a word out."},
+                   "quality": {"type":"string","enum":["any","720p","1080p","2160p"],"description":"only if the user named one"},
+                   "feed": {"type":"string","description":"a feed's name, only if the user named one"}}), &["query"]),
         tool("play", "Play a torrent's music/video in ZenTorrent's player now (streams what isn't downloaded yet).",
             json!({"torrent": {"type":"string"}, "track": {"type":"string","description":"optional: a track name to start at"}}), &["torrent"]),
         tool("scan_folder", "Summarise a folder: each sub-folder with media (an album, film or season) with its embedded \
@@ -177,6 +188,8 @@ pub enum Action {
     Moves { root: PathBuf, moves: Vec<organize::Move> },
     /// Feed results to show with a Download button each (display only; a click downloads).
     Picks(Vec<Pick>),
+    /// An auto-download rule. Needs the user's OK. `matched`: what it would have caught so far.
+    Rule { rule: crate::autodl::Rule, matched: usize, examples: Vec<String> },
 }
 
 /// One feed result as the user sees it in the chat.
@@ -233,7 +246,7 @@ fn varied(mut ranked: Vec<usize>, entries: &[history::Entry], n: usize, score: i
 
 impl Action {
     pub fn needs_ok(&self) -> bool {
-        matches!(self, Action::Download { .. } | Action::Moves { .. })
+        matches!(self, Action::Download { .. } | Action::Moves { .. } | Action::Rule { .. })
     }
 }
 
@@ -419,6 +432,41 @@ pub fn run(name: &str, args: &Value, lib: &Library, mem: &mut Memory) -> Outcome
                     receipt: format!("asks to download {}", e.title),
                     action: Some(Action::Download { title: e.title.clone(), link: e.link.clone(), feed_key: e.feed_key.clone() }),
                 },
+            }
+        }
+        "auto_download" => {
+            use crate::autodl;
+            let query = s("query");
+            let quality = match s("quality").to_ascii_lowercase().as_str() {
+                "720p" => autodl::Quality::P720,
+                "1080p" => autodl::Quality::P1080,
+                "2160p" | "4k" => autodl::Quality::P2160,
+                "480p" => autodl::Quality::P480,
+                _ => autodl::Quality::Any,
+            };
+            let feed = s("feed");
+            let feed_key = if feed.trim().is_empty() {
+                String::new()
+            } else {
+                let f = feed.to_lowercase();
+                match lib.feeds.iter().find(|e| e.feed.to_lowercase().contains(f.trim())) {
+                    Some(e) => e.feed_key.clone(),
+                    None => return error(format!("no feed called {feed}")),
+                }
+            };
+            let rule = autodl::Rule { name: autodl::name_for(&query, quality), query: query.clone(), quality, feed_key, ..autodl::new_rule() };
+            match autodl::preview(&rule, &lib.feeds) {
+                Err(e) => error(e),
+                Ok(hits) => {
+                    let examples: Vec<String> = hits.iter().take(5).map(|&i| lib.feeds[i].title.clone()).collect();
+                    let understood = autodl::plan(&query, quality).describe();
+                    Outcome {
+                        for_model: json!({ "understood_as": understood, "would_have_matched_so_far": hits.len(), "examples": examples,
+                                           "status": "shown to the user with an Add rule button — they confirm; don't call it again" }),
+                        receipt: format!("proposes the auto-download rule “{}”", rule.name),
+                        action: Some(Action::Rule { rule, matched: hits.len(), examples }),
+                    }
+                }
             }
         }
         "play" => match find(lib, &s("torrent")) {
@@ -638,6 +686,33 @@ mod tests {
             Some(Action::Picks(p)) => assert!(p.len() == 6 && p[0].link.contains("passkey"), "links stay in the app, for its buttons"),
             other => panic!("expected picks, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_auto_download_rule_is_proposed_with_what_it_would_catch() {
+        let mut l = lib();
+        let ep = |t: &str| history::Entry {
+            title: t.into(),
+            link: format!("https://t/{t}?passkey=X"),
+            feed: "TV".into(),
+            feed_key: "tv".into(),
+            ..Default::default()
+        };
+        l.feeds.extend([ep("The.Bear.S04E01.1080p.WEB"), ep("The.Bear.S04E01.720p.WEB"), ep("The.Bear.S03E01.1080p.WEB")]);
+        let mut mem = Memory::default();
+        let o = run("auto_download", &json!({"query": "the bear s04", "quality": "1080p", "feed": "tv"}), &l, &mut mem);
+        assert_eq!(o.for_model["understood_as"], "the bear · season 4 · 1080p");
+        assert_eq!(o.for_model["would_have_matched_so_far"], 1);
+        assert!(!o.for_model.to_string().contains("passkey"));
+        match &o.action {
+            Some(Action::Rule { rule, matched, .. }) => {
+                assert_eq!((rule.name.as_str(), rule.feed_key.as_str(), *matched), ("The Bear S04 1080p", "tv", 1));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(o.action.unwrap().needs_ok(), "the user confirms");
+        assert!(run("auto_download", &json!({"query": "s04"}), &l, &mut mem).for_model["error"].is_string(), "no words");
+        assert!(run("auto_download", &json!({"query": "bear", "feed": "nope"}), &l, &mut mem).for_model["error"].is_string());
     }
 
     #[test]

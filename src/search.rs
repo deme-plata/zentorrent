@@ -96,6 +96,11 @@ impl Query {
     pub fn is_empty(&self) -> bool {
         *self == Query::default()
     }
+
+    /// Whether it names something to look for (words or a phrase), not only filters.
+    pub fn has_words(&self) -> bool {
+        !self.words.is_empty() || !self.phrases.is_empty()
+    }
 }
 
 /// Lowercase words, split on anything that isn't a letter or digit.
@@ -287,6 +292,14 @@ fn score(e: &Entry, q: &Query, h: &Hay) -> Option<f64> {
     }
     // Among equal matches, the healthier swarm first.
     Some(total + (e.seeders.unwrap_or(0) as f64 + 1.0).ln() * 0.1)
+}
+
+/// For auto-download rules: field filters, exclusions and phrases as in a search, and every
+/// word in the TITLE (a rule must not fire because a description mentions a word).
+pub fn matches_title(e: &Entry, q: &Query) -> bool {
+    let h = Hay::new(e, "");
+    let rest = Query { words: Vec::new(), ..q.clone() };
+    score(e, &rest, &h).is_some() && q.words.iter().all(|w| word_score(w, &h.title) > 0.0)
 }
 
 /// Indexes into `entries` that match, best first.

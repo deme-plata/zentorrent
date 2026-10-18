@@ -6,9 +6,8 @@
 //! dir (`zentorrent/feeds.json`, mode 0600 on Unix) because private-tracker
 //! feed URLs carry a passkey, which is a credential.
 //!
-//! Each feed can have an auto-download rule: a case-insensitive regex; any
-//! NEW item whose title matches is started automatically. Items already
-//! seen are remembered by link so a restart never re-downloads them.
+//! New items (not in the feed's last read) go to the auto-download rules (`autodl`).
+//! Items already seen are remembered by link so a restart never re-downloads them.
 
 use regex::Regex;
 use std::collections::HashMap;
@@ -38,7 +37,8 @@ pub fn http() -> reqwest::Client {
 pub struct Feed {
     pub name: String,
     pub url: String,
-    /// Case-insensitive regex; empty = no auto-download.
+    /// The feed's own auto-download pattern from before 0.10.16; moved into
+    /// `FeedStore::rules` when the store is loaded.
     #[serde(default)]
     pub auto_regex: String,
     #[serde(default)]
@@ -59,24 +59,26 @@ pub struct Feed {
 }
 
 impl Feed {
-    /// Record a fresh read of the feed and return the items that should be
-    /// auto-downloaded (new since the last read AND matching the rule).
-    pub fn absorb<'a>(&mut self, items: &'a [Item]) -> Vec<&'a Item> {
-        let re = match rule(self) {
-            Some(Ok(re)) if self.primed => Some(re),
-            _ => None,
+    /// Record a fresh read of the feed and return its NEW items (not in an earlier read),
+    /// for the auto-download rules. The first read returns none: adding a feed never
+    /// downloads its backlog.
+    pub fn fresh(&mut self, items: &[Item], now: u64) -> Vec<crate::history::Entry> {
+        let key = crate::history::feed_key(&self.url);
+        let new = if self.primed {
+            items
+                .iter()
+                .filter(|i| !self.seen.contains(&i.link))
+                .map(|i| crate::history::Entry::from_item(i, &self.name, &key, now))
+                .collect()
+        } else {
+            Vec::new()
         };
-        let fresh: Vec<&Item> = items
-            .iter()
-            .filter(|i| !self.seen.contains(&i.link))
-            .filter(|i| re.as_ref().is_some_and(|re| re.is_match(&i.title)))
-            .collect();
         if self.seen.len() > 5000 {
             self.seen.clear();
         }
         self.seen.extend(items.iter().map(|i| i.link.clone()));
         self.primed = true;
-        fresh
+        new
     }
 }
 
@@ -91,6 +93,9 @@ pub struct FeedStore {
     pub omdb_key: String,
     #[serde(default = "yes")]
     pub show_ratings: bool,
+    /// Auto-download rules (see `autodl`).
+    #[serde(default)]
+    pub rules: Vec<crate::autodl::Rule>,
 }
 
 fn yes() -> bool {
@@ -137,7 +142,24 @@ impl FeedStore {
         if s.refresh_minutes == 0 {
             s.refresh_minutes = default_interval();
         }
+        s.move_old_rules();
         s
+    }
+
+    /// A feed's own pattern (before 0.10.16) becomes a rule in `rules`.
+    fn move_old_rules(&mut self) {
+        for f in self.feeds.iter_mut().filter(|f| !f.auto_regex.trim().is_empty()) {
+            self.rules.push(crate::autodl::Rule {
+                name: format!("{} (old rule)", f.name),
+                query: f.auto_regex.trim().to_string(),
+                regex: true,
+                enabled: f.auto_enabled,
+                feed_key: crate::history::feed_key(&f.url),
+                ..crate::autodl::new_rule()
+            });
+            f.auto_regex.clear();
+            f.auto_enabled = false;
+        }
     }
 
     pub fn save(&self) -> anyhow::Result<()> {
@@ -719,15 +741,6 @@ fn describe(body: &[u8]) -> String {
     if out.is_empty() { "(empty reply)".into() } else { out }
 }
 
-/// Compile a feed's auto-download rule. `None` = rule off or empty.
-pub fn rule(feed: &Feed) -> Option<Result<regex::Regex, regex::Error>> {
-    let pat = feed.auto_regex.trim();
-    if !feed.auto_enabled || pat.is_empty() {
-        return None;
-    }
-    Some(regex::RegexBuilder::new(pat).case_insensitive(true).build())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -847,18 +860,31 @@ mod tests {
     }
 
     #[test]
-    fn absorb_primes_then_fires_once_per_new_match() {
+    fn fresh_primes_then_returns_each_new_item_once() {
         let it = |t: &str, l: &str| Item { title: t.into(), link: l.into(), ..Default::default() };
-        let mut f = Feed { auto_regex: "debian".into(), auto_enabled: true, ..Default::default() };
-        // First read: backlog is recorded, nothing downloads.
-        assert!(f.absorb(&[it("Debian 12", "a")]).is_empty());
-        // New matching item fires; non-matching and already-seen do not.
-        let batch = [it("Debian 12", "a"), it("Debian 13", "b"), it("Fedora", "c")];
-        let got = f.absorb(&batch);
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].link, "b");
+        let mut f = Feed { name: "Distros".into(), url: "https://d.example/rss".into(), ..Default::default() };
+        // First read: the backlog is recorded, nothing is new.
+        assert!(f.fresh(&[it("Debian 12", "a")], 1).is_empty());
+        let got = f.fresh(&[it("Debian 12", "a"), it("Debian 13", "b"), it("Fedora", "c")], 2);
+        assert_eq!(got.iter().map(|e| e.link.as_str()).collect::<Vec<_>>(), ["b", "c"]);
+        assert_eq!((got[0].feed.as_str(), got[0].first_seen), ("Distros", 2));
         // Same read again: nothing new.
-        assert!(f.absorb(&[it("Debian 13", "b")]).is_empty());
+        assert!(f.fresh(&[it("Debian 13", "b")], 3).is_empty());
+    }
+
+    #[test]
+    fn a_feeds_old_pattern_becomes_a_rule() {
+        let json = r#"{"feeds":[{"name":"TB","url":"https://tb/rss?passkey=x","auto_regex":"debian.*netinst","auto_enabled":true},
+                                {"name":"Other","url":"https://o/rss"}]}"#;
+        let mut s: FeedStore = serde_json::from_str(json).unwrap();
+        s.move_old_rules();
+        assert_eq!(s.rules.len(), 1);
+        let r = &s.rules[0];
+        assert!(r.regex && r.enabled && r.query == "debian.*netinst" && r.name == "TB (old rule)");
+        assert_eq!(r.feed_key, crate::history::feed_key("https://tb/rss?passkey=x"));
+        assert!(s.feeds.iter().all(|f| f.auto_regex.is_empty() && !f.auto_enabled));
+        s.move_old_rules();
+        assert_eq!(s.rules.len(), 1, "once");
     }
 
     #[test]
@@ -914,13 +940,5 @@ mod tests {
         assert_eq!(parse_size("1,5 GiB"), Some(1_610_612_736));
         assert_eq!(parse_size("12"), Some(12));
         assert_eq!(parse_size("lots"), None);
-    }
-
-    #[test]
-    fn rule_is_case_insensitive_and_off_by_default() {
-        let mut f = Feed { auto_regex: "debian.*netinst".into(), ..Default::default() };
-        assert!(rule(&f).is_none());
-        f.auto_enabled = true;
-        assert!(rule(&f).unwrap().unwrap().is_match("DEBIAN 13 NETINST"));
     }
 }

@@ -65,7 +65,7 @@ pub struct Entry {
 }
 
 impl Entry {
-    fn from_item(it: &rss::Item, feed: &str, key: &str, now: u64) -> Self {
+    pub fn from_item(it: &rss::Item, feed: &str, key: &str, now: u64) -> Self {
         let mut e = Entry {
             link: it.link.clone(),
             feed_key: key.to_string(),
