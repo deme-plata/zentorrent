@@ -52,16 +52,24 @@ mod update;
 mod vpn;
 
 fn main() -> eframe::Result<()> {
+    // Started by an update's (or the VPN's) restart: the old ZenTorrent may still be
+    // closing, holding the saved data and the one-ZenTorrent port. Wait for it first, or
+    // the new one would start with none of it. Not passed on to programs started from here.
+    if std::env::var_os(update::RESTARTED).is_some() {
+        std::env::remove_var(update::RESTARTED);
+        db::claim(std::time::Duration::from_secs(30));
+    }
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("tokio runtime");
 
-    // "Save to" as the user last chose it, else the system's Downloads folder.
-    let default_dir = saved_folder()
-        .or_else(dirs::download_dir)
-        .or_else(dirs::home_dir)
-        .unwrap_or_else(|| PathBuf::from("."));
+    // "Save to" as the user last chose it, else the system's Downloads folder. Asked only
+    // where it is needed: a second start that hands over to the running one never opens
+    // the saved data.
+    let default_dir =
+        || saved_folder().or_else(dirs::download_dir).or_else(dirs::home_dir).unwrap_or_else(|| PathBuf::from("."));
 
     // Leftovers of the previous update (the replaced program, set aside while it ran).
     update::clean_up();
@@ -82,7 +90,7 @@ fn main() -> eframe::Result<()> {
             eprintln!("usage: zentorrent --cli <magnet|url|file.torrent> [folder]");
             std::process::exit(2);
         };
-        let dir = args.get(3).map(PathBuf::from).unwrap_or(default_dir);
+        let dir = args.get(3).map(PathBuf::from).unwrap_or_else(default_dir);
         let vpn = vpn::Vpn::start(&rt, &vpn::VpnSettings::load());
         if let Err(e) = rt.block_on(cli(link, dir, &vpn)) {
             eprintln!("error: {e:#}");
@@ -191,7 +199,7 @@ fn main() -> eframe::Result<()> {
             eprintln!("usage: zentorrent --ask \"<question>\" [folder] [--cpu]");
             std::process::exit(2);
         };
-        let folder = args.get(3).filter(|a| !a.starts_with("--")).map(PathBuf::from).unwrap_or(default_dir);
+        let folder = args.get(3).filter(|a| !a.starts_with("--")).map(PathBuf::from).unwrap_or_else(default_dir);
         let lib = moe::skills::Library { folder, torrents: Vec::new(), feeds: history::History::load().entries };
         if let Err(e) = rt.block_on(moe::ask(question, lib, args.iter().any(|a| a == "--cpu"))) {
             eprintln!("error: {e}");
@@ -207,7 +215,7 @@ fn main() -> eframe::Result<()> {
             eprintln!("usage: zentorrent --repair-session <session folder> [save folder]");
             std::process::exit(2);
         };
-        let saves = vec![args.get(3).map(PathBuf::from).unwrap_or(default_dir)];
+        let saves = vec![args.get(3).map(PathBuf::from).unwrap_or_else(default_dir)];
         let plan = repair::plan(&dir, &saves);
         for t in &plan {
             println!("{}  {}  →  {}", if t.found { "found  " } else { "MISSING" }, t.name, t.folder.display());
@@ -280,7 +288,7 @@ fn main() -> eframe::Result<()> {
     // `zentorrent serve [folder] [--port N]`: no window — the engine, the feeds and the
     // MCP server, in a terminal or on a server. Ctrl-C stops it.
     if args.get(1).map(String::as_str) == Some("serve") {
-        let folder = args.get(2).filter(|a| !a.starts_with("--")).map(PathBuf::from).unwrap_or(default_dir);
+        let folder = args.get(2).filter(|a| !a.starts_with("--")).map(PathBuf::from).unwrap_or_else(default_dir);
         let port = args.iter().position(|a| a == "--port").and_then(|i| args.get(i + 1)).and_then(|p| p.parse().ok());
         if let Err(e) = serve::run(rt, folder, port) {
             eprintln!("error: {e}");
@@ -330,6 +338,11 @@ fn main() -> eframe::Result<()> {
         instance::Start::HandedOff => return Ok(()),
         instance::Start::Alone => None,
     };
+
+    // This window owns the saved data. A ZenTorrent that was just closed may still hold it
+    // for a moment: wait for it rather than start without your feeds, ratios and settings.
+    db::claim(std::time::Duration::from_secs(10));
+    let default_dir = default_dir();
 
     // Windows' start-up list and the .torrent/magnet registration follow Settings and this exe's path.
     if let Err(e) = autostart::apply(autostart::wanted()) {
@@ -1636,7 +1649,7 @@ impl App {
                     if self.vpn_settings != self.vpn_running
                         && ui.button("↻ Restart now").on_hover_text("The engine takes the VPN setting at start").clicked()
                     {
-                        update::relaunch();
+                        self.restart();
                     }
                 });
                 if let Some(n) = &self.vpn_note {
@@ -1680,7 +1693,7 @@ impl App {
                 }
                 Upd::Installed(v) => {
                     if ui.button(format!("↻ Restart into v{v}")).clicked() {
-                        update::relaunch();
+                        self.restart();
                     }
                 }
                 Upd::Checking => {
@@ -2691,6 +2704,20 @@ impl eframe::App for App {
             if let Some(err) = &self.session_error {
                 ui.colored_label(egui::Color32::LIGHT_RED, err);
             }
+            if !db::owned() {
+                let mut restart = false;
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(
+                        egui::Color32::LIGHT_RED,
+                        "⚠ Your saved data (RSS feeds and history, ratios and ratings, settings) is open in another \
+                         ZenTorrent, so this one shows none of it and saves nothing. Close the other ZenTorrent, then restart.",
+                    );
+                    restart = ui.button("↻ Restart").clicked();
+                });
+                if restart {
+                    self.restart();
+                }
+            }
             let orange = egui::Color32::from_rgb(240, 170, 60);
             let free = self.disk_free.map(|f| format!("{f:.1} GB")).unwrap_or_else(|| "almost nothing".into());
             if !self.space_paused.is_empty() && self.space_anyway {
@@ -2954,6 +2981,13 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.save_all();
+    }
+}
+
+impl App {
+    /// What is kept on quitting: bookmarks, the ratio ledger, RSS history.
+    fn save_all(&mut self) {
         if let Some(p) = self.player.as_mut() {
             p.marks.save();
         }
@@ -2963,9 +2997,13 @@ impl eframe::App for App {
             let _ = self.feed_hist.save();
         }
     }
-}
 
-impl App {
+    /// Save, then start ZenTorrent again (`process::exit` skips `on_exit`).
+    fn restart(&mut self) -> ! {
+        self.save_all();
+        update::relaunch()
+    }
+
     fn feeds_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         if !self.errors.is_empty() {
             let mut clear = false;

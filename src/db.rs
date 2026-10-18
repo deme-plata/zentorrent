@@ -11,10 +11,13 @@
 //! One process owns the store: the first ZenTorrent to open it holds `db.lock` (an OS file
 //! lock, released if the process dies). Another one (a second start handing a .torrent
 //! over, `--ask` beside the app) leaves the store alone: it reads nothing and saves nothing.
+//! The window's process waits for it (`claim`): right after an update's restart, or a Quit
+//! and start again, the old ZenTorrent may still be closing and holding it.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 pub struct Store {
     db: flux_db::Database,
@@ -67,9 +70,38 @@ impl Store {
     }
 }
 
+/// `Store::open`, trying again for up to `wait` while another process holds the store.
+fn open_waiting(dir: &Path, wait: Duration) -> Option<Store> {
+    let until = Instant::now() + wait;
+    loop {
+        if let Some(s) = Store::open(dir) {
+            return Some(s);
+        }
+        if Instant::now() >= until {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Whether this process has the store. Decided once, at the first use: a process that did
+/// not get it never takes it later, or it would save the empty lists it started with over
+/// the real ones.
+static STORE: OnceLock<Option<Store>> = OnceLock::new();
+
 fn store() -> Option<&'static Store> {
-    static STORE: OnceLock<Option<Store>> = OnceLock::new();
     STORE.get_or_init(|| Store::open(&crate::seed::data_dir())).as_ref()
+}
+
+/// For the window's process, before anything is loaded: open the store, waiting up to
+/// `wait` for a ZenTorrent that is still closing to let go of it. True if it is ours.
+pub fn claim(wait: Duration) -> bool {
+    STORE.get_or_init(|| open_waiting(&crate::seed::data_dir(), wait)).is_some()
+}
+
+/// Whether this process has the saved data (false: it shows none of it and saves nothing).
+pub fn owned() -> bool {
+    STORE.get().is_some_and(|s| s.is_some())
 }
 
 /// What was saved under `key` (importing the old JSON file `legacy` the first time).
@@ -124,6 +156,24 @@ mod tests {
         let again = Store::open(&d).expect("free once the owner is gone");
         assert_eq!(again.load("prefs", None).unwrap(), b"{}");
         drop(again);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_restart_waits_for_the_old_one_to_close() {
+        let d = dir("wait");
+        let old = Store::open(&d).unwrap();
+        old.save("feeds", b"[1]").unwrap();
+        assert!(open_waiting(&d, Duration::from_millis(200)).is_none(), "still held: no store");
+        // The old ZenTorrent closes a moment after the new one started.
+        let closing = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            drop(old);
+        });
+        let new = open_waiting(&d, Duration::from_secs(10)).expect("taken once the old one is gone");
+        assert_eq!(new.load("feeds", None).unwrap(), b"[1]", "with the data, not empty");
+        closing.join().unwrap();
+        drop(new);
         let _ = std::fs::remove_dir_all(&d);
     }
 }

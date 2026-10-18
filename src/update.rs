@@ -212,10 +212,14 @@ pub fn program() -> Option<std::path::PathBuf> {
     EXE.get_or_init(|| std::env::current_exe().ok()).clone()
 }
 
+/// Set for the ZenTorrent `relaunch` starts: this one may still be closing, so the new one
+/// waits for the saved data (see `db::claim`).
+pub const RESTARTED: &str = "ZENTORRENT_RESTARTED";
+
 /// Start the freshly installed binary and leave.
 pub fn relaunch() -> ! {
     if let Some(exe) = program() {
-        let _ = std::process::Command::new(exe).args(std::env::args().skip(1)).spawn();
+        let _ = std::process::Command::new(exe).args(std::env::args().skip(1)).env(RESTARTED, "1").spawn();
     }
     std::process::exit(0)
 }
