@@ -114,7 +114,7 @@ pub async fn add(session: Arc<Session>, http: reqwest::Client, tunnelled: bool, 
             Err(e) => Err(e),
         },
     }
-    .map_err(|e| format!("{label}: {e:#}"))?;
+    .map_err(|e| crate::vpn::explain(format!("{label}: {e:#}"), tunnelled))?;
     // Where it goes: a torrent with several files (an album, a season) gets its own
     // folder named after it, a single file goes straight into the download folder
     // (qBittorrent's default). librqbit only makes that folder itself when no
@@ -133,7 +133,7 @@ pub async fn add(session: Arc<Session>, http: reqwest::Client, tunnelled: bool, 
             let folder = handle.output_folder().to_path_buf();
             return Ok(Transfer { name, folder, handle });
         }
-        Err(e) => return Err(format!("{label}: {e:#}")),
+        Err(e) => return Err(crate::vpn::explain(format!("{label}: {e:#}"), tunnelled)),
     };
     let opts = AddTorrentOptions {
         output_folder: Some(folder.to_string_lossy().into_owned()),

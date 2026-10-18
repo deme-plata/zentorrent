@@ -12,7 +12,10 @@
 //!   tracker name is looked up locally either.
 //! - **UDP cannot ride the tunnel**, so everything UDP is switched off: DHT, local peer
 //!   discovery, and `udp://` trackers (librqbit would contact those directly, proxy or
-//!   not, so they are removed from every magnet and .torrent before it is added).
+//!   not). Every `udp://host:port` tracker in a magnet or .torrent is replaced by its
+//!   HTTP twin `http://host:port/announce` before it is added: the big public trackers
+//!   (opentrackr and others) answer both on the same port, and HTTP rides the tunnel.
+//!   A magnet that listed only udp:// trackers would otherwise find no peers at all.
 //! - **no listener** — incoming peers would reach the real address.
 //! - **kill switch**: VPN on but the relay not answering = the engine does not start.
 //! - torrents remembered from direct mode still carry their `udp://` trackers, so VPN
@@ -199,13 +202,13 @@ pub fn session_options(mut o: SessionOptions, vpn: &Vpn) -> Option<SessionOption
     }
 }
 
-/// A typed link (magnet or .torrent URL) made safe for the tunnel: magnets lose their
-/// `udp://` trackers; a .torrent URL is fetched by ZenTorrent through `http` (the tunnel
-/// client) and stripped, instead of letting librqbit fetch it.
+/// A typed link (magnet or .torrent URL) made safe for the tunnel: magnets get HTTP
+/// trackers for their `udp://` ones; a .torrent URL is fetched by ZenTorrent through
+/// `http` (the tunnel client) and changed the same way, instead of letting librqbit fetch it.
 pub async fn tunnel_link(http: &reqwest::Client, link: &str) -> anyhow::Result<librqbit::AddTorrent<'static>> {
     let l = link.trim();
     if l.len() > 7 && l[..7].eq_ignore_ascii_case("magnet:") {
-        return Ok(librqbit::AddTorrent::from_url(strip_udp_from_magnet(l).0));
+        return Ok(librqbit::AddTorrent::from_url(tunnel_magnet(l).0));
     }
     if l.starts_with("http://") || l.starts_with("https://") {
         let bytes = crate::rss::fetch_torrent(http, l, None).await?;
@@ -214,9 +217,30 @@ pub async fn tunnel_link(http: &reqwest::Client, link: &str) -> anyhow::Result<l
     Ok(librqbit::AddTorrent::from_url(l.to_string()))
 }
 
+/// librqbit's "no known way to resolve peers", said plainly: behind the VPN it means the link
+/// has no tracker that can go through the tunnel.
+pub fn explain(e: String, tunnelled: bool) -> String {
+    if tunnelled && e.contains("no known way to resolve peers") {
+        format!(
+            "{e} — with the VPN on, DHT and udp:// trackers are off (UDP can't go through the tunnel),              and this link has no tracker that works over HTTP. Turn the VPN off for it, or use its .torrent file"
+        )
+    } else {
+        e
+    }
+}
+
+/// What to call a magnet link in messages: its name (`dn=`), else the link.
+pub fn link_label(link: &str) -> String {
+    link.split_once('?')
+        .and_then(|(_, q)| q.split('&').find_map(|p| p.strip_prefix("dn=")))
+        .map(|n| pct_decode(&n.replace('+', " ")))
+        .filter(|n| !n.trim().is_empty())
+        .unwrap_or_else(|| link.to_string())
+}
+
 /// .torrent bytes made safe for the tunnel.
 pub fn tunnel_bytes(bytes: Vec<u8>) -> anyhow::Result<librqbit::AddTorrent<'static>> {
-    Ok(librqbit::AddTorrent::from_bytes(strip_udp_from_torrent(&bytes)?.0))
+    Ok(librqbit::AddTorrent::from_bytes(tunnel_torrent(&bytes)?.0))
 }
 
 fn is_udp(url: &[u8]) -> bool {
@@ -224,21 +248,65 @@ fn is_udp(url: &[u8]) -> bool {
     l.starts_with(b"udp:") || l.starts_with(b"udp%3a")
 }
 
-/// Drop `tr=udp://…` from a magnet link. Returns the link and how many were removed.
-pub fn strip_udp_from_magnet(link: &str) -> (String, usize) {
+/// The HTTP twin of a `udp://host:port[/…]` tracker: `http://host:port/announce`. Many
+/// public trackers answer both on the same port (opentrackr, tracker.dler.org,
+/// internetwarriors: checked 2026-10-18); one that speaks UDP only just never answers.
+fn http_twin(udp: &str) -> Option<String> {
+    let rest = udp.get(..6).filter(|s| s.eq_ignore_ascii_case("udp://")).map(|_| &udp[6..])?;
+    let (host, port) = rest.split(['/', '?', '#']).next()?.rsplit_once(':')?;
+    let host_ok = !host.is_empty() && host.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+    (host_ok && port.parse::<u16>().is_ok_and(|p| p > 0)).then(|| format!("http://{}:{port}/announce", host.to_ascii_lowercase()))
+}
+
+/// `%3A` → `:` (magnet values are percent-encoded, or not).
+fn pct_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |c: u8| (c as char).to_digit(16);
+        match (b[i], b.get(i + 1).and_then(|&c| hex(c)), b.get(i + 2).and_then(|&c| hex(c))) {
+            (b'%', Some(h), Some(l)) => {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+            }
+            (c, _, _) => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn is_tracker_key(k: &str) -> bool {
+    k.eq_ignore_ascii_case("tr") || k.to_ascii_lowercase().starts_with("tr.")
+}
+
+/// A magnet link for the tunnel: each `tr=udp://…` becomes its HTTP twin (once; not when the
+/// link already has it). Returns the link and how many udp:// trackers it had.
+pub fn tunnel_magnet(link: &str) -> (String, usize) {
     let Some((head, query)) = link.split_once('?') else { return (link.to_string(), 0) };
-    let mut removed = 0;
-    let kept: Vec<&str> = query
+    let mut seen: std::collections::HashSet<String> = query
         .split('&')
-        .filter(|p| {
-            let (k, v) = p.split_once('=').unwrap_or((p, ""));
-            let tracker_key = k.eq_ignore_ascii_case("tr") || k.to_ascii_lowercase().starts_with("tr.");
-            let drop = tracker_key && is_udp(v.as_bytes());
-            removed += drop as usize;
-            !drop
-        })
+        .filter_map(|p| p.split_once('='))
+        .filter(|(k, v)| is_tracker_key(k) && !is_udp(v.as_bytes()))
+        .map(|(_, v)| pct_decode(v).to_ascii_lowercase())
         .collect();
-    (format!("{head}?{}", kept.join("&")), removed)
+    let mut udp = 0;
+    let mut out: Vec<String> = Vec::new();
+    for p in query.split('&') {
+        let (k, v) = p.split_once('=').unwrap_or((p, ""));
+        if is_tracker_key(k) && is_udp(v.as_bytes()) {
+            udp += 1;
+            if let Some(t) = http_twin(&pct_decode(v)).filter(|t| seen.insert(t.clone())) {
+                out.push(format!("tr={}", t.replace(':', "%3A").replace('/', "%2F")));
+            }
+        } else {
+            out.push(p.to_string());
+        }
+    }
+    (format!("{head}?{}", out.join("&")), udp)
 }
 
 const MAX_DEPTH: usize = 64;
@@ -275,10 +343,11 @@ fn put_string(out: &mut Vec<u8>, s: &[u8]) {
     out.extend_from_slice(s);
 }
 
-/// Remove `udp://` trackers from a .torrent's `announce` and `announce-list`. Every other
-/// key — above all `info`, whose bytes ARE the info-hash — is copied byte for byte.
-/// Returns the rewritten torrent and how many tracker URLs were removed.
-pub fn strip_udp_from_torrent(b: &[u8]) -> anyhow::Result<(Vec<u8>, usize)> {
+/// A .torrent for the tunnel: each `udp://` tracker in `announce` and `announce-list` becomes
+/// its HTTP twin (dropped when it has none). Every other key — above all `info`, whose bytes
+/// ARE the info-hash — is copied byte for byte. Returns the rewritten torrent and how many
+/// udp:// trackers it had.
+pub fn tunnel_torrent(b: &[u8]) -> anyhow::Result<(Vec<u8>, usize)> {
     anyhow::ensure!(b.first() == Some(&b'd'), "not a .torrent file");
     let mut out = Vec::with_capacity(b.len());
     out.push(b'd');
@@ -291,6 +360,10 @@ pub fn strip_udp_from_torrent(b: &[u8]) -> anyhow::Result<(Vec<u8>, usize)> {
         match key {
             b"announce" if b.get(kend).is_some_and(u8::is_ascii_digit) && is_udp(string_at(b, kend)?.0) => {
                 removed += 1;
+                if let Some(t) = http_twin(&String::from_utf8_lossy(string_at(b, kend)?.0)) {
+                    put_string(&mut out, key);
+                    put_string(&mut out, t.as_bytes());
+                }
             }
             b"announce-list" if b.get(kend) == Some(&b'l') => {
                 let mut tiers = Vec::new();
@@ -298,13 +371,20 @@ pub fn strip_udp_from_torrent(b: &[u8]) -> anyhow::Result<(Vec<u8>, usize)> {
                 while b.get(j) != Some(&b'e') {
                     let tend = skip(b, j, 2)?;
                     if b[j] == b'l' {
-                        let mut urls = Vec::new();
+                        let mut urls: Vec<Vec<u8>> = Vec::new();
                         let mut k = j + 1;
                         while b.get(k) != Some(&b'e') {
                             let uend = skip(b, k, 3)?;
                             match b[k].is_ascii_digit().then(|| string_at(b, k)).transpose()? {
-                                Some((u, _)) if is_udp(u) => removed += 1,
-                                _ => urls.push(&b[k..uend]),
+                                Some((u, _)) if is_udp(u) => {
+                                    removed += 1;
+                                    if let Some(t) = http_twin(&String::from_utf8_lossy(u)) {
+                                        let mut s = Vec::new();
+                                        put_string(&mut s, t.as_bytes());
+                                        urls.push(s);
+                                    }
+                                }
+                                _ => urls.push(b[k..uend].to_vec()),
                             }
                             k = uend;
                         }
@@ -360,41 +440,73 @@ mod tests {
     }
 
     #[test]
-    fn udp_trackers_leave_the_torrent_and_info_is_untouched() {
+    fn udp_trackers_become_http_and_info_is_untouched() {
         let t = torrent(
             "udp://tracker.opentrackr.org:1337/announce",
-            &[&["udp://open.demonii.com:1337"], &["http://bttracker.debian.org:6969/announce", "UDP://x:1"]],
+            &[&["udp://open.demonii.com:1337"], &["http://bttracker.debian.org:6969/announce", "UDP://x:1", "udp://[::1]:80"]],
         );
-        let (out, removed) = strip_udp_from_torrent(&t).unwrap();
-        assert_eq!(removed, 3);
+        let (out, udp) = tunnel_torrent(&t).unwrap();
+        assert_eq!(udp, 4);
         assert_eq!(info(&out), info(&t), "info dict bytes (the info-hash) must not change");
         let s = String::from_utf8_lossy(&out);
         assert!(!s.to_ascii_lowercase().contains("udp://"), "{s}");
-        let http = "http://bttracker.debian.org:6969/announce";
-        assert!(s.contains(&format!("13:announce-listll{}:{http}ee", http.len())), "{s}");
-        assert!(!s.contains("8:announce4"), "udp announce key dropped");
+        let l = |u: &str| format!("{}:{u}", u.len());
+        assert!(s.contains(&format!("8:announce{}", l("http://tracker.opentrackr.org:1337/announce"))), "{s}");
+        let tiers = format!(
+            "13:announce-listll{}el{}{}ee",
+            l("http://open.demonii.com:1337/announce"),
+            l("http://bttracker.debian.org:6969/announce"),
+            l("http://x:1/announce")
+        );
+        assert!(s.contains(&tiers), "{s}");
     }
 
     #[test]
     fn http_only_torrent_is_byte_identical() {
         let t = torrent("http://bttracker.debian.org:6969/announce", &[&["https://t.example/announce"]]);
-        assert_eq!(strip_udp_from_torrent(&t).unwrap(), (t.clone(), 0));
+        assert_eq!(tunnel_torrent(&t).unwrap(), (t.clone(), 0));
     }
 
     #[test]
     fn junk_and_hostile_input_is_refused_not_panicking() {
-        assert!(strip_udp_from_torrent(b"<html>registered users only</html>").is_err());
-        assert!(strip_udp_from_torrent(b"d8:announce999:short").is_err());
+        assert!(tunnel_torrent(b"<html>registered users only</html>").is_err());
+        assert!(tunnel_torrent(b"d8:announce999:short").is_err());
         let deep = [vec![b'd', b'1', b':', b'x'], vec![b'l'; 10_000]].concat();
-        assert!(strip_udp_from_torrent(&deep).is_err());
+        assert!(tunnel_torrent(&deep).is_err());
     }
 
     #[test]
-    fn magnet_keeps_everything_but_udp_trackers() {
-        let m = "magnet:?xt=urn:btih:abc&dn=debian&tr=udp%3A%2F%2Fopen.demonii.com%3A1337&tr=http%3A%2F%2Fbttracker.debian.org%3A6969%2Fannounce&tr.1=udp://x:1";
-        let (out, removed) = strip_udp_from_magnet(m);
-        assert_eq!(removed, 2);
-        assert_eq!(out, "magnet:?xt=urn:btih:abc&dn=debian&tr=http%3A%2F%2Fbttracker.debian.org%3A6969%2Fannounce");
+    fn magnet_udp_trackers_become_their_http_twins() {
+        let m = "magnet:?xt=urn:btih:abc&dn=debian&tr=udp%3A%2F%2Fopen.demonii.com%3A1337&tr=http%3A%2F%2Fbttracker.debian.org%3A6969%2Fannounce&tr.1=udp://x:1&tr=udp://bttracker.debian.org:6969";
+        let (out, udp) = tunnel_magnet(m);
+        assert_eq!(udp, 3);
+        assert_eq!(
+            out,
+            "magnet:?xt=urn:btih:abc&dn=debian&tr=http%3A%2F%2Fopen.demonii.com%3A1337%2Fannounce\
+             &tr=http%3A%2F%2Fbttracker.debian.org%3A6969%2Fannounce&tr=http%3A%2F%2Fx%3A1%2Fannounce",
+            "in place, and the debian twin not twice"
+        );
+    }
+
+    #[test]
+    fn a_udp_only_magnet_still_has_trackers_behind_the_vpn() {
+        // Viktor, 2026-10-18: "no known way to resolve peers (no DHT, no trackers, no initial_peers)".
+        let m = "magnet:?xt=urn:btih:D098998D4519F241B6BB8478E8D4F87E4062A8A3&dn=VA%20-%20100%20Club%20Hits\
+                 &tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337&tr=udp%3A%2F%2Fopen.stealth.si%3A80%2Fannounce\
+                 &tr=udp%3A%2F%2Ftracker.internetwarriors.net%3A1337";
+        let (out, udp) = tunnel_magnet(m);
+        assert_eq!(udp, 3);
+        assert!(!out.to_ascii_lowercase().contains("udp"), "{out}");
+        assert!(out.contains("&tr=http%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce"), "{out}");
+        assert!(out.starts_with("magnet:?xt=urn:btih:D098998D4519F241B6BB8478E8D4F87E4062A8A3&dn=VA%20-%20100%20Club%20Hits"));
+        assert_eq!(link_label(m), "VA - 100 Club Hits");
+        assert_eq!(link_label("magnet:?xt=urn:btih:ab"), "magnet:?xt=urn:btih:ab");
+        let e = explain("x: no known way to resolve peers (no DHT, no trackers, no initial_peers)".into(), true);
+        assert!(e.contains("Turn the VPN off for it"), "{e}");
+        assert_eq!(explain("x: other".into(), true), "x: other");
+        assert_eq!(http_twin("udp://[::1]:80"), None);
+        assert_eq!(http_twin("udp://host:0"), None);
+        assert_eq!(http_twin("UDP://Tracker.Example:6969/announce?x=1").as_deref(), Some("http://tracker.example:6969/announce"));
     }
 
     #[test]

@@ -863,7 +863,7 @@ impl App {
     fn open_item(&mut self, ctx: &egui::Context, item: String) {
         self.view = View::Downloads;
         if item.starts_with("magnet:") {
-            self.start(ctx, item.clone(), Source::Link(item));
+            self.start(ctx, vpn::link_label(&item), Source::Link(item));
             return;
         }
         let path = PathBuf::from(&item);
@@ -2725,7 +2725,7 @@ impl eframe::App for App {
                     || (edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
                 if go && !self.link.trim().is_empty() {
                     let link = self.link.trim().to_string();
-                    self.start(ctx, link.clone(), Source::Link(link));
+                    self.start(ctx, vpn::link_label(&link), Source::Link(link));
                     self.link.clear();
                 }
                 if ui
