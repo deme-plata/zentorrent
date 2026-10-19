@@ -45,6 +45,8 @@ enum Line {
     Picks(usize),
     /// Commands to copy (how to connect an MCP client).
     Setup(String),
+    /// A note with a folder to open (where an organize put things).
+    Folder(String, std::path::PathBuf),
 }
 
 enum CardState {
@@ -454,6 +456,15 @@ impl Moe {
     }
 
     /// Something an MCP client asked for that needs the user's OK: a card.
+    /// The app finished moving (an organize, or its undo): say so, with the folder to open.
+    pub fn moved(&mut self, text: String, folder: Option<std::path::PathBuf>) {
+        self.lines.push(match folder {
+            Some(f) => Line::Folder(text, f),
+            None => Line::Note(text),
+        });
+        self.can_undo = organize::can_undo();
+    }
+
     pub fn propose(&mut self, a: Action) {
         self.flush_live();
         self.lines.push(Line::Note("🔌 An MCP client asks:".into()));
@@ -538,9 +549,10 @@ impl Moe {
                     self.save_settings();
                 }
                 if self.can_undo && ui.button("↶ Undo last organize").on_hover_text("Put the last applied moves back").clicked() {
-                    let (n, problems) = organize::undo();
-                    self.lines.push(Line::Note(format!("Undo: {n} moved back.{}", if problems.is_empty() { String::new() } else { format!(" Problems: {}", problems.join("; ")) })));
-                    self.can_undo = organize::can_undo();
+                    // The app puts them back, with the torrents in them.
+                    actions.push(Action::UndoMoves);
+                    self.can_undo = false;
+                    self.lines.push(Line::Note("Undoing the last organize…".into()));
                 }
                 if self.busy && ui.button("Stop").on_hover_text("Stop this answer").clicked() {
                     if let Some(t) = self.task.take() {
@@ -720,6 +732,14 @@ impl Moe {
                     Line::Note(t) => {
                         ui.label(RichText::new(t).small().weak());
                     }
+                    Line::Folder(t, dir) => {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new(t).small().color(Color32::from_rgb(120, 200, 140)));
+                            if ui.small_button("Open folder").on_hover_text(dir.display().to_string()).clicked() {
+                                let _ = crate::open_folder(dir);
+                            }
+                        });
+                    }
                     Line::Setup(t) => {
                         egui::Frame::new().fill(Color32::from_rgb(22, 26, 32)).corner_radius(6.0).inner_margin(egui::Margin::same(8)).show(ui, |ui| {
                             ui.add(egui::Label::new(RichText::new(t).monospace().size(11.0)).selectable(true).wrap());
@@ -779,10 +799,10 @@ impl Moe {
                 card.state = CardState::Cancelled;
             } else {
                 match &card.action {
-                    Action::Moves { moves, .. } => {
-                        let (n, problems) = organize::apply(moves);
-                        card.state = CardState::Done(format!("Moved {n}.{}", if problems.is_empty() { String::new() } else { format!(" Problems: {}", problems.join("; ")) }));
-                        self.can_undo = organize::can_undo();
+                    Action::Moves { root, moves } => {
+                        // The app moves them, and moves the torrents in them along.
+                        actions.push(Action::ApplyMoves { root: root.clone(), moves: moves.clone() });
+                        card.state = CardState::Done("Moving…".into());
                     }
                     Action::Rule { rule, .. } => {
                         card.state = CardState::Done(format!("Rule “{}” added — it is in the RSS feeds tab, under ⚡ Auto-download.", rule.name));

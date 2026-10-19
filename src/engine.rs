@@ -190,6 +190,83 @@ pub async fn list(session: &Arc<Session>, http: reqwest::Client, tunnelled: bool
     }
 }
 
+/// Where a torrent's folder goes when `pairs` move (from → its whole new path): None when
+/// none of its files move, or they would be split up.
+pub fn moved_output(t: &Transfer, pairs: &[(PathBuf, PathBuf)]) -> Option<PathBuf> {
+    let out = t.handle.output_folder().to_path_buf();
+    // The folder it is in moves (its own folder, or one above it).
+    for (from, to) in pairs {
+        if let Ok(rest) = out.strip_prefix(from) {
+            return Some(to.join(rest));
+        }
+    }
+    // Its files sit in a shared folder (a single file, or a few top-level entries): it moves
+    // when all of them move to the same new folder.
+    let tops: std::collections::BTreeSet<PathBuf> = t
+        .handle
+        .with_metadata(|m| {
+            m.file_infos
+                .iter()
+                .filter(|f| !f.attrs.padding)
+                .filter_map(|f| f.relative_filename.components().next().map(|c| out.join(c)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut parent: Option<PathBuf> = None;
+    for top in &tops {
+        let (_, to) = pairs.iter().find(|(from, _)| from == top)?;
+        let p = to.parent()?.to_path_buf();
+        if parent.get_or_insert_with(|| p.clone()) != &p {
+            return None;
+        }
+    }
+    parent
+}
+
+/// A torrent taken out of the engine to be moved, and what it needs to come back.
+pub struct Moving {
+    pub name: String,
+    torrent: Vec<u8>,
+    only: Option<Vec<usize>>,
+    paused: bool,
+    /// One of its files, relative to its folder: is it in the new place?
+    probe: Option<PathBuf>,
+    pub old: PathBuf,
+    pub new: PathBuf,
+}
+
+/// Take a torrent out of the engine (its files close: Windows can't move open files), to be
+/// added back with `put_back` once its folder has moved.
+pub async fn take_out(session: &Arc<Session>, t: Transfer, new: PathBuf) -> Moving {
+    let h = &t.handle;
+    let torrent = h.with_metadata(|m| m.torrent_bytes.to_vec()).unwrap_or_default();
+    let probe = h.with_metadata(|m| m.file_infos.iter().find(|f| !f.attrs.padding).map(|f| f.relative_filename.clone())).unwrap_or_default();
+    let m = Moving { name: t.name.clone(), torrent, only: h.only_files(), paused: h.is_paused(), probe, old: h.output_folder().to_path_buf(), new };
+    let _ = session.delete(h.id().into(), false).await;
+    m
+}
+
+/// Add a taken-out torrent back: at its new folder if its files are there now, else where it
+/// was. It checks its files and seeds on, as it was (paused or not, the same files ticked).
+pub async fn put_back(session: &Arc<Session>, m: Moving) -> Result<Transfer, String> {
+    let moved = m.probe.as_ref().is_some_and(|p| m.new.join(p).exists());
+    let folder = if moved { m.new } else { m.old };
+    let opts = AddTorrentOptions {
+        output_folder: Some(folder.to_string_lossy().into_owned()),
+        overwrite: true,
+        only_files: m.only,
+        paused: m.paused,
+        ..Default::default()
+    };
+    match session.add_torrent(AddTorrent::from_bytes(m.torrent), Some(opts)).await {
+        Ok(AddTorrentResponse::Added(_, handle)) | Ok(AddTorrentResponse::AlreadyManaged(_, handle)) => {
+            Ok(Transfer { name: handle.name().unwrap_or(m.name), folder, handle })
+        }
+        Ok(AddTorrentResponse::ListOnly(_)) => Err(format!("{}: the engine only listed it", m.name)),
+        Err(e) => Err(format!("{}: {e:#}", m.name)),
+    }
+}
+
 /// The second half of `add`: start it, with only the files in `only` (None: all of them).
 pub async fn add_listed(session: Arc<Session>, l: Listed, only: Option<Vec<usize>>) -> Result<Transfer, String> {
     let Listed { label, add, folder, peers, .. } = l;
@@ -206,5 +283,54 @@ pub async fn add_listed(session: Arc<Session>, l: Listed, only: Option<Vec<usize
         }
         Ok(AddTorrentResponse::ListOnly(_)) => Err(format!("{label}: the engine only listed it")),
         Err(e) => Err(format!("{label}: {e:#}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Flux MoE's organize on a torrent ZenTorrent seeds: taken out, its folder moved, put back
+    /// at the new place, and it finds every piece there (no download again).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_seeding_torrent_moves_with_its_folder() {
+        let d = std::env::temp_dir().join(format!("zt-move-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let album = d.join("Album");
+        std::fs::create_dir_all(&album).unwrap();
+        for (i, f) in ["01 One.flac", "02 Two.flac"].iter().enumerate() {
+            std::fs::write(album.join(f), vec![i as u8 + 1; 50_000]).unwrap();
+        }
+        let spawner = librqbit::spawn_utils::BlockingSpawner::new(2);
+        let opts = librqbit::CreateTorrentOptions { name: Some("Album"), trackers: vec![], piece_length: Some(16384) };
+        let bytes = librqbit::create_torrent(&album, opts, &spawner).await.unwrap().as_bytes().unwrap().to_vec();
+        let session = Session::new_with_opts(
+            d.join("engine"),
+            librqbit::SessionOptions { dht: None, persistence: None, listen: None, fastresume: false, ..Default::default() },
+        )
+        .await
+        .unwrap();
+        let add = AddTorrentOptions { output_folder: Some(album.to_string_lossy().into_owned()), overwrite: true, ..Default::default() };
+        let handle = match session.add_torrent(AddTorrent::from_bytes(bytes), Some(add)).await.unwrap() {
+            AddTorrentResponse::Added(_, h) => h,
+            _ => panic!("not added"),
+        };
+        tokio::time::timeout(Duration::from_secs(30), handle.wait_until_completed()).await.unwrap().unwrap();
+        let t = Transfer { name: "Album".into(), folder: album.clone(), handle };
+
+        let dest = d.join("Music").join("Trance").join("Album");
+        assert!(moved_output(&t, &[(d.join("Other"), d.join("X").join("Other"))]).is_none(), "not this one");
+        let new = moved_output(&t, &[(album.clone(), dest.clone())]).unwrap();
+        assert_eq!(new, dest);
+        let m = take_out(&session, t, new).await;
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::rename(&album, &dest).unwrap();
+        let back = put_back(&session, m).await.unwrap();
+        assert_eq!(back.handle.output_folder(), dest.as_path());
+        tokio::time::timeout(Duration::from_secs(30), back.handle.wait_until_completed()).await.unwrap().unwrap();
+        let s = back.handle.stats();
+        assert!(s.finished && s.progress_bytes == s.total_bytes && s.total_bytes == 100_000, "every piece found in the new place");
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

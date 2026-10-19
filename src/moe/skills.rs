@@ -195,6 +195,10 @@ pub enum Action {
     Moves { root: PathBuf, moves: Vec<organize::Move> },
     /// Feed results to show with a Download button each (display only; a click downloads).
     Picks(Vec<Pick>),
+    /// Moves the user applied (from a Moves card): the app does them, moving seeding torrents along.
+    ApplyMoves { root: PathBuf, moves: Vec<organize::Move> },
+    /// Put the last applied moves back (with their torrents).
+    UndoMoves,
     /// An auto-download rule. Needs the user's OK. `matched`: what it would have caught so far.
     Rule { rule: crate::autodl::Rule, matched: usize, examples: Vec<String> },
 }
@@ -602,13 +606,16 @@ pub fn run(name: &str, args: &Value, lib: &Library, mem: &mut Memory) -> Outcome
                 .filter_map(|m| Some((m.get("from")?.as_str()?.to_string(), m.get("to")?.as_str()?.to_string())))
                 .collect();
             let busy: Vec<PathBuf> = lib.torrents.iter().filter(|t| t.state != "removed").flat_map(|t| torrent_paths(t)).collect();
-            let (ok, refused) = organize::check(&root, &raw, &busy);
+            let (ok, refused) = organize::check(&root, &raw);
             if ok.is_empty() {
                 return Outcome { for_model: json!({ "refused": refused }), receipt: format!("⚠ no moves possible ({} refused)", refused.len()), action: None };
             }
+            let seeding = ok.iter().filter(|m| busy.iter().any(|b| b.starts_with(&m.from) || m.from.starts_with(b))).count();
             Outcome {
                 for_model: json!({ "status": "shown to the user as a preview — they press Apply. Tell them; don't call again.",
-                                   "moves": ok.len(), "refused": refused }),
+                                   "moves": ok.len(), "refused": refused,
+                                   "torrents_moved_along": seeding,
+                                   "note": "torrents ZenTorrent is seeding move too: it points them at the new place and they seed on" }),
                 receipt: format!("proposes {} moves{}", ok.len(), if refused.is_empty() { String::new() } else { format!(" ({} refused)", refused.len()) }),
                 action: Some(Action::Moves { root, moves: ok }),
             }

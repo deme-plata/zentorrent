@@ -494,6 +494,8 @@ struct Inbox {
     overloaded: Vec<(String, String, String)>,
     /// Torrents read, waiting for the user to choose their files.
     listed: Vec<engine::Listed>,
+    /// Moves done (Flux MoE organize or undo): what to tell, and the folder to open.
+    moved: Vec<(String, Option<PathBuf>)>,
     busy: usize,
     /// Result of the VPN window's "Test relay" (handshake + ping, ms).
     vpn_test: Option<Result<u128, String>>,
@@ -2040,6 +2042,67 @@ impl App {
         }
     }
 
+    /// Move folders (Flux MoE's organize, or its undo) together with the torrents in them. A
+    /// torrent whose files move is taken out of the engine first (its files close: Windows
+    /// can't move open files), the folders move, and it comes back pointing at the new place,
+    /// paused or not as it was, with the same files ticked: it checks its files and seeds on.
+    /// Its ratio, labels, rating and bookmarks are kept (they go by info-hash).
+    fn move_with_torrents(
+        &mut self,
+        ctx: &egui::Context,
+        pairs: Vec<(PathBuf, PathBuf)>,
+        job: impl FnOnce() -> (usize, Vec<String>) + Send + 'static,
+        what: &'static str,
+        folder: Option<PathBuf>,
+    ) {
+        let mut moving = Vec::new();
+        if self.session.is_some() {
+            let mut keep = Vec::new();
+            for t in std::mem::take(&mut self.transfers) {
+                match engine::moved_output(&t, &pairs) {
+                    Some(new) => moving.push((t, new)),
+                    None => keep.push(t),
+                }
+            }
+            self.transfers = keep;
+        }
+        let (session, inbox, ctx) = (self.session.clone(), self.inbox.clone(), ctx.clone());
+        inbox.lock().unwrap().busy += 1;
+        self.rt.spawn(async move {
+            let mut out = Vec::new();
+            if let Some(s) = &session {
+                for (t, new) in moving {
+                    out.push(engine::take_out(s, t, new).await);
+                }
+            }
+            let along = out.len();
+            let (n, mut problems) = tokio::task::spawn_blocking(job).await.unwrap_or_else(|e| (0, vec![format!("the move stopped: {e}")]));
+            let mut back = Vec::new();
+            if let Some(s) = &session {
+                for m in out {
+                    let name = m.name.clone();
+                    match engine::put_back(s, m).await {
+                        Ok(t) => back.push(t),
+                        Err(e) => problems.push(format!("{name} could not be added back: {e}")),
+                    }
+                }
+            }
+            let mut text = format!("{what}: {n} moved");
+            if along > 0 {
+                text += &format!(", {along} torrent{} moved along (they check their files and seed on)", if along == 1 { "" } else { "s" });
+            }
+            text += ".";
+            if !problems.is_empty() {
+                text += &format!(" Problems: {}", problems.join("; "));
+            }
+            let mut ib = inbox.lock().unwrap();
+            ib.busy -= 1;
+            ib.added.extend(back);
+            ib.moved.push((text, folder.filter(|_| n > 0)));
+            ctx.request_repaint();
+        });
+    }
+
     /// A torrent the user added: with several files, they choose which first (all ticked;
     /// see `pick`). Off under Settings, or no engine: as `start`.
     fn start_asking(&mut self, ctx: &egui::Context, label: String, source: Source) {
@@ -2362,8 +2425,18 @@ impl App {
                     self.store.rules.push(rule);
                     self.save_feeds();
                 }
-                // Moves are done by the tab itself (files only, after Apply).
+                // A card waiting for Apply (Apply sends ApplyMoves).
                 Action::Moves { .. } => {}
+                Action::ApplyMoves { root, moves } => {
+                    let pairs: Vec<(PathBuf, PathBuf)> = moves.iter().map(|m| (m.from.clone(), m.dest())).collect();
+                    // The folder to open: where the first one went, one level under the scanned folder.
+                    let folder = moves.first().and_then(|m| m.to.strip_prefix(&root).ok()?.components().next().map(|c| root.join(c)));
+                    self.move_with_torrents(ctx, pairs, move || moe::organize::apply(&moves), "Organized", folder);
+                }
+                Action::UndoMoves => {
+                    let pairs = moe::organize::undo_pairs();
+                    self.move_with_torrents(ctx, pairs, moe::organize::undo, "Undo", None);
+                }
                 // Result lists are shown in the tab; their Download buttons send Download.
                 Action::Picks(_) => {}
             }
@@ -2530,6 +2603,9 @@ impl App {
         }
         for l in ib.listed.drain(..) {
             self.picks.push(pick::Pick::new(l));
+        }
+        for (text, folder) in ib.moved.drain(..) {
+            self.moe.moved(text, folder);
         }
         for t in ib.added.drain(..) {
             let id = t.handle.id();

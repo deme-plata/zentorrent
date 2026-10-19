@@ -112,8 +112,18 @@ impl mcp::Host for Headless {
                 println!("auto-download rule added: {name}");
                 Ok(format!("added the auto-download rule {name}"))
             }
-            Action::Moves { moves, .. } => {
-                let (n, problems) = moe::organize::apply(&moves);
+            Action::UndoMoves => {
+                let (n, problems) = moe::organize::undo();
+                Ok(format!("moved back {n}{}", if problems.is_empty() { String::new() } else { format!("; problems: {}", problems.join("; ")) }))
+            }
+            Action::Moves { moves, .. } | Action::ApplyMoves { moves, .. } => {
+                // Headless, a seeding torrent's folder stays put (the app moves those along).
+                let (moves, held): (Vec<_>, Vec<_>) = {
+                    let ts = self.transfers.lock().unwrap();
+                    moves.into_iter().partition(|m| ts.iter().all(|t| crate::engine::moved_output(t, &[(m.from.clone(), m.dest())]).is_none()))
+                };
+                let (n, mut problems) = moe::organize::apply(&moves);
+                problems.extend(held.iter().map(|m| format!("{}: a torrent ZenTorrent seeds — move it in the app", m.from.display())));
                 let msg = format!("moved {n}{}", if problems.is_empty() { String::new() } else { format!("; problems: {}", problems.join("; ")) });
                 println!("{msg}");
                 Ok(msg)

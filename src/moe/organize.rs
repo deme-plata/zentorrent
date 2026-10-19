@@ -138,14 +138,44 @@ fn inside(root: &Path, p: &str) -> Result<PathBuf, String> {
     Ok(out)
 }
 
-/// Validate the model's moves. `busy` = folders/files torrents are still using.
-/// Returns the good moves and one line per refused move.
-pub fn check(root: &Path, raw: &[(String, String)], busy: &[PathBuf]) -> (Vec<Move>, Vec<String>) {
+/// A name as a small model may write it: lower case, accents and punctuation gone
+/// ("Détresse-Misères" and "detresse_miseres" are the same).
+fn loose(name: &str) -> String {
+    name.chars()
+        .flat_map(|c| c.to_lowercase())
+        .map(|c| match c {
+            'à' | 'á' | 'â' | 'ä' | 'ã' | 'å' | 'æ' => 'a',
+            'è' | 'é' | 'ê' | 'ë' => 'e',
+            'ì' | 'í' | 'î' | 'ï' => 'i',
+            'ò' | 'ó' | 'ô' | 'ö' | 'õ' | 'ø' => 'o',
+            'ù' | 'ú' | 'û' | 'ü' => 'u',
+            'ñ' => 'n',
+            'ç' => 'c',
+            'ý' | 'ÿ' => 'y',
+            c => c,
+        })
+        .filter(|c| c.is_alphanumeric())
+        .collect()
+}
+
+/// `p` does not exist: the one entry next to it whose name only differs in case, accents
+/// or punctuation, if there is exactly one.
+fn nearly(p: &Path) -> Option<PathBuf> {
+    let want = loose(&p.file_name()?.to_string_lossy());
+    let mut found = std::fs::read_dir(p.parent()?).ok()?.flatten().map(|e| e.path()).filter(|q| q.file_name().is_some_and(|n| loose(&n.to_string_lossy()) == want));
+    let one = found.next()?;
+    found.next().is_none().then_some(one)
+}
+
+/// Validate the model's moves. Folders of torrents ZenTorrent seeds are fine: the app moves
+/// those torrents along (see `App::move_with_torrents`). Returns the good moves and one line
+/// per refused move.
+pub fn check(root: &Path, raw: &[(String, String)]) -> (Vec<Move>, Vec<String>) {
     let mut ok: Vec<Move> = Vec::new();
     let mut refused = Vec::new();
     for (from, to) in raw {
         let m = match (inside(root, from), inside(root, to)) {
-            (Ok(f), Ok(t)) => Move { from: f, to: t },
+            (Ok(f), Ok(t)) => Move { from: if f.exists() { f } else { nearly(&f).unwrap_or(f) }, to: t },
             (Err(e), _) | (_, Err(e)) => {
                 refused.push(e);
                 continue;
@@ -159,8 +189,6 @@ pub fn check(root: &Path, raw: &[(String, String)], busy: &[PathBuf]) -> (Vec<Mo
             Some("is already there".into())
         } else if m.dest().exists() || ok.iter().any(|o| o.dest() == m.dest()) {
             Some("something with that name is already in the destination".into())
-        } else if busy.iter().any(|b| b.starts_with(&m.from) || m.from.starts_with(b)) {
-            Some("ZenTorrent is still seeding it — remove the torrent first, or it can't find its files".into())
         } else {
             None
         };
@@ -214,6 +242,16 @@ pub fn can_undo() -> bool {
 
 fn can_undo_at(journal: &Path) -> bool {
     std::fs::read(journal).ok().and_then(|b| serde_json::from_slice::<Journal>(&b).ok()).is_some_and(|j| !j.done.is_empty())
+}
+
+/// What the last organize's undo will move: (where it is now, where it goes back to),
+/// newest first.
+pub fn undo_pairs() -> Vec<(PathBuf, PathBuf)> {
+    std::fs::read(journal_path())
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Journal>(&b).ok())
+        .map(|j| j.done.into_iter().rev().collect())
+        .unwrap_or_default()
 }
 
 /// Put the last organize back, newest move first. Returns (restored, problems).
@@ -272,20 +310,29 @@ mod tests {
     }
 
     #[test]
+    fn a_name_with_a_missing_accent_still_finds_its_folder() {
+        let root = tree();
+        std::fs::create_dir_all(root.join("Détresse-Misères-WEB-2026-BLEEDiNG")).unwrap();
+        let (ok, refused) = check(&root, &[("Détresse-Miseres-WEB-2026-BLEEDiNG".into(), "Music/Black Metal".into())]);
+        assert!(refused.is_empty(), "{refused:?}");
+        assert_eq!(ok[0].from, root.join("Détresse-Misères-WEB-2026-BLEEDiNG"));
+        let (_, refused) = check(&root, &[("Nothing-Like-It".into(), "Music".into())]);
+        assert_eq!(refused.len(), 1, "really missing stays missing");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn moves_are_checked_applied_and_undone() {
         let root = tree();
-        let seeding = vec![root.join("Film (2021)")];
         let raw = vec![
             ("Artist A - Album (2020)".to_string(), "Music/Trance".to_string()),
             ("loose.flac".into(), "Music/Ambient".into()),
-            ("Film (2021)".into(), "Movies".into()),
             ("../etc".into(), "Music".into()),
             ("missing.mp3".into(), "Music".into()),
         ];
-        let (ok, refused) = check(&root, &raw, &seeding);
+        let (ok, refused) = check(&root, &raw);
         assert_eq!(ok.len(), 2, "{refused:?}");
-        assert_eq!(refused.len(), 3);
-        assert!(refused.iter().any(|r| r.contains("seeding")));
+        assert_eq!(refused.len(), 2);
         let journal = root.join("journal.json");
         let (n, problems) = apply_at(&ok, &journal);
         assert_eq!((n, problems.len()), (2, 0));
