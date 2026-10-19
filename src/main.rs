@@ -31,6 +31,7 @@ mod assoc;
 mod autodl;
 mod autostart;
 mod cover;
+mod crash;
 mod db;
 mod details;
 mod diskguard;
@@ -59,6 +60,8 @@ mod update;
 mod vpn;
 
 fn main() -> eframe::Result<()> {
+    // Errors and crashes go to crash.log; the next start tells about the last one.
+    crash::install();
     // Started by an update's (or the VPN's) restart: the old ZenTorrent may still be
     // closing, holding the saved data and the one-ZenTorrent port. Wait for it first, or
     // the new one would start with none of it. Not passed on to programs started from here.
@@ -344,6 +347,18 @@ fn main() -> eframe::Result<()> {
         instance::Start::Primary(l) => Some(l),
         instance::Start::HandedOff => return Ok(()),
         instance::Start::Alone => None,
+        // The running one is frozen: offer to end it, then be the running one.
+        instance::Start::Hung(pid) => {
+            if !crash::ask_to_end_frozen(pid) {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(1500));
+            match instance::start(&open, !autostarted) {
+                instance::Start::Primary(l) => Some(l),
+                instance::Start::HandedOff => return Ok(()),
+                _ => None,
+            }
+        }
     };
 
     // This window owns the saved data. A ZenTorrent that was just closed may still hold it
@@ -591,6 +606,8 @@ struct App {
     /// Torrents selected in Downloads (info-hashes), and the one a Shift-click counts from.
     sel: HashSet<String>,
     sel_anchor: Option<String>,
+    /// The last crash or freeze (crash.log) not yet shown to the user.
+    last_crash: Option<crash::Last>,
     /// Torrents the user added, waiting in the "Choose what to download" window.
     picks: Vec<pick::Pick>,
     /// Where each Downloads row was drawn last frame (clicks and the selection box use it).
@@ -714,6 +731,7 @@ impl App {
             sel: HashSet::new(),
             sel_anchor: None,
             picks: Vec::new(),
+            last_crash: crash::last_unseen(),
             row_rects: HashMap::new(),
             band: None,
             tray: (tray::supported() && tray::wanted())
@@ -761,9 +779,10 @@ impl App {
         app.apply_global_limits();
         // What this start was given, and what later starts hand over.
         app.inbox.lock().unwrap().opens.extend(open);
+        crash::watchdog(tray::responding);
         if let Some(l) = listener {
             let (inbox, ctx) = (app.inbox.clone(), cc.egui_ctx.clone());
-            instance::listen(l, move |req| {
+            instance::listen(l, || tray::responding() != Some(false), move |req| {
                 inbox.lock().unwrap().opens.extend(req.open);
                 if req.show {
                     bring_forward(&ctx);
@@ -2840,6 +2859,14 @@ impl Source {
 impl eframe::App for App {
     fn ui(&mut self, root: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = &root.ctx().clone();
+        // Tests only (debug builds): freeze the window once, to try the hang check.
+        #[cfg(debug_assertions)]
+        if let Some(secs) = std::env::var("ZENTORRENT_TEST_FREEZE").ok().and_then(|s| s.parse::<u64>().ok()) {
+            static FROZE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if ctx.cumulative_pass_nr() > 60 && !FROZE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_secs(secs));
+            }
+        }
         #[cfg(windows)]
         if !self.hwnd_known {
             use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -3055,6 +3082,29 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(root, |ui| {
             if let Some(err) = &self.session_error {
                 ui.colored_label(egui::Color32::LIGHT_RED, err);
+            }
+            if let Some(c) = &self.last_crash {
+                let (mut copy, mut dismiss) = (false, false);
+                ui.horizontal_wrapped(|ui| {
+                    let what = match c.kind.as_str() {
+                        "froze" => "ZenTorrent stopped responding last time",
+                        "ended frozen" => "ZenTorrent was not responding last time and was closed",
+                        _ => "ZenTorrent closed unexpectedly last time",
+                    };
+                    ui.colored_label(egui::Color32::from_rgb(240, 170, 60), format!("⚠ {what} ({}): {}", c.head, c.summary()));
+                    copy = ui.small_button("Copy details").on_hover_text("To send to the people behind ZenTorrent (Settings → About)").clicked();
+                    if ui.small_button("Open folder").on_hover_text("crash.log is in ZenTorrent's data folder").clicked() {
+                        let _ = open_folder(&seed::data_dir());
+                    }
+                    dismiss = ui.small_button("Dismiss").clicked();
+                });
+                if copy {
+                    ui.ctx().copy_text(c.text.clone());
+                }
+                if dismiss {
+                    crash::mark_seen(c);
+                    self.last_crash = None;
+                }
             }
             if !db::owned() {
                 let mut restart = false;

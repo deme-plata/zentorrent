@@ -20,6 +20,8 @@ pub enum Start {
     HandedOff,
     /// The port is taken by something else: run without the hand-over.
     Alone,
+    /// The running ZenTorrent (this process id) answered, but its window is frozen.
+    Hung(u32),
 }
 
 /// What a second start asks the running one to do.
@@ -93,10 +95,11 @@ pub fn start(open: &[String], show: bool) -> Start {
     // The port is taken: the running ZenTorrent (perhaps still starting), else something else.
     let req = Request { open: open.to_vec(), show };
     for _ in 0..10 {
-        if send(addr, &req).is_ok() {
-            return Start::HandedOff;
+        match send(addr, &req) {
+            Ok(None) => return Start::HandedOff,
+            Ok(Some(pid)) => return Start::Hung(pid),
+            Err(_) => std::thread::sleep(Duration::from_millis(500)),
         }
-        std::thread::sleep(Duration::from_millis(500));
     }
     Start::Alone
 }
@@ -133,29 +136,39 @@ fn decode(key: &str, r: impl BufRead) -> Option<Request> {
     None
 }
 
-fn send(addr: SocketAddr, req: &Request) -> std::io::Result<()> {
+/// Hand `req` over. Ok(None): taken; Ok(Some(pid)): ZenTorrent is running but frozen.
+fn send(addr: SocketAddr, req: &Request) -> std::io::Result<Option<u32>> {
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
-    s.set_read_timeout(Some(Duration::from_secs(3)))?;
+    // The running one first asks its own window whether it answers (up to 4 s).
+    s.set_read_timeout(Some(Duration::from_secs(8)))?;
     s.write_all(encode(&key(), req).as_bytes())?;
     let mut ack = String::new();
     BufReader::new(&s).read_line(&mut ack)?;
-    if ack.trim() == "ok" {
-        Ok(())
-    } else {
-        Err(std::io::Error::other("not a ZenTorrent"))
+    match ack.trim() {
+        "ok" => Ok(None),
+        a => match a.strip_prefix("hung ").and_then(|p| p.parse().ok()) {
+            Some(pid) => Ok(Some(pid)),
+            None => Err(std::io::Error::other("not a ZenTorrent")),
+        },
     }
 }
 
-/// The running ZenTorrent: hears second starts on its own thread.
-pub fn listen(l: TcpListener, on: impl Fn(Request) + Send + 'static) {
+/// The running ZenTorrent: hears second starts on its own thread. This thread answers even
+/// when the window is frozen, so it asks `alive` first: a frozen one says "hung <pid>", and
+/// the new start offers to end it instead of handing over to a window that never comes.
+pub fn listen(l: TcpListener, alive: impl Fn() -> bool + Send + 'static, on: impl Fn(Request) + Send + 'static) {
     let key = key();
     std::thread::spawn(move || {
         for conn in l.incoming() {
             let Ok(s) = conn else { continue };
             let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
             if let Some(req) = decode(&key, BufReader::new(&s)) {
-                let _ = (&s).write_all(b"ok\n");
-                on(req);
+                if alive() {
+                    let _ = (&s).write_all(b"ok\n");
+                    on(req);
+                } else {
+                    let _ = (&s).write_all(format!("hung {}\n", std::process::id()).as_bytes());
+                }
             }
         }
     });

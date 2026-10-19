@@ -72,8 +72,8 @@ mod imp {
     use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
     use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        FindWindowW, GetWindowLongPtrW, IsIconic, SetForegroundWindow, SetWindowLongPtrW, ShowWindow, GWLP_HWNDPARENT, SW_HIDE,
-        SW_RESTORE, SW_SHOW,
+        FindWindowW, GetWindowLongPtrW, IsIconic, SendMessageTimeoutW, SetForegroundWindow, SetWindowLongPtrW, ShowWindow,
+        GWLP_HWNDPARENT, SMTO_ABORTIFHUNG, SMTO_BLOCK, SW_HIDE, SW_RESTORE, SW_SHOW, WM_NULL,
     };
 
     /// The main window's handle, set on the first frame (the tray handlers need it).
@@ -155,6 +155,19 @@ mod imp {
         }
     }
 
+    /// Whether the window answers Windows (the same test Windows' "Not Responding" uses),
+    /// also while it is hidden in the tray. None before its handle is known.
+    pub fn responding() -> Option<bool> {
+        let h = HWND.load(Ordering::Relaxed);
+        if h == 0 {
+            return None;
+        }
+        let mut r: usize = 0;
+        // SAFETY: a window handle of this process; Win32 ignores a stale one.
+        let ok = unsafe { SendMessageTimeoutW(h as _, WM_NULL, 0, 0, SMTO_ABORTIFHUNG | SMTO_BLOCK, 4000, &mut r) };
+        Some(ok != 0)
+    }
+
     /// Off the screen and the taskbar; still running, in the tray. False before the
     /// window's handle is known.
     pub fn hide() -> bool {
@@ -179,6 +192,9 @@ mod imp {
         false
     }
     pub fn own_video_window(_: &str) {}
+    pub fn responding() -> Option<bool> {
+        None
+    }
 }
 
 pub use imp::*;
