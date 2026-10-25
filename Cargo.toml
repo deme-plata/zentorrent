@@ -42,6 +42,10 @@ tracing = "0.1"
 
 # Flux MoE progress: the CPU gauge on Windows (GetSystemTimes).
 [target.'cfg(windows)'.dependencies]
+# Windows draws with DirectX 12 (wgpu): old Intel OpenGL drivers crash inside ZenTorrent
+# (ig9icd64.dll, 2026-10-25). OpenGL (glow) stays as the fallback.
+eframe = { version = "0.35", default-features = false, features = ["wgpu_no_default_features"] }
+wgpu = { version = "29", default-features = false, features = ["dx12"] }
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Registry", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_System_Diagnostics_Debug", "Win32_System_Kernel"] }
 # System tray icon (Settings → keep running in the tray); its window handle from eframe.
 tray-icon = "=0.25.1"

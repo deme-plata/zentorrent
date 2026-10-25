@@ -7,8 +7,10 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet},
     path::PathBuf,
+    rc::Rc,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -374,19 +376,63 @@ fn main() -> eframe::Result<()> {
         eprintln!("{e}");
     }
 
-    let opts = eframe::NativeOptions {
+    let opts = |renderer| eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("ZenTorrent")
             // Room for the sidebar, the list and the player's playlist side by side.
             .with_inner_size([1180.0, 720.0])
             .with_min_inner_size([560.0, 420.0]),
+        renderer,
         ..Default::default()
     };
-    eframe::run_native(
-        "ZenTorrent",
-        opts,
-        Box::new(move |cc| Ok(Box::new(App::new(cc, rt, default_dir, listener, open)))),
-    )
+    // The app starts once, under whichever renderer gets a window up; until then these wait here.
+    let start = Rc::new(RefCell::new(Some((rt, default_dir, listener, open))));
+    let creator = |start: Rc<RefCell<Option<_>>>| -> eframe::AppCreator<'static> {
+        Box::new(move |cc| {
+            let (rt, folder, listener, open) = start.borrow_mut().take().expect("the app starts once");
+            Ok(Box::new(App::new(cc, rt, folder, listener, open)))
+        })
+    };
+    // Windows draws with DirectX 12: old Intel OpenGL drivers crash inside ZenTorrent
+    // (ig9icd64.dll, 2026-10-25). OpenGL stays for a PC without DirectX 12, or when asked
+    // for with ZENTORRENT_OPENGL=1.
+    #[cfg(windows)]
+    if std::env::var_os("ZENTORRENT_OPENGL").is_none() {
+        let mut dx = opts(eframe::Renderer::Wgpu);
+        // The integrated GPU: a laptop's discrete one would wake (and warm up) just for a window.
+        if let eframe::egui_wgpu::WgpuSetup::CreateNew(c) = &mut dx.wgpu_options.wgpu_setup {
+            c.power_preference = eframe::wgpu::PowerPreference::LowPower;
+        }
+        match eframe::run_native("ZenTorrent", dx, creator(start.clone())) {
+            Err(e) if start.borrow().is_some() => crash::note("no DirectX 12", &format!("{e}\nDrawing with OpenGL instead.")),
+            r => return r,
+        }
+    }
+    let r = eframe::run_native("ZenTorrent", opts(eframe::Renderer::Glow), creator(start.clone()));
+    if let Err(e) = &r {
+        if start.borrow().is_some() {
+            crash::no_window(&e.to_string());
+        }
+    }
+    r
+}
+
+/// What draws the window, for Settings → About: "DirectX 12 · Intel(R) UHD Graphics 620".
+static DRAWING: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+fn drawing_with(cc: &eframe::CreationContext<'_>) -> String {
+    #[cfg(windows)]
+    if let Some(s) = &cc.wgpu_render_state {
+        return format!("DirectX 12 · {}", s.adapter.get_info().name);
+    }
+    match &cc.gl {
+        Some(gl) => {
+            use eframe::glow::HasContext as _;
+            // SAFETY: a plain string query on the live context eframe hands us.
+            format!("OpenGL · {}", unsafe { gl.get_parameter_string(eframe::glow::RENDERER) })
+        }
+        None => "unknown".into(),
+    }
 }
 
 /// Incoming peer connections. Without a listener ZenTorrent can only dial out: two such
@@ -693,6 +739,7 @@ impl App {
         open: Vec<String>,
     ) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        let _ = DRAWING.set(drawing_with(cc));
 
         let vpn_settings = vpn::VpnSettings::load();
         // The engine: damaged torrent lists repaired, VPN kill switch, incoming listener.
@@ -1154,6 +1201,10 @@ impl App {
                 ui.end_row();
                 ui.label("Licence");
                 ui.label("MIT or Apache-2.0");
+                ui.end_row();
+                ui.label("Drawing with");
+                ui.label(DRAWING.get().map(String::as_str).unwrap_or("unknown"))
+                    .on_hover_text("Windows uses DirectX 12, or OpenGL when DirectX 12 is not available");
                 ui.end_row();
                 ui.label("Built with");
                 ui.label("librqbit (BitTorrent engine), egui (window), libmpv (player, LGPL)");
@@ -3165,6 +3216,7 @@ impl eframe::App for App {
                     let what = match c.kind.as_str() {
                         "froze" => "ZenTorrent stopped responding last time",
                         "ended frozen" => "ZenTorrent was not responding last time and was closed",
+                        "could not open window" => "ZenTorrent could not open its window last time",
                         _ => "ZenTorrent closed unexpectedly last time",
                     };
                     ui.colored_label(egui::Color32::from_rgb(240, 170, 60), format!("⚠ {what} ({}): {}", c.head, c.summary()));

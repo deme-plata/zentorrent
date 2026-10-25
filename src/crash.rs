@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 /// The log keeps its newest part only.
 const MAX_BYTES: usize = 64 * 1024;
 /// What the next start tells the user about (an error that ZenTorrent survived it does not).
-const SHOWN: [&str; 4] = ["crash", "native crash", "froze", "ended frozen"];
+const SHOWN: [&str; 5] = ["crash", "native crash", "froze", "ended frozen", "could not open window"];
 
 fn path() -> PathBuf {
     crate::seed::data_dir().join("crash.log")
@@ -165,6 +165,27 @@ pub fn watchdog(responding: fn() -> Option<bool>) {
             }
         })
         .ok();
+}
+
+/// Neither DirectX nor OpenGL gave ZenTorrent a window. Without this the app just ended:
+/// a windows-subsystem exe has no console for the error.
+pub fn no_window(err: &str) {
+    note("could not open window", &format!("{err}\nUpdating the graphics driver usually helps."));
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+        let w = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
+        let text = w(&format!(
+            "ZenTorrent could not open its window:\n\n{err}\n\n\
+             Updating the graphics driver usually helps. The details are in crash.log in {}.",
+            path().parent().map(|p| p.display().to_string()).unwrap_or_default()
+        ));
+        let title = w("ZenTorrent could not start");
+        // SAFETY: NUL-terminated UTF-16 strings.
+        unsafe {
+            MessageBoxW(std::ptr::null_mut(), text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONERROR);
+        }
+    }
 }
 
 /// A new start found the running ZenTorrent (`pid`) frozen: ask whether to end it.
