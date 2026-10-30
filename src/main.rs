@@ -222,6 +222,17 @@ fn main() -> eframe::Result<()> {
 
     // `zentorrent --repair-session <session folder> [save folder]`: show how a damaged
     // torrent list would be rebuilt (writes nothing; the app repairs by itself at start).
+    if args.get(1).map(String::as_str) == Some("--vm") {
+        let Some(image) = args.get(2).map(PathBuf::from) else {
+            eprintln!("usage: zentorrent --vm <image.iso|image.img> [--disk]");
+            std::process::exit(2);
+        };
+        if let Err(e) = moe::vm::cli(&image, args.iter().any(|a| a == "--disk")) {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     if args.get(1).map(String::as_str) == Some("--repair-session") {
         let Some(dir) = args.get(2).map(PathBuf::from) else {
             eprintln!("usage: zentorrent --repair-session <session folder> [save folder]");
@@ -3197,6 +3208,10 @@ impl eframe::App for App {
         }
         if self.view == View::Moe {
             let mut actions = Vec::new();
+            if self.moe.vm.wants_scan() {
+                let lib = self.moe_library();
+                self.moe.vm.scan(&lib);
+            }
             egui::CentralPanel::default().show(root, |ui| actions = self.moe.ui(ui, ctx, &self.rt));
             if let Some(text) = self.moe.take_pending() {
                 let lib = self.moe_library();

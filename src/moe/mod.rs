@@ -9,6 +9,7 @@
 //! * `skills`   — the system prompt, the tools, and what each tool does
 //! * `organize` — folder summaries, checked moves, the undo journal
 //! * `gauge`    — live GPU / VRAM / CPU load while an answer is generated
+//! * `vm`       — 🐧 Linux virtualize: boot a downloaded Linux image in QEMU
 
 pub mod gauge;
 pub mod ollama;
@@ -16,6 +17,7 @@ pub mod mix;
 pub mod organize;
 pub mod skills;
 mod text;
+pub mod vm;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -187,6 +189,8 @@ pub struct Moe {
     run: Option<Run>,
     /// Typical answer length in tokens (for the progress bar's estimate).
     avg_tokens: f64,
+    /// 🐧 Linux virtualize (its own panel; needs no model).
+    pub vm: vm::Panel,
 }
 
 impl Default for Moe {
@@ -212,6 +216,7 @@ impl Default for Moe {
             task: None,
             run: None,
             avg_tokens: 0.0,
+            vm: Default::default(),
         }
     }
 }
@@ -535,6 +540,14 @@ impl Moe {
                 ui.label(RichText::new("getting the local model ready…").weak());
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .selectable_label(self.vm.open, RichText::new("🐧 Linux virtualize").strong())
+                    .on_hover_text("Boot a Linux image you downloaded (.iso / .img) in a virtual machine on this computer")
+                    .clicked()
+                {
+                    self.vm.toggle();
+                    ctx.request_repaint();
+                }
                 if ui.checkbox(&mut self.settings.cpu_only, "CPU only").on_hover_text("Keep the model off the graphics card (slower, cooler).").changed() {
                     self.save_settings();
                 }
@@ -576,6 +589,9 @@ impl Moe {
         });
         if let Status::Failed(e) = &self.status {
             ui.colored_label(Color32::from_rgb(230, 160, 60), e);
+        }
+        if self.vm.open {
+            self.vm.ui(ui);
         }
         // The picker's "Get …": what it costs and how it would run here, before anything downloads.
         if let Some((tag, f)) = self.offer.clone() {
