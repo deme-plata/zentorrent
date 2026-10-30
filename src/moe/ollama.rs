@@ -50,7 +50,7 @@ pub struct Model {
 }
 
 /// Families known to call tools, for an Ollama too old to list capabilities.
-const TOOL_FAMILIES: &[&str] = &["qwen3", "qwen2.5", "gemma4", "llama3.1", "llama3.2", "llama3.3", "mistral", "granite3", "command-r"];
+const TOOL_FAMILIES: &[&str] = &["qwen3", "qwen2.5", "lfm3", "gemma4", "llama3.1", "llama3.2", "llama3.3", "mistral", "granite3", "command-r"];
 
 pub async fn models() -> Result<Vec<Model>, String> {
     let r = client(Duration::from_secs(5)).get(format!("{BASE}/api/tags")).send().await.map_err(|e| e.to_string())?;
@@ -91,6 +91,27 @@ pub fn choose(models: &[Model], preferred: Option<&str>) -> Option<String> {
         (fam, !n.contains("instruct"))
     };
     usable.iter().min_by_key(|m| (rank(&m.name), std::cmp::Reverse(m.size))).map(|m| m.name.clone())
+}
+
+/// Families the model picker shows: the ones ZenTorrent's skills are tested with.
+pub const PICKER_FAMILIES: &[&str] = &["qwen", "lfm3"];
+
+/// Small models the picker offers by itself, beside the signed list's: (tag, GB to download,
+/// oldest Ollama that runs it). Ollama checks every layer's digest when it pulls. Not pulled
+/// unasked: the first set-up still takes the signed list's model.
+/// LFM3-1.7B (Liquid AI, 2026-10): made for local agents, calls tools, 256K context.
+pub const OFFERS: &[(&str, f64, &str)] = &[("lfm3:1.7b", 1.1, "0.40.13")];
+
+/// Ollama's version ("0.40.13"); None when it does not answer.
+pub async fn version() -> Option<String> {
+    let v: Value = client(Duration::from_secs(2)).get(format!("{BASE}/api/version")).send().await.ok()?.json().await.ok()?;
+    v["version"].as_str().map(String::from)
+}
+
+/// "0.40.13" is at least "0.40.2": compared number by number.
+pub fn at_least(have: &str, need: &str) -> bool {
+    let n = |v: &str| v.split(['.', '-']).map(|x| x.parse::<u64>().unwrap_or(0)).collect::<Vec<_>>();
+    n(have) >= n(need)
 }
 
 // ---------------------------------------------------------------- chat
@@ -741,12 +762,28 @@ mod tests {
     }
 
     #[test]
+    fn versions_and_offers() {
+        assert!(at_least("0.40.13", "0.40.13"));
+        assert!(at_least("0.41.0", "0.40.13"));
+        assert!(at_least("0.40.13-rc1", "0.40.13"));
+        assert!(!at_least("0.40.2", "0.40.13"));
+        assert!(!at_least("", "0.40.13"));
+        for (tag, gb, _) in OFFERS {
+            assert!(PICKER_FAMILIES.iter().any(|f| tag.starts_with(f)), "{tag} would be offered but not shown");
+            assert!(*gb > 0.0);
+        }
+    }
+
+    #[test]
     fn the_best_tool_model_is_chosen() {
         let m = |n: &str, s, t| Model { name: n.into(), size: s, tools: t };
         let have = vec![m("gemma4:latest", 9, true), m("qwen3:4b-instruct", 3, true), m("qwen3:8b", 5, true), m("llava:7b", 4, false), m("nomic-embed-text", 1, true)];
         assert_eq!(choose(&have, None).as_deref(), Some("qwen3:4b-instruct"), "instruct before a bigger thinking model");
         assert_eq!(choose(&have, Some("gemma4:latest")).as_deref(), Some("gemma4:latest"));
         assert_eq!(choose(&have, Some("llava:7b")).as_deref(), Some("qwen3:4b-instruct"), "a pick that can't use tools is not used");
+        let with_lfm = [have.clone(), vec![m("lfm3:1.7b", 1, true)]].concat();
+        assert_eq!(choose(&with_lfm, Some("lfm3:1.7b")).as_deref(), Some("lfm3:1.7b"), "LFM3 when picked");
+        assert_eq!(choose(&with_lfm, None).as_deref(), Some("qwen3:4b-instruct"), "the default stays");
         assert_eq!(choose(&[m("llava:7b", 4, false)], None), None);
     }
 

@@ -208,12 +208,13 @@ fn main() -> eframe::Result<()> {
     // (the real local model, your feeds and that folder; actions are printed, not done).
     if args.get(1).map(String::as_str) == Some("--ask") {
         let Some(question) = args.get(2) else {
-            eprintln!("usage: zentorrent --ask \"<question>\" [folder] [--cpu]");
+            eprintln!("usage: zentorrent --ask \"<question>\" [folder] [--cpu] [--model <ollama tag>]");
             std::process::exit(2);
         };
         let folder = args.get(3).filter(|a| !a.starts_with("--")).map(PathBuf::from).unwrap_or_else(default_dir);
         let lib = moe::skills::Library { folder, torrents: Vec::new(), feeds: history::History::load().entries };
-        if let Err(e) = rt.block_on(moe::ask(question, lib, args.iter().any(|a| a == "--cpu"))) {
+        let model = args.iter().position(|a| a == "--model").and_then(|i| args.get(i + 1)).cloned();
+        if let Err(e) = rt.block_on(moe::ask(question, lib, args.iter().any(|a| a == "--cpu"), model)) {
             eprintln!("error: {e}");
             std::process::exit(1);
         }

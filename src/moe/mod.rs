@@ -278,17 +278,25 @@ impl Moe {
             ollama::ensure(pick, |s| Moe::push(&events, &ctx, Ev::Setup(s))).await;
             if let Ok(m) = ollama::models().await {
                 let names = m.into_iter().filter(|m| m.tools).map(|m| m.name).collect::<Vec<_>>();
-                // Models from the signed list that are not here yet: the picker offers them.
+                // Models from the signed list that are not here yet, and ZenTorrent's own small
+                // offers this Ollama can run: the picker offers them.
+                let mut offers: Vec<(String, f64)> = Vec::new();
                 if let Ok(man) = ollama::manifest().await {
-                    let offers = man
-                        .extra_models
-                        .iter()
-                        .chain(&man.models)
-                        .filter(|t| !names.contains(t))
-                        .filter_map(|t| man.sizes_gb.get(t).map(|gb| (t.clone(), *gb)))
-                        .collect();
-                    Moe::push(&events, &ctx, Ev::Offers(offers));
+                    offers.extend(
+                        man.extra_models
+                            .iter()
+                            .chain(&man.models)
+                            .filter(|t| !names.contains(t))
+                            .filter_map(|t| man.sizes_gb.get(t).map(|gb| (t.clone(), *gb))),
+                    );
                 }
+                let have = ollama::version().await.unwrap_or_default();
+                for (tag, gb, need) in ollama::OFFERS {
+                    if !names.iter().any(|n| n == tag) && !offers.iter().any(|(t, _)| t == tag) && ollama::at_least(&have, need) {
+                        offers.push((tag.to_string(), *gb));
+                    }
+                }
+                Moe::push(&events, &ctx, Ev::Offers(offers));
                 Moe::push(&events, &ctx, Ev::Models(names));
             }
         });
@@ -507,8 +515,8 @@ impl Moe {
                 let mut pick = m.clone();
                 let mut get: Option<(String, f64)> = None;
                 egui::ComboBox::from_id_salt("moe-model").selected_text(&pick).show_ui(ui, |ui| {
-                    // Qwen only (the skills are tuned on it); the current model always shows.
-                    for name in self.models.iter().filter(|n| n.starts_with("qwen") || *n == m) {
+                    // The families the skills are tested with; the current model always shows.
+                    for name in self.models.iter().filter(|n| ollama::PICKER_FAMILIES.iter().any(|f| n.starts_with(f)) || *n == m) {
                         ui.selectable_value(&mut pick, name.clone(), name);
                     }
                     if !self.offers.is_empty() {
@@ -1149,13 +1157,18 @@ async fn agent(
 
 /// `zentorrent --ask "<question>"`: one Flux MoE turn in the terminal, against the
 /// real local model and the real folder — but actions are only printed, never done.
-pub async fn ask(question: &str, lib: Library, cpu_only: bool) -> Result<(), String> {
+pub async fn ask(question: &str, lib: Library, cpu_only: bool, model: Option<String>) -> Result<(), String> {
     use std::io::Write;
     let settings: Settings = crate::db::load("flux-moe", Some(&settings_path())).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
     let cpu_only = cpu_only || settings.cpu_only;
     // Installed but stopped (closed from the tray, or quit by itself): start it again.
     ollama::wake().await?;
-    let model = ollama::choose(&ollama::models().await?, settings.model.as_deref()).ok_or("no model that can use tools is installed")?;
+    let have = ollama::models().await?;
+    // --model: that model or an error, never a quiet fallback (it is for comparing models).
+    if let Some(m) = model.as_deref().filter(|m| !have.iter().any(|x| x.name == *m && x.tools)) {
+        return Err(format!("{m} is not installed here, or cannot use tools (ollama pull {m})"));
+    }
+    let model = ollama::choose(&have, model.as_deref().or(settings.model.as_deref())).ok_or("no model that can use tools is installed")?;
     println!("Flux MoE · {model}{} · {}", if cpu_only { " (CPU only)" } else { "" }, lib.folder.display());
     let started = std::time::Instant::now();
     let messages = vec![json!({"role": "system", "content": skills::system(&lib)}), json!({"role": "user", "content": question})];
