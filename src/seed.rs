@@ -102,7 +102,17 @@ pub fn bps(kib: u32) -> Option<std::num::NonZeroU32> {
 }
 
 pub fn data_dir() -> PathBuf {
+    // A second ZenTorrent with its own data (and so its own single-instance port), for tests
+    // beside the one in use.
+    if let Some(d) = std::env::var_os("ZENTORRENT_DATA_DIR") {
+        return PathBuf::from(d);
+    }
     dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("zentorrent")
+}
+
+/// Running on ZENTORRENT_DATA_DIR (a test copy).
+pub fn own_data_dir() -> bool {
+    std::env::var_os("ZENTORRENT_DATA_DIR").is_some()
 }
 
 impl Ledger {

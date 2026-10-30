@@ -13,15 +13,19 @@
 //!   the VM starts from it once something is installed, else from the image
 //! * start-up: read from the image (`boot_of`); BIOS when it can, UEFI (edk2/OVMF
 //!   firmware, each image its own settings store) when that is the only way in
+//! * "Get a Linux image": the distro list (`distros`), newest version read live
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, RichText};
 
-use super::skills::Library;
+use super::distros::{self, Distro, Get, DISTROS};
+use super::skills::{Action, Library};
 
 /// winget's id for QEMU's official Windows build (qemu.weilnetz.de).
 const WINGET_ID: &str = "SoftwareFreedomConservancy.QEMU";
@@ -585,6 +589,81 @@ pub fn install() -> Result<(), String> {
     }
 }
 
+/// Where a "Get" from the distro list is.
+#[derive(Clone)]
+enum Fetch {
+    /// Reading the distro's download page for the newest version.
+    Looking,
+    /// An ISO over HTTPS: bytes so far, of how many (0 = not told).
+    Downloading(u64, u64),
+    Checking,
+    Done(String),
+    Failed(String),
+}
+
+type Fetches = Arc<Mutex<HashMap<&'static str, Fetch>>>;
+
+/// An ISO the distro offers only over HTTPS, into `dir`: kept only when it matches the
+/// SHA-256 published beside it (anything else is deleted). The space is checked first.
+async fn fetch_iso(http: &reqwest::Client, url: &str, sha_url: &str, dir: &Path, id: &'static str, fetches: &Fetches, stop: &AtomicBool) -> Result<PathBuf, String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
+    let name = url.rsplit('/').next().filter(|n| kind_of(Path::new(n)).is_some()).ok_or("the link is not an image")?;
+    let dest = dir.join(name);
+    if dest.exists() {
+        return Ok(dest);
+    }
+    let get = |u: &str| http.get(u).header("User-Agent", crate::rss::UA).send();
+    let sums = get(sha_url).await.map_err(|e| e.to_string())?.text().await.map_err(|e| e.to_string())?;
+    let want = distros::parse_sha256(&sums).ok_or("its SHA-256 could not be read, so it was not downloaded")?;
+    // The app's client gives a whole request 30 s (right for feeds): 6 GB takes longer.
+    // Its own deadline here, and a stall check per piece below instead.
+    let mut r = http.get(url).header("User-Agent", crate::rss::UA).timeout(Duration::from_secs(12 * 3600)).send().await.map_err(|e| e.to_string())?;
+    if !r.status().is_success() {
+        return Err(format!("{name}: HTTP {}", r.status()));
+    }
+    let total = r.content_length().unwrap_or(0);
+    if let Some(free) = super::ollama::free_disk_gb(dir) {
+        let need = total as f64 / 1e9 + crate::diskguard::LOW_GB;
+        if free < need {
+            return Err(format!("it needs {need:.1} GB free where your downloads go ({}); {free:.1} GB is free", dir.display()));
+        }
+    }
+    let part = dir.join(format!("{name}.part"));
+    let mut f = std::fs::File::create(&part).map_err(|e| format!("could not write {}: {e}", part.display()))?;
+    let (mut h, mut got) = (Sha256::new(), 0u64);
+    let copied: Result<(), String> = async {
+        loop {
+            let c = match tokio::time::timeout(Duration::from_secs(60), r.chunk()).await {
+                Err(_) => return Err("the download stalled (nothing for a minute) — try again".into()),
+                Ok(c) => c.map_err(|e| format!("the download stopped: {e}"))?,
+            };
+            let Some(c) = c else { break };
+            if stop.load(Ordering::Relaxed) {
+                return Err("stopped".into());
+            }
+            f.write_all(&c).map_err(|e| format!("could not write {}: {e}", part.display()))?;
+            h.update(&c);
+            got += c.len() as u64;
+            fetches.lock().unwrap().insert(id, Fetch::Downloading(got, total));
+        }
+        f.flush().map_err(|e| e.to_string())
+    }
+    .await;
+    drop(f);
+    if let Err(e) = copied {
+        let _ = std::fs::remove_file(&part);
+        return Err(e);
+    }
+    fetches.lock().unwrap().insert(id, Fetch::Checking);
+    if hex::encode(h.finalize()) != want {
+        let _ = std::fs::remove_file(&part);
+        return Err("the download does not match the SHA-256 its makers publish, so it was deleted".into());
+    }
+    std::fs::rename(&part, &dest).map_err(|e| format!("could not name it {}: {e}", dest.display()))?;
+    Ok(dest)
+}
+
 /// What the probe thread found.
 #[derive(Clone)]
 struct Probe {
@@ -617,6 +696,19 @@ pub struct Panel {
     /// winget was started: look for QEMU again every few seconds.
     installing: Option<Instant>,
     last_look: Instant,
+    /// The Save-to folder (from the last scan): HTTPS images go there.
+    folder: PathBuf,
+    last_scan: Instant,
+    /// The app's HTTP client (through the VPN when it is on).
+    http: Option<reqwest::Client>,
+    fetches: Fetches,
+    stops: HashMap<&'static str, Arc<AtomicBool>>,
+    /// Torrent links found for the distro list, for the Downloads list: (name, link).
+    found: Arc<Mutex<Vec<(String, String)>>>,
+    /// What the app must do (add those torrents).
+    out: Vec<Action>,
+    /// Finished Gets already looked for in the list.
+    done_seen: usize,
 }
 
 impl Default for Panel {
@@ -637,6 +729,14 @@ impl Default for Panel {
             notes: Vec::new(),
             installing: None,
             last_look: Instant::now(),
+            folder: PathBuf::new(),
+            last_scan: Instant::now(),
+            http: None,
+            fetches: Default::default(),
+            stops: HashMap::new(),
+            found: Default::default(),
+            out: Vec::new(),
+            done_seen: 0,
         }
     }
 }
@@ -655,8 +755,118 @@ impl Panel {
         self.open && self.want_scan
     }
 
+    /// The app's HTTP client, before each frame (a cheap handle; it changes with the VPN).
+    pub fn set_http(&mut self, http: &reqwest::Client) {
+        self.http = Some(http.clone());
+    }
+
+    /// Torrents to add, found by the distro list.
+    pub fn take_actions(&mut self) -> Vec<Action> {
+        std::mem::take(&mut self.out)
+    }
+
+    /// Find the newest version of a distro and get it: a torrent goes to Downloads, an
+    /// HTTPS-only ISO is downloaded here, checked, and shows up in the list.
+    fn get(&mut self, d: &'static Distro, rt: &tokio::runtime::Runtime, ctx: &egui::Context) {
+        let Some(http) = self.http.clone() else { return };
+        let (fetches, found, dir, ctx) = (self.fetches.clone(), self.found.clone(), self.folder.clone(), ctx.clone());
+        let stop = Arc::new(AtomicBool::new(false));
+        self.stops.insert(d.id, stop.clone());
+        fetches.lock().unwrap().insert(d.id, Fetch::Looking);
+        rt.spawn(async move {
+            let done: Result<String, String> = async {
+                let url = distros::resolve(&http, d).await?;
+                match d.get {
+                    Get::Torrent => {
+                        found.lock().unwrap().push((d.name.to_string(), url));
+                        Ok("added to Downloads — it shows up above when it has finished".to_string())
+                    }
+                    Get::Iso { sha256 } => {
+                        fetch_iso(&http, &url, &format!("{url}{sha256}"), &dir, d.id, &fetches, &stop).await?;
+                        Ok("downloaded, SHA-256 checked — it is in the list above".to_string())
+                    }
+                }
+            }
+            .await;
+            fetches.lock().unwrap().insert(d.id, done.map_or_else(Fetch::Failed, Fetch::Done));
+            ctx.request_repaint();
+        });
+    }
+
+    fn distros_ui(&mut self, ui: &mut egui::Ui, rt: &tokio::runtime::Runtime) {
+        let nothing = self.images.iter().all(|i| i.why_not().is_some());
+        egui::CollapsingHeader::new(RichText::new("⬇ Get a Linux image").strong()).default_open(nothing).show(ui, |ui| {
+            ui.label(RichText::new("Each link is read from the distro's own download page, newest version first.").small().weak());
+            let state = self.fetches.lock().unwrap().clone();
+            let mut get: Option<&'static Distro> = None;
+            let mut stop: Option<&'static str> = None;
+            egui::Grid::new("vm-distros").num_columns(3).spacing([12.0, 6.0]).show(ui, |ui| {
+                for d in DISTROS {
+                    // A fixed width: a grid cell otherwise shrinks to its narrowest word.
+                    ui.vertical(|ui| {
+                        ui.set_width(420.0);
+                        ui.label(RichText::new(d.name).strong());
+                        ui.add(egui::Label::new(RichText::new(d.blurb).small().weak()).wrap());
+                    });
+                    let how = if matches!(d.get, Get::Iso { .. }) { "ISO, checked" } else { "torrent" };
+                    ui.label(RichText::new(format!("≈ {:.1} GB · {how}", d.size_gb)).small());
+                    match state.get(d.id) {
+                        Some(Fetch::Looking) => {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(RichText::new("finding the newest version…").small());
+                            });
+                        }
+                        Some(Fetch::Downloading(got, total)) => {
+                            ui.horizontal(|ui| {
+                                let f = if *total > 0 { *got as f32 / *total as f32 } else { 0.0 };
+                                ui.add(egui::ProgressBar::new(f).desired_width(160.0).text(format!("{:.2} / {:.2} GB", *got as f64 / 1e9, *total as f64 / 1e9)));
+                                if ui.small_button("Stop").clicked() {
+                                    stop = Some(d.id);
+                                }
+                            });
+                        }
+                        Some(Fetch::Checking) => {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(RichText::new("checking its SHA-256…").small());
+                            });
+                        }
+                        Some(Fetch::Done(t)) => {
+                            ui.label(RichText::new(format!("✔ {t}")).small().color(Color32::from_rgb(120, 200, 140)));
+                        }
+                        Some(Fetch::Failed(e)) => {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(RichText::new(e).small().color(Color32::from_rgb(230, 120, 100)));
+                                if ui.small_button("Try again").clicked() {
+                                    get = Some(d);
+                                }
+                            });
+                        }
+                        None => {
+                            if ui.add_enabled(self.http.is_some(), egui::Button::new("⬇ Get")).clicked() {
+                                get = Some(d);
+                            }
+                        }
+                    }
+                    ui.end_row();
+                }
+            });
+            if let Some(d) = get {
+                self.get(d, rt, ui.ctx());
+            }
+            if let Some(id) = stop {
+                if let Some(s) = self.stops.get(id) {
+                    s.store(true, Ordering::Relaxed);
+                }
+            }
+        });
+    }
+
     pub fn scan(&mut self, lib: &Library) {
         self.want_scan = false;
+        self.last_scan = Instant::now();
+        self.folder = lib.folder.clone();
         let chosen_extra: Vec<Image> = self.images.iter().filter(|i| i.from == "chosen by you").cloned().collect();
         self.images = images(lib);
         for i in chosen_extra {
@@ -702,7 +912,7 @@ impl Panel {
         }
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui) {
+    pub fn ui(&mut self, ui: &mut egui::Ui, rt: &tokio::runtime::Runtime) {
         self.tick();
         let fresh = self.incoming.lock().unwrap().take();
         if let Some(p) = fresh {
@@ -725,9 +935,24 @@ impl Panel {
                 self.look();
             }
         }
-        if self.probing || self.installing.is_some() || !self.running.is_empty() {
+        // Torrents the distro list found go to the app; finished downloads show up by themselves.
+        let found: Vec<(String, String)> = self.found.lock().unwrap().drain(..).collect();
+        self.out.extend(found.into_iter().map(|(title, link)| Action::Download { title, link, feed_key: String::new() }));
+        if self.last_scan.elapsed() > Duration::from_secs(15) {
+            self.want_scan = true;
+        }
+        let fetching = self.fetches.lock().unwrap().values().any(|f| matches!(f, Fetch::Looking | Fetch::Downloading(..) | Fetch::Checking));
+        if self.probing || self.installing.is_some() || !self.running.is_empty() || fetching {
             ui.ctx().request_repaint_after(Duration::from_secs(1));
         }
+        // A Get that just finished: look for its image now. Torrents that finish on their own
+        // show up within 15 s: egui draws only on events, so ask for a frame now and then.
+        let done = self.fetches.lock().unwrap().values().filter(|f| matches!(f, Fetch::Done(_))).count();
+        if done != self.done_seen {
+            self.done_seen = done;
+            self.want_scan = true;
+        }
+        ui.ctx().request_repaint_after(Duration::from_secs(5));
 
         egui::Frame::new().fill(Color32::from_rgb(30, 36, 46)).corner_radius(8.0).inner_margin(egui::Margin::same(10)).show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -816,6 +1041,10 @@ impl Panel {
                     });
                 }
             });
+
+            // ── distros to get ──
+            ui.add_space(4.0);
+            egui::ScrollArea::vertical().id_salt("vm-distros-scroll").max_height(240.0).show(ui, |ui| self.distros_ui(ui, rt));
 
             // ── options ──
             let chosen = self.chosen.clone().and_then(|c| self.images.iter().find(|i| i.path == c).cloned());

@@ -55,6 +55,7 @@ mod search;
 mod seed;
 mod serve;
 mod sidebar;
+mod skin;
 mod tabs;
 mod tray;
 mod tunnel;
@@ -223,6 +224,10 @@ fn main() -> eframe::Result<()> {
 
     // `zentorrent --repair-session <session folder> [save folder]`: show how a damaged
     // torrent list would be rebuilt (writes nothing; the app repairs by itself at start).
+    if args.get(1).map(String::as_str) == Some("--distros") {
+        let ok = rt.block_on(moe::distros::check(&rss::http()));
+        std::process::exit(if ok { 0 } else { 1 });
+    }
     if args.get(1).map(String::as_str) == Some("--vm") {
         let Some(image) = args.get(2).map(PathBuf::from) else {
             eprintln!("usage: zentorrent --vm <image.iso|image.img> [--disk]");
@@ -381,19 +386,25 @@ fn main() -> eframe::Result<()> {
     let default_dir = default_dir();
 
     // Windows' start-up list and the .torrent/magnet registration follow Settings and this exe's path.
-    if let Err(e) = autostart::apply(autostart::wanted()) {
-        eprintln!("{e}");
-    }
-    if let Err(e) = assoc::apply(assoc::wanted()) {
-        eprintln!("{e}");
+    // Not for a test copy with its own data: these are this user's Windows settings.
+    if !seed::own_data_dir() {
+        if let Err(e) = autostart::apply(autostart::wanted()) {
+            eprintln!("{e}");
+        }
+        if let Err(e) = assoc::apply(assoc::wanted()) {
+            eprintln!("{e}");
+        }
     }
 
+    // Settings → Look: a see-through window has to open that way.
+    let see_through = skin::open_see_through();
     let opts = |renderer| eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("ZenTorrent")
             // Room for the sidebar, the list and the player's playlist side by side.
             .with_inner_size([1180.0, 720.0])
-            .with_min_inner_size([560.0, 420.0]),
+            .with_min_inner_size([560.0, 420.0])
+            .with_transparent(see_through && skin::PANEL_GLASS),
         renderer,
         ..Default::default()
     };
@@ -414,6 +425,11 @@ fn main() -> eframe::Result<()> {
         // The integrated GPU: a laptop's discrete one would wake (and warm up) just for a window.
         if let eframe::egui_wgpu::WgpuSetup::CreateNew(c) = &mut dx.wgpu_options.wgpu_setup {
             c.power_preference = eframe::wgpu::PowerPreference::LowPower;
+            // A swapchain made straight from the window cannot be see-through; one through
+            // DirectComposition can (only used when Transparency is on).
+            if see_through {
+                c.instance_descriptor.backend_options.dx12.presentation_system = eframe::wgpu::Dx12SwapchainKind::DxgiFromVisual;
+            }
         }
         match eframe::run_native("ZenTorrent", dx, creator(start.clone())) {
             Err(e) if start.borrow().is_some() => crash::note("no DirectX 12", &format!("{e}\nDrawing with OpenGL instead.")),
@@ -648,6 +664,8 @@ struct App {
     store: rss::FeedStore,
     fv: FeedView,
     http: reqwest::Client,
+    /// Settings → Look.
+    look: skin::Look,
     upd: Upd,
     upd_checked: Option<Instant>,
     ledger: seed::Ledger,
@@ -750,7 +768,8 @@ impl App {
         listener: Option<std::net::TcpListener>,
         open: Vec<String>,
     ) -> Self {
-        cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        let look = skin::load();
+        cc.egui_ctx.set_visuals(skin::visuals(&look));
         let _ = DRAWING.set(drawing_with(cc));
 
         let vpn_settings = vpn::VpnSettings::load();
@@ -776,6 +795,7 @@ impl App {
             store: rss::FeedStore::load(),
             fv: FeedView::default(),
             http: vpn.http(),
+            look,
             upd: Upd::Checking,
             upd_checked: None,
             ledger,
@@ -1121,6 +1141,50 @@ impl App {
                         }
                     });
                 }
+            }
+
+            section(ui, "Look");
+            let before = self.look.clone();
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+                for s in skin::SKINS {
+                    let (fill, accent) = s.swatch();
+                    let b = egui::Button::new(egui::RichText::new(s.name).color(accent).strong())
+                        .fill(fill)
+                        .selected(self.look.skin == s.id)
+                        .min_size(egui::vec2(104.0, 32.0));
+                    if ui.add(b).clicked() {
+                        self.look.skin = s.id.to_string();
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Transparency");
+                ui.add(egui::Slider::new(&mut self.look.transparency, 0..=skin::MAX_TRANSPARENCY).suffix(" %"));
+            });
+            if self.look != before {
+                skin::save(&self.look);
+                ctx.set_visuals(skin::visuals(&self.look));
+            }
+            if self.look.transparency > 0 && !skin::see_through_window() {
+                let mut restart = false;
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(egui::Color32::from_rgb(240, 170, 60), "The window turns see-through after a restart (it has to open that way).");
+                    restart = ui.button("↻ Restart").clicked();
+                });
+                if restart {
+                    self.restart();
+                }
+            } else {
+                ui.label(
+                    egui::RichText::new(if skin::PANEL_GLASS {
+                        "Backgrounds turn see-through; text and buttons stay solid (on a desktop that composites windows)."
+                    } else {
+                        "The whole window turns see-through (with DirectX 12, Windows cannot fade the backgrounds alone)."
+                    })
+                    .weak()
+                    .small(),
+                );
             }
 
             section(ui, "VPN");
@@ -2996,6 +3060,11 @@ impl Source {
 }
 
 impl eframe::App for App {
+    /// See-through window (Settings → Look): clear to nothing, the panels draw the rest.
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        if skin::see_through_window() && skin::PANEL_GLASS { [0.0; 4] } else { visuals.panel_fill.to_normalized_gamma_f32() }
+    }
+
     fn ui(&mut self, root: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = &root.ctx().clone();
         // Tests only (debug builds): freeze the window once, to try the hang check.
@@ -3018,6 +3087,7 @@ impl eframe::App for App {
         }
         #[cfg(not(windows))]
         let _ = (frame, self.hwnd_known);
+        skin::apply_window_alpha(&self.look);
         // Started by Windows at log-in: in the tray when it is on, else minimized. Not on
         // the first frame: eframe shows the window after that one, undoing the hiding.
         if self.start_minimized && ctx.cumulative_frame_nr() >= 3 {
@@ -3209,6 +3279,7 @@ impl eframe::App for App {
         }
         if self.view == View::Moe {
             let mut actions = Vec::new();
+            self.moe.vm.set_http(&self.http);
             if self.moe.vm.wants_scan() {
                 let lib = self.moe_library();
                 self.moe.vm.scan(&lib);

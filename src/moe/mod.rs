@@ -15,6 +15,7 @@ pub mod gauge;
 pub mod ollama;
 pub mod mix;
 pub mod organize;
+pub mod distros;
 pub mod skills;
 mod text;
 pub mod vm;
@@ -599,7 +600,8 @@ impl Moe {
             ui.colored_label(Color32::from_rgb(230, 160, 60), e);
         }
         if self.vm.open {
-            self.vm.ui(ui);
+            self.vm.ui(ui, rt);
+            actions.extend(self.vm.take_actions());
         }
         // The picker's "Get …": what it costs and how it would run here, before anything downloads.
         if let Some((tag, f)) = self.offer.clone() {

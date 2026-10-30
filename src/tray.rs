@@ -168,6 +168,36 @@ mod imp {
         Some(ok != 0)
     }
 
+    /// Keep the whole window at this opacity (Settings → Look on Windows); 255 = solid.
+    /// Called every frame: winit rewrites the window's extended style when the window
+    /// changes, which drops the layered flag (seen 2026-10-30), so it is put back. Only
+    /// two cheap reads when nothing changed.
+    pub fn set_opacity(alpha: u8) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GetLayeredWindowAttributes, SetLayeredWindowAttributes, GWL_EXSTYLE, LWA_ALPHA, WS_EX_LAYERED};
+        let h = HWND.load(Ordering::Relaxed);
+        if h == 0 {
+            return;
+        }
+        // SAFETY: a window handle of this process; Win32 ignores a stale one.
+        unsafe {
+            let ex = GetWindowLongPtrW(h as _, GWL_EXSTYLE);
+            let layered = ex & WS_EX_LAYERED as isize != 0;
+            if alpha == 255 {
+                if layered {
+                    SetWindowLongPtrW(h as _, GWL_EXSTYLE, ex & !(WS_EX_LAYERED as isize));
+                }
+                return;
+            }
+            let (mut key, mut now, mut flags) = (0u32, 0u8, 0u32);
+            if !layered || GetLayeredWindowAttributes(h as _, &mut key, &mut now, &mut flags) == 0 || now != alpha {
+                if !layered {
+                    SetWindowLongPtrW(h as _, GWL_EXSTYLE, ex | WS_EX_LAYERED as isize);
+                }
+                SetLayeredWindowAttributes(h as _, 0, alpha, LWA_ALPHA);
+            }
+        }
+    }
+
     /// Off the screen and the taskbar; still running, in the tray. False before the
     /// window's handle is known.
     pub fn hide() -> bool {
