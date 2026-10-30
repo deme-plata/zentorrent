@@ -11,6 +11,8 @@
 //!   runs with `snapshot=on`, so seeding goes on and the torrent stays valid
 //! * "Keep a disk": a growing qcow2 in ZenTorrent's data folder to install into;
 //!   the VM starts from it once something is installed, else from the image
+//! * start-up: read from the image (`boot_of`); BIOS when it can, UEFI (edk2/OVMF
+//!   firmware, each image its own settings store) when that is the only way in
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -61,7 +63,7 @@ pub fn foreign_arch(name: &str) -> Option<&'static str> {
 pub enum Boot {
     /// Starts with the VM's BIOS.
     Yes,
-    /// Bootable only with UEFI firmware.
+    /// Starts only with UEFI firmware (found next to QEMU or from the distro's OVMF package).
     UefiOnly,
     /// An Android boot/recovery image: made for a phone.
     Android,
@@ -75,8 +77,7 @@ impl Boot {
     /// Why it cannot be started, for the list.
     pub fn why_not(self) -> Option<&'static str> {
         match self {
-            Boot::Yes => None,
-            Boot::UefiOnly => Some("starts only with UEFI, which this does not do yet"),
+            Boot::Yes | Boot::UefiOnly => None,
             Boot::Android => Some("an Android phone image, not a system for a PC"),
             Boot::No => Some("not bootable — no start-up record (a data disc?)"),
             Boot::Unknown => Some("could not be read"),
@@ -97,8 +98,13 @@ pub fn boot_of(path: &Path, kind: Kind) -> Boot {
         return Boot::Android;
     }
     if kind == Kind::Raw {
-        // A PC disk starts with a master boot record (also the guard record of a GPT disk).
-        return if head[510..512] == [0x55, 0xAA] { Boot::Yes } else { Boot::No };
+        // A PC disk starts with a master boot record. A GPT disk has one too, as a guard: with
+        // no boot code in it (the first 440 bytes empty) only UEFI can start the disk.
+        if head[510..512] != [0x55, 0xAA] {
+            return Boot::No;
+        }
+        let gpt = &head[512..520] == b"EFI PART";
+        return if gpt && head[..440].iter().all(|b| *b == 0) { Boot::UefiOnly } else { Boot::Yes };
     }
     // A CD starts through El Torito: a boot record at sector 17 points to the boot catalog.
     let mut rec = [0u8; 0x4B];
@@ -214,7 +220,39 @@ pub struct Qemu {
     /// `qemu-img`, for a kept disk.
     pub img: Option<PathBuf>,
     pub version: String,
+    pub uefi: Option<Uefi>,
 }
+
+/// UEFI firmware for x86-64 (edk2 / OVMF): its code, and the empty settings store each
+/// image gets a copy of.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Uefi {
+    pub code: PathBuf,
+    pub vars: PathBuf,
+}
+
+/// Where the firmware is: QEMU's Windows build carries it in `share\`; Linux distros put it
+/// in their OVMF package. The Secure Boot builds are left out (they need more machine setup).
+pub fn find_uefi(qemu: &Path) -> Option<Uefi> {
+    let mut c: Vec<(PathBuf, PathBuf)> = Vec::new();
+    if let Some(share) = qemu.parent().map(|d| d.join("share")) {
+        c.push((share.join("edk2-x86_64-code.fd"), share.join("edk2-i386-vars.fd")));
+    }
+    for (code, vars) in [
+        ("/usr/share/qemu/edk2-x86_64-code.fd", "/usr/share/qemu/edk2-i386-vars.fd"),
+        ("/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/OVMF/OVMF_VARS_4M.fd"),
+        ("/usr/share/OVMF/OVMF_CODE.fd", "/usr/share/OVMF/OVMF_VARS.fd"),
+        ("/usr/share/edk2/ovmf/OVMF_CODE.fd", "/usr/share/edk2/ovmf/OVMF_VARS.fd"),
+        ("/usr/share/edk2/x64/OVMF_CODE.4m.fd", "/usr/share/edk2/x64/OVMF_VARS.4m.fd"),
+        ("/usr/share/edk2-ovmf/x64/OVMF_CODE.fd", "/usr/share/edk2-ovmf/x64/OVMF_VARS.fd"),
+    ] {
+        c.push((code.into(), vars.into()));
+    }
+    c.into_iter().find(|(code, vars)| code.is_file() && vars.is_file()).map(|(code, vars)| Uefi { code, vars })
+}
+
+/// What to say when a UEFI image meets a QEMU without the firmware (only happens on Linux).
+const NO_UEFI: &str = "starts only with UEFI — install the firmware: sudo apt install ovmf (Fedora/Arch: edk2-ovmf)";
 
 fn quiet(cmd: &mut Command) -> &mut Command {
     #[cfg(windows)]
@@ -263,7 +301,7 @@ pub fn find_qemu() -> Option<Qemu> {
     let img = bin.with_file_name(exe("qemu-img"));
     let out = quiet(Command::new(&bin).arg("--version").stdin(Stdio::null())).output().ok()?;
     let version = parse_version(&String::from_utf8_lossy(&out.stdout)).unwrap_or_else(|| "?".into());
-    Some(Qemu { img: img.is_file().then_some(img), bin, version })
+    Some(Qemu { img: img.is_file().then_some(img), uefi: find_uefi(&bin), bin, version })
 }
 
 /// How fast the VM can run here.
@@ -374,6 +412,11 @@ pub fn disk_path(image: &Path) -> PathBuf {
     vm_dir().join(format!("{}.qcow2", stem(image)))
 }
 
+/// The image's own UEFI settings store (boot entries an installer writes live here).
+pub fn efivars_path(image: &Path) -> PathBuf {
+    vm_dir().join(format!("{}.efivars.fd", stem(image)))
+}
+
 /// QEMU's option syntax: a comma inside a value is written twice.
 fn esc(p: &Path) -> String {
     p.to_string_lossy().replace(',', ",,")
@@ -387,6 +430,20 @@ pub struct Plan {
     pub cpus: u32,
     /// A disk to install into (ISO only).
     pub disk: Option<PathBuf>,
+    /// Start with UEFI firmware instead of the BIOS (for images that start only that way).
+    pub uefi: Option<Uefi>,
+}
+
+impl Plan {
+    /// The plan for an image: UEFI when it needs it (an error when the firmware is missing).
+    pub fn new(img: &Image, q: &Qemu, ram_mb: u32, cpus: u32, keep_disk: bool) -> Result<Plan, String> {
+        let uefi = match img.boot {
+            Boot::UefiOnly => Some(q.uefi.clone().ok_or(NO_UEFI)?),
+            _ => None,
+        };
+        let disk = (keep_disk && img.kind == Kind::Iso).then(|| disk_path(&img.path));
+        Ok(Plan { image: img.path.clone(), kind: img.kind, ram_mb, cpus, disk, uefi })
+    }
 }
 
 pub fn args(p: &Plan, accel: &Accel) -> Vec<String> {
@@ -395,6 +452,11 @@ pub fn args(p: &Plan, accel: &Accel) -> Vec<String> {
     a.push(format!("{name} — ZenTorrent"));
     a.extend(accel.args.iter().cloned());
     a.extend(["-m".into(), p.ram_mb.to_string(), "-smp".into(), p.cpus.to_string()]);
+    if let Some(u) = &p.uefi {
+        // The firmware read-only; the image's own copy of the settings store beside it.
+        a.extend(["-drive".into(), format!("if=pflash,format=raw,readonly=on,file={}", esc(&u.code))]);
+        a.extend(["-drive".into(), format!("if=pflash,format=raw,file={}", esc(&efivars_path(&p.image)))]);
+    }
     // Resizable screen, a mouse that is not captured, and internet through the host.
     a.extend(owned(&["-vga", "virtio", "-usb", "-device", "usb-tablet", "-nic", "user,model=virtio-net-pci"]));
     match p.kind {
@@ -447,6 +509,12 @@ pub fn launch(q: &Qemu, plan: &Plan, accel: &Accel) -> Result<Running, String> {
             return Err(format!("could not make the disk: {}", String::from_utf8_lossy(&out.stderr).trim()));
         }
     }
+    if let Some(u) = &plan.uefi {
+        let vars = efivars_path(&plan.image);
+        if !vars.exists() {
+            std::fs::copy(&u.vars, &vars).map_err(|e| format!("could not copy the UEFI settings store {}: {e}", u.vars.display()))?;
+        }
+    }
     let log = vm_dir().join(format!("{}.log", stem(&plan.image)));
     let f = std::fs::File::create(&log).map_err(|e| format!("could not write {}: {e}", log.display()))?;
     let child = quiet(
@@ -469,7 +537,9 @@ pub fn cli(image: &Path, disk: bool) -> Result<(), String> {
     if !image.is_file() {
         return Err(format!("{} not found", image.display()));
     }
-    if let Some(why) = boot_of(image, kind).why_not() {
+    let size = std::fs::metadata(image).map(|m| m.len()).unwrap_or(0);
+    let img = Image::new(image.to_path_buf(), size, kind, true, String::new());
+    if let Some(why) = img.why_not() {
         return Err(format!("{} cannot start: {why}", image.display()));
     }
     let q = find_qemu().ok_or(if cfg!(windows) {
@@ -478,8 +548,9 @@ pub fn cli(image: &Path, disk: bool) -> Result<(), String> {
         "QEMU is not installed: sudo apt install qemu-system-x86 qemu-utils".to_string()
     })?;
     let a = accel();
-    let plan = Plan { image: image.to_path_buf(), kind, ram_mb: default_ram_mb(total_ram_mb()), cpus: default_cpus(), disk: (disk && kind == Kind::Iso).then(|| disk_path(image)) };
-    println!("QEMU {} ({}) · {}", q.version, q.bin.display(), a.label);
+    let plan = Plan::new(&img, &q, default_ram_mb(total_ram_mb()), default_cpus(), disk).map_err(|e| format!("{} {e}", img.name))?;
+    let start = if plan.uefi.is_some() { "UEFI" } else { "BIOS" };
+    println!("QEMU {} ({}) · {} · starts with {start}", q.version, q.bin.display(), a.label);
     if let Some(h) = &a.hint {
         println!("  {h}");
     }
@@ -722,9 +793,12 @@ impl Panel {
                         .weak(),
                 );
             }
+            // A UEFI image needs the firmware: QEMU on Windows has it, a Linux distro maybe not.
+            let no_uefi = qemu.as_ref().is_some_and(|(q, _)| q.uefi.is_none());
+            let blocked = |img: &Image| img.why_not().or_else(|| (no_uefi && img.boot == Boot::UefiOnly).then(|| NO_UEFI.to_string()));
             egui::ScrollArea::vertical().id_salt("vm-images").max_height(150.0).show(ui, |ui| {
                 for img in &self.images {
-                    let why_not = img.why_not();
+                    let why_not = blocked(img);
                     let mut text = format!("{}  ·  {:.2} GB", img.name, img.size as f64 / 1e9);
                     if img.kind == Kind::Raw {
                         text += "  ·  disk image";
@@ -736,6 +810,7 @@ impl Panel {
                         }
                         match &why_not {
                             Some(w) => ui.label(RichText::new(w).small().color(Color32::from_rgb(200, 150, 90))),
+                            None if img.boot == Boot::UefiOnly => ui.label(RichText::new(format!("starts with UEFI · {}", img.from)).small().weak()),
                             None => ui.label(RichText::new(&img.from).small().weak()),
                         };
                     });
@@ -765,15 +840,13 @@ impl Panel {
             ui.horizontal(|ui| {
                 // One VM per image: a second one could not open the same disk.
                 let already = chosen.as_ref().is_some_and(|c| self.running.iter().any(|r| r.image == c.path));
-                let can = qemu.is_some() && chosen.as_ref().is_some_and(|c| c.why_not().is_none()) && !already;
+                let can = qemu.is_some() && chosen.as_ref().is_some_and(|c| blocked(c).is_none()) && !already;
                 let start = ui
                     .add_enabled(can, egui::Button::new(RichText::new("▶ Start the virtual machine").strong()))
                     .on_disabled_hover_text(if already { "It is running already — see its window" } else { "Choose an image, and QEMU is needed" });
                 if start.clicked() {
                     if let (Some((q, a)), Some(img)) = (&qemu, &chosen) {
-                        let disk = (img.kind == Kind::Iso && self.keep_disk).then(|| disk_path(&img.path));
-                        let plan = Plan { image: img.path.clone(), kind: img.kind, ram_mb: self.ram_mb, cpus: self.cpus, disk };
-                        match launch(q, &plan, a) {
+                        match Plan::new(img, q, self.ram_mb, self.cpus, self.keep_disk).and_then(|plan| launch(q, &plan, a)) {
                             Ok(r) => {
                                 self.notes.push(Note::Ok(format!("{} is starting in its own window. Closing that window turns the VM off.", r.name)));
                                 self.running.push(r);
@@ -856,7 +929,32 @@ mod tests {
     use crate::moe::skills::Torrent;
 
     fn plan(kind: Kind, image: &str, disk: Option<&str>) -> Plan {
-        Plan { image: image.into(), kind, ram_mb: 2048, cpus: 2, disk: disk.map(PathBuf::from) }
+        Plan { image: image.into(), kind, ram_mb: 2048, cpus: 2, disk: disk.map(PathBuf::from), uefi: None }
+    }
+
+    #[test]
+    fn uefi_images_start_with_the_firmware() {
+        let mut p = plan(Kind::Iso, "/d/uefi.iso", None);
+        p.uefi = Some(Uefi { code: "/fw/edk2-x86_64-code.fd".into(), vars: "/fw/edk2-i386-vars.fd".into() });
+        let a = args(&p, &tcg());
+        let s = a.join(" ");
+        assert!(s.contains("-drive if=pflash,format=raw,readonly=on,file=/fw/edk2-x86_64-code.fd"), "{s}");
+        // The settings store is the image's own copy, never the shared template.
+        let vars = a.iter().find(|x| x.starts_with("if=pflash,format=raw,file=")).unwrap();
+        assert!(vars.ends_with("uefi.efivars.fd") && !vars.contains("/fw/"), "{vars}");
+        assert!(s.contains("media=cdrom") && s.contains("-boot order=d"));
+        // BIOS images get no firmware drives.
+        assert!(!args(&plan(Kind::Iso, "/d/x.iso", None), &tcg()).join(" ").contains("pflash"));
+    }
+
+    #[test]
+    fn a_plan_asks_for_uefi_only_when_the_image_needs_it() {
+        let q = |uefi: Option<Uefi>| Qemu { bin: "/q".into(), img: None, version: "11".into(), uefi };
+        let fw = Some(Uefi { code: "/c".into(), vars: "/v".into() });
+        let img = |boot| Image { path: "/d/a.iso".into(), name: "a.iso".into(), size: 1, kind: Kind::Iso, ready: true, from: String::new(), boot };
+        assert!(Plan::new(&img(Boot::Yes), &q(fw.clone()), 1024, 1, false).unwrap().uefi.is_none());
+        assert_eq!(Plan::new(&img(Boot::UefiOnly), &q(fw.clone()), 1024, 1, false).unwrap().uefi, fw);
+        assert!(Plan::new(&img(Boot::UefiOnly), &q(None), 1024, 1, false).unwrap_err().contains("ovmf"));
     }
 
     fn tcg() -> Accel {
@@ -915,7 +1013,13 @@ mod tests {
         let mut mbr = vec![0u8; 4096];
         mbr[510] = 0x55;
         mbr[511] = 0xAA;
-        assert_eq!(boot_of(&file("stick.img", mbr), Kind::Raw), Boot::Yes);
+        assert_eq!(boot_of(&file("stick.img", mbr.clone()), Kind::Raw), Boot::Yes);
+        // A GPT disk whose guard MBR has no boot code: UEFI only. With boot code (hybrid): BIOS.
+        let mut gpt = mbr;
+        gpt[512..520].copy_from_slice(b"EFI PART");
+        assert_eq!(boot_of(&file("gpt.img", gpt.clone()), Kind::Raw), Boot::UefiOnly);
+        gpt[0] = 0xEB;
+        assert_eq!(boot_of(&file("hybrid.img", gpt), Kind::Raw), Boot::Yes);
         let mut android = b"ANDROID!".to_vec();
         android.resize(4096, 0);
         assert_eq!(boot_of(&file("twrp-3.4.0-0-guacamole.img", android), Kind::Raw), Boot::Android);
@@ -925,6 +1029,8 @@ mod tests {
         let img = Image::new(dir.join("twrp-3.4.0-0-guacamole.img"), 4096, Kind::Raw, true, String::new());
         assert!(img.why_not().unwrap().contains("Android"));
         assert_eq!(Image::new(dir.join("distro.iso"), 1, Kind::Iso, true, String::new()).why_not(), None);
+        // UEFI-only images can start now (with the firmware).
+        assert_eq!(Image::new(dir.join("uefi.iso"), 1, Kind::Iso, true, String::new()).why_not(), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
