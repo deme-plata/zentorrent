@@ -54,6 +54,78 @@ pub fn foreign_arch(name: &str) -> Option<&'static str> {
         .map(|(_, a)| a)
 }
 
+/// Can the VM start from an image? Read from its first sectors, not guessed from the name:
+/// a Downloads folder also holds game discs and phone images (2026-10-30: a voice-pack ISO
+/// and an Android recovery .img were offered, and the VM said "No bootable device").
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Boot {
+    /// Starts with the VM's BIOS.
+    Yes,
+    /// Bootable only with UEFI firmware.
+    UefiOnly,
+    /// An Android boot/recovery image: made for a phone.
+    Android,
+    /// No start-up record: a data disc, or a disk without a system.
+    No,
+    /// Not read (still downloading, or unreadable).
+    Unknown,
+}
+
+impl Boot {
+    /// Why it cannot be started, for the list.
+    pub fn why_not(self) -> Option<&'static str> {
+        match self {
+            Boot::Yes => None,
+            Boot::UefiOnly => Some("starts only with UEFI, which this does not do yet"),
+            Boot::Android => Some("an Android phone image, not a system for a PC"),
+            Boot::No => Some("not bootable — no start-up record (a data disc?)"),
+            Boot::Unknown => Some("could not be read"),
+        }
+    }
+}
+
+const SECTOR: u64 = 2048;
+
+pub fn boot_of(path: &Path, kind: Kind) -> Boot {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(path) else { return Boot::Unknown };
+    let mut head = [0u8; 1024];
+    if f.read_exact(&mut head).is_err() {
+        return Boot::No;
+    }
+    if head.starts_with(b"ANDROID!") || head.starts_with(b"VNDRBOOT") {
+        return Boot::Android;
+    }
+    if kind == Kind::Raw {
+        // A PC disk starts with a master boot record (also the guard record of a GPT disk).
+        return if head[510..512] == [0x55, 0xAA] { Boot::Yes } else { Boot::No };
+    }
+    // A CD starts through El Torito: a boot record at sector 17 points to the boot catalog.
+    let mut rec = [0u8; 0x4B];
+    if f.seek(SeekFrom::Start(17 * SECTOR)).is_err() || f.read_exact(&mut rec).is_err() {
+        return Boot::No;
+    }
+    if rec[0] != 0 || &rec[1..6] != b"CD001" || !rec[7..].starts_with(b"EL TORITO SPECIFICATION") {
+        return Boot::No;
+    }
+    let lba = u32::from_le_bytes([rec[0x47], rec[0x48], rec[0x49], rec[0x4A]]) as u64;
+    let mut cat = [0u8; SECTOR as usize];
+    if f.seek(SeekFrom::Start(lba * SECTOR)).is_err() || f.read_exact(&mut cat).is_err() || cat[0] != 1 {
+        return Boot::No;
+    }
+    // The validation entry names the default entry's platform; section headers (0x90, last 0x91)
+    // name the others. 0 = PC BIOS, 0xEF = UEFI.
+    let mut platforms = vec![cat[1]];
+    platforms.extend(cat.chunks(32).skip(2).filter(|e| e[0] == 0x90 || e[0] == 0x91).map(|e| e[1]));
+    if platforms.contains(&0) {
+        Boot::Yes
+    } else if platforms.contains(&0xEF) {
+        Boot::UefiOnly
+    } else {
+        Boot::No
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Image {
     pub path: PathBuf,
@@ -64,6 +136,26 @@ pub struct Image {
     pub ready: bool,
     /// Which torrent it came from, or where it was found.
     pub from: String,
+    pub boot: Boot,
+}
+
+impl Image {
+    fn new(path: PathBuf, size: u64, kind: Kind, ready: bool, from: String) -> Image {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let boot = if ready { boot_of(&path, kind) } else { Boot::Unknown };
+        Image { path, name, size, kind, ready, from, boot }
+    }
+
+    /// Why the VM cannot start it, if it cannot.
+    pub fn why_not(&self) -> Option<String> {
+        if let Some(a) = foreign_arch(&self.name) {
+            return Some(format!("built for {a}, this PC is x86-64"));
+        }
+        if !self.ready {
+            return Some(format!("still downloading — {}", self.from));
+        }
+        self.boot.why_not().map(String::from)
+    }
 }
 
 /// The images in the library: torrents' files, then loose ones in the Save-to folder.
@@ -73,9 +165,8 @@ pub fn images(lib: &Library) -> Vec<Image> {
         for (rel, size) in &t.files {
             let path = t.root.join(rel);
             let Some(kind) = kind_of(&path) else { continue };
-            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| rel.clone());
             let ready = t.progress >= 0.9999 && std::fs::metadata(&path).map(|m| m.len() == *size).unwrap_or(false);
-            out.push(Image { path, name, size: *size, kind, ready, from: format!("torrent “{}” · {:.0} %", t.name, t.progress * 100.0) });
+            out.push(Image::new(path, *size, kind, ready, format!("torrent “{}” · {:.0} %", t.name, t.progress * 100.0)));
         }
     }
     let mut loose = Vec::new();
@@ -85,10 +176,12 @@ pub fn images(lib: &Library) -> Vec<Image> {
             continue;
         }
         let (Some(kind), Ok(m)) = (kind_of(&path), std::fs::metadata(&path)) else { continue };
-        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        out.push(Image { path, name, size: m.len(), kind, ready: true, from: "in your download folder".into() });
+        out.push(Image::new(path, m.len(), kind, true, "in your download folder".into()));
     }
-    out.sort_by(|a, b| b.ready.cmp(&a.ready).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+    // Startable first, then finished, then by name.
+    out.sort_by(|a, b| {
+        (b.why_not().is_none(), b.ready).cmp(&(a.why_not().is_none(), a.ready)).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
     out
 }
 
@@ -376,6 +469,9 @@ pub fn cli(image: &Path, disk: bool) -> Result<(), String> {
     if !image.is_file() {
         return Err(format!("{} not found", image.display()));
     }
+    if let Some(why) = boot_of(image, kind).why_not() {
+        return Err(format!("{} cannot start: {why}", image.display()));
+    }
     let q = find_qemu().ok_or(if cfg!(windows) {
         format!("QEMU is not installed: winget install --id {WINGET_ID}  (or {DOWNLOAD_PAGE})")
     } else {
@@ -497,8 +593,8 @@ impl Panel {
                 self.images.insert(0, i);
             }
         }
-        if self.chosen.as_ref().is_none_or(|c| !self.images.iter().any(|i| &i.path == c)) {
-            self.chosen = self.images.iter().find(|i| i.ready && foreign_arch(&i.name).is_none()).map(|i| i.path.clone());
+        if self.chosen.as_ref().is_none_or(|c| !self.images.iter().any(|i| &i.path == c && i.why_not().is_none())) {
+            self.chosen = self.images.iter().find(|i| i.why_not().is_none()).map(|i| i.path.clone());
         }
     }
 
@@ -604,10 +700,13 @@ impl Panel {
                     if let Some(p) = rfd::FileDialog::new().add_filter("Linux image", &["iso", "img", "raw"]).pick_file() {
                         if let Some(kind) = kind_of(&p) {
                             let size = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
-                            let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                            let img = Image::new(p.clone(), size, kind, true, "chosen by you".into());
+                            match img.why_not() {
+                                None => self.chosen = Some(p.clone()),
+                                Some(why) => self.notes.push(Note::Err(format!("{} cannot start: {why}.", img.name))),
+                            }
                             self.images.retain(|i| i.path != p);
-                            self.images.insert(0, Image { path: p.clone(), name, size, kind, ready: true, from: "chosen by you".into() });
-                            self.chosen = Some(p);
+                            self.images.insert(0, img);
                         }
                     }
                 }
@@ -625,23 +724,20 @@ impl Panel {
             }
             egui::ScrollArea::vertical().id_salt("vm-images").max_height(150.0).show(ui, |ui| {
                 for img in &self.images {
-                    let foreign = foreign_arch(&img.name);
-                    let usable = img.ready && foreign.is_none();
+                    let why_not = img.why_not();
                     let mut text = format!("{}  ·  {:.2} GB", img.name, img.size as f64 / 1e9);
                     if img.kind == Kind::Raw {
                         text += "  ·  disk image";
                     }
                     ui.horizontal(|ui| {
                         let sel = self.chosen.as_ref() == Some(&img.path);
-                        if ui.add_enabled(usable, egui::RadioButton::new(sel, text)).clicked() {
+                        if ui.add_enabled(why_not.is_none(), egui::RadioButton::new(sel, text)).clicked() {
                             self.chosen = Some(img.path.clone());
                         }
-                        let why = match (img.ready, foreign) {
-                            (_, Some(a)) => format!("built for {a}, this PC is x86-64"),
-                            (false, _) => format!("still downloading — {}", img.from),
-                            _ => img.from.clone(),
+                        match &why_not {
+                            Some(w) => ui.label(RichText::new(w).small().color(Color32::from_rgb(200, 150, 90))),
+                            None => ui.label(RichText::new(&img.from).small().weak()),
                         };
-                        ui.label(RichText::new(why).small().weak());
                     });
                 }
             });
@@ -669,7 +765,7 @@ impl Panel {
             ui.horizontal(|ui| {
                 // One VM per image: a second one could not open the same disk.
                 let already = chosen.as_ref().is_some_and(|c| self.running.iter().any(|r| r.image == c.path));
-                let can = qemu.is_some() && chosen.is_some() && !already;
+                let can = qemu.is_some() && chosen.as_ref().is_some_and(|c| c.why_not().is_none()) && !already;
                 let start = ui
                     .add_enabled(can, egui::Button::new(RichText::new("▶ Start the virtual machine").strong()))
                     .on_disabled_hover_text(if already { "It is running already — see its window" } else { "Choose an image, and QEMU is needed" });
@@ -777,6 +873,59 @@ mod tests {
         assert_eq!(foreign_arch("Fedora-Server-aarch64-41.iso"), Some("ARM"));
         assert_eq!(foreign_arch("debian-13.7.0-amd64-netinst.iso"), None);
         assert_eq!(foreign_arch("debian-12-i386-netinst.iso"), None);
+    }
+
+    /// A CD image with an El Torito boot catalog whose entries are for `platforms`.
+    fn cd(platforms: &[u8]) -> Vec<u8> {
+        let mut b = vec![0u8; 21 * SECTOR as usize];
+        let rec = 17 * SECTOR as usize;
+        b[rec + 1..rec + 6].copy_from_slice(b"CD001");
+        b[rec + 6] = 1;
+        b[rec + 7..rec + 30].copy_from_slice(b"EL TORITO SPECIFICATION");
+        b[rec + 0x47..rec + 0x4B].copy_from_slice(&20u32.to_le_bytes());
+        let cat = 20 * SECTOR as usize;
+        b[cat] = 1;
+        b[cat + 1] = platforms[0];
+        b[cat + 32] = 0x88;
+        for (i, p) in platforms[1..].iter().enumerate() {
+            let e = cat + 64 + i * 64;
+            b[e] = if i + 2 == platforms.len() { 0x91 } else { 0x90 };
+            b[e + 1] = *p;
+            b[e + 32] = 0x88;
+        }
+        b
+    }
+
+    #[test]
+    fn only_bootable_images_can_start() {
+        let dir = std::env::temp_dir().join(format!("zt-vm-boot-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = |name: &str, bytes: Vec<u8>| {
+            let p = dir.join(name);
+            std::fs::write(&p, bytes).unwrap();
+            p
+        };
+        // A hybrid distro ISO (BIOS default + UEFI section), a UEFI-only one, a data disc.
+        assert_eq!(boot_of(&file("distro.iso", cd(&[0, 0xEF])), Kind::Iso), Boot::Yes);
+        assert_eq!(boot_of(&file("uefi.iso", cd(&[0xEF])), Kind::Iso), Boot::UefiOnly);
+        let mut data = cd(&[0]);
+        data[17 * SECTOR as usize + 1] = b'X';
+        assert_eq!(boot_of(&file("voices.iso", data), Kind::Iso), Boot::No);
+        // Disk images: an MBR disk, an Android recovery, blank.
+        let mut mbr = vec![0u8; 4096];
+        mbr[510] = 0x55;
+        mbr[511] = 0xAA;
+        assert_eq!(boot_of(&file("stick.img", mbr), Kind::Raw), Boot::Yes);
+        let mut android = b"ANDROID!".to_vec();
+        android.resize(4096, 0);
+        assert_eq!(boot_of(&file("twrp-3.4.0-0-guacamole.img", android), Kind::Raw), Boot::Android);
+        assert_eq!(boot_of(&file("blank.img", vec![0u8; 4096]), Kind::Raw), Boot::No);
+        assert_eq!(boot_of(&file("tiny.iso", vec![1, 2, 3]), Kind::Iso), Boot::No);
+        assert_eq!(boot_of(&dir.join("gone.iso"), Kind::Iso), Boot::Unknown);
+        let img = Image::new(dir.join("twrp-3.4.0-0-guacamole.img"), 4096, Kind::Raw, true, String::new());
+        assert!(img.why_not().unwrap().contains("Android"));
+        assert_eq!(Image::new(dir.join("distro.iso"), 1, Kind::Iso, true, String::new()).why_not(), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
