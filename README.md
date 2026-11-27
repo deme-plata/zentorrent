@@ -169,6 +169,7 @@ BLAKE3 content id, so anyone can re-snapshot the tree and check it.
 | `zentorrent serve [folder] [--port N]` | the engine, the feeds and the MCP server, no window (Ctrl-C stops) |
 | `zentorrent mcp` | MCP over stdin/stdout, forwarded to the running ZenTorrent |
 | `zentorrent mcp-config` | the `claude mcp add …` line for this install |
+| `zentorrent --loudness <file>…` | how loud the player measures a track (LUFS), and the gain it would play it with |
 | `zentorrent --ask "<question>" [folder]` | one Flux MoE turn in the terminal (actions printed, not done) |
 
 ## 🧭 How it fits together

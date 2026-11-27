@@ -205,6 +205,18 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    // `zentorrent --loudness <file>…`: what the player measures for a track without
+    // ReplayGain tags, and the gain it would play it with.
+    if args.get(1).map(String::as_str) == Some("--loudness") {
+        for f in &args[2..] {
+            match player::loudness::measure(std::path::Path::new(f)) {
+                Ok(m) => println!("{:6.1} LUFS   peak {:5.1} dBFS   gain {:+5.1} dB   {f}", m.lufs, 20.0 * m.peak.max(1e-6).log10(), m.gain_db(true)),
+                Err(e) => println!("     –   {f}: {e}"),
+            }
+        }
+        return Ok(());
+    }
+
     // `zentorrent --ask "<question>" [folder] [--cpu]`: one Flux MoE turn in the terminal
     // (the real local model, your feeds and that folder; actions are printed, not done).
     if args.get(1).map(String::as_str) == Some("--ask") {

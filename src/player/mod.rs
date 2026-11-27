@@ -6,6 +6,7 @@
 //! * `archive`  — films inside RAR/ZIP/TAR archives and .001 splits, streamed too
 //! * `playlist` — a torrent's files (and its .m3u playlists) → what plays, in order
 //! * `audio`    — the engine: queue, gapless playback, sound settings
+//! * `loudness` — how loud a track is (EBU R128), for music without ReplayGain tags
 //! * `ui`       — the now-playing bar, the playlist panel and the Sound window
 
 pub mod archive;
@@ -13,6 +14,7 @@ pub mod bookmark;
 pub mod audio;
 pub mod engine;
 pub mod ffi;
+pub mod loudness;
 pub mod playlist;
 pub mod stream;
 pub mod ui;

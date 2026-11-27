@@ -46,6 +46,9 @@ pub struct Sound {
     pub normalize: bool,
     /// "no", "track" or "album"
     pub replaygain: String,
+    /// With "track": tracks that carry no ReplayGain tags are measured by ZenTorrent
+    /// (EBU R128, see `loudness`) and played at the same level as tagged ones.
+    pub measure: bool,
     /// Headphones: blend a little of each side into the other.
     pub crossfeed: bool,
     /// Stereo width: 1.0 = as recorded.
@@ -62,6 +65,7 @@ impl Default for Sound {
             preset: "Flat".into(),
             normalize: false,
             replaygain: "track".into(),
+            measure: true,
             crossfeed: false,
             width: 1.0,
             speed: 1.0,
@@ -116,7 +120,11 @@ impl Sound {
         if self.can_clip() {
             // level=0: left on, alimiter scales its output back up to full scale, and the
             // 0.97 ceiling is gone again (measured: peak 0.00 dB with it, -0.26 dB without).
-            f.push("@limit:lavfi=[alimiter=limit=0.97:level=0]".into());
+            // latency=1: the limiter looks 5 ms ahead, and without this it plays everything
+            // 5 ms late — so at every track change the old track's last 5 ms were lost and
+            // the new one began with 5 ms of silence (measured 2026-11-27 in the real
+            // player: 219 silent frames at the change; none with it).
+            f.push("@limit:lavfi=[alimiter=limit=0.97:level=0:latency=1]".into());
         }
         f.join(",")
     }
@@ -274,6 +282,9 @@ struct Mpv {
     h: *mut Handle,
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// Does this mpv's `loadfile` take an index before the per-file options (0.38 and
+    /// newer)? Learned on the first load that has options.
+    indexed: std::cell::Cell<Option<bool>>,
 }
 
 // The client API is thread-safe; the handle is only destroyed in Drop, after the event thread ended.
@@ -289,7 +300,7 @@ impl Mpv {
         if h.is_null() {
             return Err("libmpv could not create a player".into());
         }
-        let mut m = Mpv { api, h, stop: Arc::new(AtomicBool::new(false)), thread: None };
+        let mut m = Mpv { api, h, stop: Arc::new(AtomicBool::new(false)), thread: None, indexed: Default::default() };
         // Before initialize: options. mpv reads no config files of its own; ZenTorrent sets everything.
         let ao = std::env::var("ZENTORRENT_MPV_AO").unwrap_or_default();
         for (k, v) in [
@@ -440,6 +451,26 @@ impl Mpv {
         if rc < 0 { Err(ffi::err_text(self.api, rc)) } else { Ok(()) }
     }
 
+    /// `loadfile`, with options that hold for this file only (its measured gain).
+    /// mpv 0.38 put an index argument before the options; both forms are tried once and
+    /// the one this mpv takes is remembered. A file is never left unplayed over its
+    /// options: if neither form is taken, it is loaded without them.
+    fn load(&self, src: &str, mode: &str, opts: Option<&str>) -> Result<(), String> {
+        let Some(o) = opts else { return self.cmd(&["loadfile", src, mode]) };
+        let with = |indexed: bool| if indexed { self.cmd(&["loadfile", src, mode, "-1", o]) } else { self.cmd(&["loadfile", src, mode, o]) };
+        let tries = match self.indexed.get() {
+            Some(known) => vec![known],
+            None => vec![true, false],
+        };
+        for indexed in tries {
+            if with(indexed).is_ok() {
+                self.indexed.set(Some(indexed));
+                return Ok(());
+            }
+        }
+        self.cmd(&["loadfile", src, mode])
+    }
+
     fn set(&self, name: &str, value: &str) -> Result<(), String> {
         let (n, v) = (ffi::cstr(name), ffi::cstr(value));
         let rc = unsafe { (self.api.set_property_string)(self.h, n.as_ptr(), v.as_ptr()) };
@@ -480,6 +511,10 @@ pub struct Player {
     pub resumed: Option<(f64, std::time::Instant)>,
     /// When the playing track last changed (the player may still report the old time).
     changed: std::time::Instant,
+    /// How loud untagged tracks are (measured in the background, remembered).
+    pub loud: super::loudness::Loudness,
+    /// The measurements already passed on to mpv's queue (`Loudness::version`).
+    loud_seen: u64,
 }
 
 impl Player {
@@ -493,6 +528,8 @@ impl Player {
             live: Default::default(),
             queue: Queue::default(),
             sound: Sound::load(),
+            loud: super::loudness::Loudness::new(!cfg!(test), repaint.clone()),
+            loud_seen: 0,
             in_mpv: Vec::new(),
             error: None,
             repaint,
@@ -535,6 +572,33 @@ impl Player {
         }
     }
 
+    /// The file on disk behind a music track, when all of it is there: what can be measured.
+    fn on_disk(&self, track: &Track, complete: bool) -> Option<PathBuf> {
+        if track.archive.is_some() || !matches!(track.kind, super::playlist::Kind::Audio) {
+            return None;
+        }
+        if self.queue.hash.is_empty() {
+            Some(PathBuf::from(&track.path))
+        } else if complete {
+            Some(self.queue.folder.join(&track.path))
+        } else {
+            None
+        }
+    }
+
+    /// The per-file option that plays this track at the common level: its measured gain
+    /// as mpv's ReplayGain fallback, which mpv uses only for a file without ReplayGain
+    /// tags. None: not wanted, or not measured yet (asking starts the measuring).
+    fn gain(&self, track: &Track, complete: bool) -> Option<String> {
+        if !self.sound.measure || self.sound.replaygain != "track" {
+            return None;
+        }
+        let m = self.loud.lookup(&self.on_disk(track, complete)?)?;
+        // This gain comes after the filters: where they already fill the range (an EQ
+        // boost, more volume) a quiet track is not raised on top of that.
+        Some(format!("replaygain-fallback={:.2}", m.gain_db(!self.sound.can_clip())))
+    }
+
     /// Start a new queue at play-order position `pos`. `complete(file)` says
     /// whether a file is fully downloaded.
     pub fn start(&mut self, queue: Queue, pos: usize, complete: &dyn Fn(usize) -> bool) {
@@ -553,12 +617,14 @@ impl Player {
         let src = self.source(&track, complete(track.file));
         let next = self.queue.after(pos).map(|p| (p, self.queue.tracks[self.queue.order[p]].clone()));
         let next_src = next.as_ref().map(|(_, t)| self.source(t, complete(t.file)));
+        let gain = self.gain(&track, complete(track.file));
+        let next_gain = next.as_ref().and_then(|(_, t)| self.gain(t, complete(t.file)));
         let result = (|| -> Result<(), String> {
             let m = self.mpv()?;
-            m.cmd(&["loadfile", &src, "replace"])?;
+            m.load(&src, "replace", gain.as_deref())?;
             m.set("pause", "no")?;
             if let Some(s) = &next_src {
-                m.cmd(&["loadfile", s, "append"])?;
+                m.load(s, "append", next_gain.as_deref())?;
             }
             Ok(())
         })();
@@ -603,6 +669,18 @@ impl Player {
         let (Some(p), Some(m)) = (pos, self.mpv.as_ref()) else { return };
         let p = p as usize;
         if p == 0 || p >= self.in_mpv.len() {
+            // A track was measured meanwhile (or the sound settings changed): queue the next
+            // track again, with its level. Not in a track's last seconds, where mpv is
+            // already reading the next one for the gapless change.
+            let v = self.loud.version();
+            let (time, dur) = {
+                let l = self.live.lock().unwrap();
+                (l.time, l.duration)
+            };
+            if v != self.loud_seen && (dur <= 0.0 || dur - time > 4.0) {
+                self.loud_seen = v;
+                self.requeue(complete);
+            }
             return;
         }
         // mpv moved on by itself (gapless): drop what's behind, queue the next.
@@ -617,7 +695,8 @@ impl Player {
         if let Some(n) = self.queue.after(now) {
             let t = self.queue.tracks[self.queue.order[n]].clone();
             let src = self.source(&t, complete(t.file));
-            if self.mpv.as_ref().unwrap().cmd(&["loadfile", &src, "append"]).is_ok() {
+            let gain = self.gain(&t, complete(t.file));
+            if self.mpv.as_ref().unwrap().load(&src, "append", gain.as_deref()).is_ok() {
                 self.in_mpv.push(n);
             }
         }
@@ -703,6 +782,8 @@ impl Player {
     pub fn apply_sound(&mut self) {
         self.sound.save();
         self.push_sound();
+        // The next track's level depends on these settings: `tick` queues it again.
+        self.loud_seen = u64::MAX;
     }
 
     fn push_sound(&mut self) {
@@ -712,7 +793,9 @@ impl Player {
             m.set("volume", &format!("{:.0}", s.mpv_volume())),
             m.set("replaygain", &s.replaygain),
             m.set("speed", &format!("{:.2}", s.speed)),
-            m.set("af", &s.af()),
+            // An FFmpeg from before 5.1 does not know the limiter's `latency`: then rather
+            // the limiter with its 5 ms hole at a track change than no limiter at all.
+            m.set("af", &s.af()).or_else(|_| m.set("af", &s.af().replace(":latency=1", ""))),
         ];
         self.error = r.into_iter().find_map(Result::err).map(|e| format!("sound settings: {e}"));
     }
@@ -726,7 +809,8 @@ impl Player {
         if let Some(n) = self.queue.after(cur) {
             let t = self.queue.tracks[self.queue.order[n]].clone();
             let src = self.source(&t, complete(t.file));
-            if self.mpv.as_ref().unwrap().cmd(&["loadfile", &src, "append"]).is_ok() {
+            let gain = self.gain(&t, complete(t.file));
+            if self.mpv.as_ref().unwrap().load(&src, "append", gain.as_deref()).is_ok() {
                 self.in_mpv.push(n);
             }
         }
@@ -789,16 +873,16 @@ mod tests {
         let af = s.af();
         assert!(af.starts_with("@eq0:lavfi=[equalizer=f=31:width_type=o:width=1:gain=5.0]"), "{af}");
         assert!(af.contains("@eq9:lavfi=[equalizer=f=16000") && af.contains("gain=-2.0]"));
-        assert!(af.contains("@xfeed") && af.ends_with("@limit:lavfi=[alimiter=limit=0.97:level=0]"), "a boost gets a limiter that keeps its ceiling: {af}");
+        assert!(af.contains("@xfeed") && af.ends_with("@limit:lavfi=[alimiter=limit=0.97:level=0:latency=1]"), "a boost gets a limiter that keeps its ceiling: {af}");
         s.eq = [-3.0; 10];
         assert!(!s.af().contains("@limit"), "cuts can't clip");
         // Everything else that can go over full scale gets the limiter too, as the last filter.
         let wide = Sound { width: 2.0, ..Default::default() };
-        assert_eq!(wide.af(), "@wide:lavfi=[extrastereo=m=2.00:c=0],@limit:lavfi=[alimiter=limit=0.97:level=0]");
+        assert_eq!(wide.af(), "@wide:lavfi=[extrastereo=m=2.00:c=0],@limit:lavfi=[alimiter=limit=0.97:level=0:latency=1]");
         let narrow = Sound { width: 0.5, ..Default::default() };
         assert_eq!(narrow.af(), "@wide:lavfi=[extrastereo=m=0.50:c=0]", "narrower can't clip");
         let loud = Sound { volume: 130.0, ..Default::default() };
-        assert_eq!(loud.af(), "@gain:lavfi=[volume=2.197],@limit:lavfi=[alimiter=limit=0.97:level=0]");
+        assert_eq!(loud.af(), "@gain:lavfi=[volume=2.197],@limit:lavfi=[alimiter=limit=0.97:level=0:latency=1]");
         assert_eq!((loud.mpv_volume(), Sound { volume: 80.0, ..Default::default() }.mpv_volume()), (100.0, 80.0), "mpv's own volume stops at 100 %");
         assert_eq!((Sound { volume: 100.0, ..Default::default() }.af(), Sound { volume: 60.0, ..Default::default() }.af()), (String::new(), String::new()));
         let back: Sound = serde_json::from_str(r#"{"volume": 80}"#).unwrap();
@@ -863,6 +947,221 @@ mod tests {
         panic!("no audio in {}", path.display());
     }
 
+    /// A stereo 16-bit WAV: `n` frames of a sine, as if cut out of one long tone at frame
+    /// `from` — so two of these in a row continue each other exactly.
+    fn tone_wav(path: &std::path::Path, rate: u32, from: u32, n: u32, hz: f64, amp: f64) {
+        let mut w = Vec::new();
+        let bytes = n * 4;
+        w.extend_from_slice(b"RIFF");
+        w.extend_from_slice(&(36 + bytes).to_le_bytes());
+        w.extend_from_slice(b"WAVEfmt ");
+        for v in [16u32.to_le_bytes().to_vec(), 1u16.to_le_bytes().to_vec(), 2u16.to_le_bytes().to_vec(), rate.to_le_bytes().to_vec(),
+                  (rate * 4).to_le_bytes().to_vec(), 4u16.to_le_bytes().to_vec(), 16u16.to_le_bytes().to_vec()] {
+            w.extend_from_slice(&v);
+        }
+        w.extend_from_slice(b"data");
+        w.extend_from_slice(&bytes.to_le_bytes());
+        for i in from..from + n {
+            let v = ((amp * (std::f64::consts::TAU * hz * i as f64 / rate as f64).sin()) * 32767.0).round() as i16;
+            w.extend_from_slice(&v.to_le_bytes());
+            w.extend_from_slice(&v.to_le_bytes());
+        }
+        std::fs::write(path, w).unwrap();
+    }
+
+    /// The left channel of a float WAV mpv wrote, and its sample rate.
+    fn left_of(path: &std::path::Path) -> (Vec<f32>, u32) {
+        let b = std::fs::read(path).unwrap();
+        let u16at = |i: usize| u16::from_le_bytes([b[i], b[i + 1]]);
+        let u32at = |i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+        let (mut at, mut ch, mut rate, mut bits) = (12, 2usize, 0u32, 0u16);
+        while at + 8 <= b.len() {
+            let (id, len, body) = (&b[at..at + 4], u32at(at + 4) as usize, at + 8);
+            if id == b"fmt " {
+                ch = u16at(body + 2) as usize;
+                rate = u32at(body + 4);
+                bits = u16at(body + 14);
+            }
+            if id == b"data" {
+                assert_eq!(bits, 32, "float samples were asked for");
+                let end = if len == 0 { b.len() } else { body.saturating_add(len).min(b.len()) };
+                let left = b[body..end].chunks_exact(4 * ch).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                return (left, rate);
+            }
+            at = body + len + (len & 1);
+        }
+        panic!("no audio in {}", path.display());
+    }
+
+    /// Play `files` as a queue through the real player (libmpv, writing `frames` frames
+    /// to `out` as fast as it decodes) and return what came out: left channel, sample rate.
+    fn render(out: &std::path::Path, sound: Sound, files: &[PathBuf], frames: u64, measured: bool) -> (Vec<f32>, u32) {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let mut p = Player::new(rt.handle().clone(), Arc::new(|| {}));
+        p.sound = sound;
+        if measured {
+            for f in files {
+                p.loud.measure_now(f).unwrap();
+            }
+        }
+        {
+            let m = p.mpv().expect("the player starts");
+            m.set("ao", "pcm").unwrap();
+            m.set("ao-pcm-file", &out.to_string_lossy()).unwrap();
+            m.set("audio-format", "float").unwrap();
+        }
+        let tracks: Vec<Track> = files.iter().enumerate().map(|(i, f)| Track::file(i, &f.to_string_lossy(), format!("T{i}"), None, Kind::Audio)).collect();
+        let n = tracks.len();
+        p.start(Queue { tracks, order: (0..n).collect(), ..Default::default() }, 0, &|_| true);
+        assert_eq!(p.error, None);
+        let t0 = std::time::Instant::now();
+        loop {
+            p.tick(&|_| true);
+            let (idle, err) = {
+                let l = p.live.lock().unwrap();
+                (l.idle, l.error.clone())
+            };
+            assert_eq!(err, None);
+            let size = std::fs::metadata(out).map(|m| m.len()).unwrap_or(0);
+            if idle && size >= frames * 8 * 9 / 10 {
+                break;
+            }
+            assert!(t0.elapsed() < std::time::Duration::from_secs(60), "the player did not finish ({size} bytes written)");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        drop(p); // closes the file
+        left_of(out)
+    }
+
+    fn scratch(name: &str) -> Option<PathBuf> {
+        if ffi::api().is_err() {
+            eprintln!("libmpv is not on this machine: not tested here");
+            return None;
+        }
+        let dir = std::env::temp_dir().join(format!("zt-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Some(dir)
+    }
+
+    /// Gapless, measured in the real player: one tone cut into two files at an odd place
+    /// comes out as the one tone again — every sample where it belongs, nothing added,
+    /// nothing lost — plain, and with the EQ, widening and limiter in the chain.
+    #[test]
+    fn two_tracks_in_a_row_play_without_a_gap_in_the_real_player() {
+        let Some(dir) = scratch("gapless") else { return };
+        let (rate, cut, total, hz, amp) = (44_100u32, 88_211u32, 176_400u32, 440.0, 0.5);
+        let (a, b) = (dir.join("a.wav"), dir.join("b.wav"));
+        tone_wav(&a, rate, 0, cut, hz, amp);
+        tone_wav(&b, rate, cut, total - cut, hz, amp);
+        let quiet = Sound { replaygain: "no".into(), measure: false, ..Default::default() };
+
+        let (left, got_rate) = render(&dir.join("plain.wav"), quiet.clone(), &[a.clone(), b.clone()], total as u64, false);
+        assert_eq!(got_rate, rate);
+        assert_eq!(left.len(), total as usize, "not one frame more or less than the two files hold");
+        let worst = left.iter().enumerate().map(|(n, &x)| (x as f64 - amp * (std::f64::consts::TAU * hz * n as f64 / rate as f64).sin()).abs()).fold(0.0, f64::max);
+        assert!(worst < 1e-3, "the tone carries on across the files exactly: worst sample is {worst} off");
+
+        // With filters the level and phase move, so look for the gap itself: silence at
+        // the change, or a jump between two neighbouring samples bigger than this tone makes.
+        // The limiter and the widening must leave none at all (the limiter used to leave
+        // 5 ms of silence). The equalizer is different: mpv builds the filters anew for
+        // each file, so its bands start the new track with an empty memory. That is no
+        // silence and no lost sample, but it is a step at the change — measured 2026-11-27
+        // with the Bass preset, crossfeed, widening and 110 % at once: 3.6 times the tone's
+        // own. Known, not fixed here; the bound only keeps it from growing unnoticed.
+        let mut eq = [0.0; 10];
+        eq[..4].copy_from_slice(&[6.0, 5.0, 4.0, 2.0]);
+        for (name, sound, most) in [
+            ("limiter", Sound { volume: 130.0, ..quiet.clone() }, 1.05),
+            ("wide", Sound { width: 1.5, ..quiet.clone() }, 1.05),
+            ("everything", Sound { eq, width: 1.5, crossfeed: true, volume: 110.0, ..quiet.clone() }, 6.0),
+        ] {
+            let (left, _) = render(&dir.join(format!("{name}.wav")), sound, &[a.clone(), b.clone()], total as u64, false);
+            assert_eq!(left.len(), total as usize, "{name}: not one frame more or less");
+            let around = &left[cut as usize - 2000..cut as usize + 2000];
+            let (mut run, mut silent) = (0usize, 0usize);
+            for v in around {
+                run = if v.abs() < 1e-4 { run + 1 } else { 0 };
+                silent = silent.max(run);
+            }
+            assert!(silent <= 2, "{name}: {silent} frames of silence at the track change");
+            let body = &left[rate as usize / 5..left.len() - rate as usize / 5];
+            let peak = body.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let step = body.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max);
+            let own = peak * (std::f32::consts::TAU * hz as f32 / rate as f32);
+            assert!(step <= own * most, "{name}: a jump of {step} between two samples (the tone's own is {own})");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The queue keeps going past the two tracks mpv holds: with real timing (no sound
+    /// card, but the clock of one), three tracks play one after the other, in order.
+    #[test]
+    fn the_queue_carries_on_track_after_track() {
+        let Some(dir) = scratch("queue") else { return };
+        let files: Vec<PathBuf> = (0..3u32).map(|i| dir.join(format!("{i}.wav"))).collect();
+        for (i, f) in files.iter().enumerate() {
+            tone_wav(f, 44_100, 0, 44_100, 300.0 + 100.0 * i as f64, 0.3);
+        }
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let mut p = Player::new(rt.handle().clone(), Arc::new(|| {}));
+        p.sound = Sound { measure: false, ..Default::default() };
+        p.mpv().expect("the player starts").set("ao", "null").unwrap();
+        let tracks: Vec<Track> = files.iter().enumerate().map(|(i, f)| Track::file(i, &f.to_string_lossy(), format!("T{i}"), None, Kind::Audio)).collect();
+        p.start(Queue { tracks, order: vec![0, 1, 2], ..Default::default() }, 0, &|_| true);
+        let (t0, mut seen, mut playing) = (std::time::Instant::now(), vec![0usize], false);
+        loop {
+            p.tick(&|_| true);
+            let (idle, dur) = {
+                let l = p.live.lock().unwrap();
+                (l.idle, l.duration)
+            };
+            playing |= dur > 0.0 && !idle;
+            if let Some(pos) = p.queue.pos.filter(|pos| seen.last() != Some(pos)) {
+                seen.push(pos);
+            }
+            if playing && idle {
+                break;
+            }
+            assert!(t0.elapsed() < std::time::Duration::from_secs(30), "stuck after {seen:?}");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(seen, [0, 1, 2]);
+        let took = t0.elapsed().as_secs_f64();
+        assert!((2.6..6.0).contains(&took), "three 1 s tracks took {took:.1} s");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Measured loudness in the real player: a loud and a quiet track without ReplayGain
+    /// tags come out at the same level (-18 LUFS; for a 1 kHz tone that is a peak of
+    /// 0.126), and the change of gain between them does not land on the wrong track.
+    #[test]
+    fn untagged_tracks_come_out_at_the_same_level_in_the_real_player() {
+        let Some(dir) = scratch("level") else { return };
+        let (rate, each) = (44_100u32, 88_200u32);
+        let (a, b) = (dir.join("loud.wav"), dir.join("quiet.wav"));
+        tone_wav(&a, rate, 0, each, 1000.0, 0.5);
+        tone_wav(&b, rate, each, each, 1000.0, 0.05);
+        let peaks = |left: &[f32]| -> Vec<f32> { left.chunks(rate as usize / 100).map(|c| c.iter().fold(0.0f32, |m, v| m.max(v.abs()))).collect() };
+
+        let off = Sound { measure: false, ..Default::default() };
+        let (left, _) = render(&dir.join("off.wav"), off, &[a.clone(), b.clone()], 2 * each as u64, true);
+        let p = peaks(&left);
+        assert!((p[50] - 0.5).abs() < 0.01 && (p[350] - 0.05).abs() < 0.002, "as recorded when it is off: {} then {}", p[50], p[350]);
+
+        let (left, _) = render(&dir.join("on.wav"), Sound::default(), &[a, b], 2 * each as u64, true);
+        let p = peaks(&left);
+        let want = 10f32.powf(-18.0 / 20.0);
+        assert!((p[50] / want - 1.0).abs() < 0.04, "the loud track came down to {} (wanted {want})", p[50]);
+        assert!((p[350] / want - 1.0).abs() < 0.04, "the quiet track came up to {} (wanted {want})", p[350]);
+        // Around the change (2.0 s): the loud track's end must not get the quiet track's
+        // +8 dB, nor the quiet track's start the loud one's -12 dB.
+        let wrong: Vec<(usize, f32)> = p.iter().copied().enumerate().skip(5).take(390).filter(|(_, v)| (v / want - 1.0).abs() > 0.25).collect();
+        assert!(wrong.len() <= 3, "{} hundredths of a second at the wrong level around the change: {:?}", wrong.len(), &wrong[..wrong.len().min(12)]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The real player (libmpv, writing to a file instead of the sound card): with the
     /// loudest settings the Sound window offers, a full-scale track stays under full scale.
     /// 2026-11-27, measured with the same filters in ffmpeg before this fix: volume 130 %
@@ -911,7 +1210,7 @@ mod tests {
             assert!(n >= 3 * 44_100 * 2 * 9 / 10, "{name}: only {n} samples");
             peak
         };
-        let plain = play(Sound { replaygain: "no".into(), ..Default::default() }, "plain.wav");
+        let plain = play(Sound { replaygain: "no".into(), measure: false, ..Default::default() }, "plain.wav");
         assert!((0.90..=1.0).contains(&plain), "untouched settings play the track as it is: peak {plain}");
         let mut eq = [0.0; 10];
         eq[..4].copy_from_slice(&[6.0, 5.0, 4.0, 2.0]);

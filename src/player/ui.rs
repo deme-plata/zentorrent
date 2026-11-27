@@ -299,6 +299,16 @@ pub fn sound(ctx: &egui::Context, p: &mut Player, open: &mut bool, bands: Option
                 }
             });
             ui.end_row();
+            ui.label("");
+            apply |= ui
+                .add_enabled(p.sound.replaygain == "track", egui::Checkbox::new(&mut p.sound.measure, "measure tracks that have no ReplayGain tags"))
+                .on_hover_text(
+                    "ZenTorrent measures how loud such a track is (EBU R128) and plays it at the same level as tagged ones. \
+                     A track is measured the first time it is queued, so the very first play of a track is still as recorded. \
+                     Nothing in the file is changed.",
+                )
+                .changed();
+            ui.end_row();
             ui.label("Headphones");
             apply |= ui.checkbox(&mut p.sound.crossfeed, "crossfeed (less tiring hard-panned stereo)").changed();
             ui.end_row();
