@@ -329,7 +329,7 @@ impl Moe {
         self.lines.push(Line::User(text.clone()));
         self.busy = true;
         self.live.clear();
-        let mut messages = vec![json!({"role": "system", "content": skills::system(&lib)})];
+        let mut messages = vec![json!({"role": "system", "content": skills::system(&lib, claude::is(&model))})];
         let start = self.history.len().saturating_sub(KEEP);
         messages.extend(self.history[start..].iter().cloned());
         messages.push(json!({"role": "user", "content": text}));
@@ -1310,7 +1310,7 @@ pub async fn ask(question: &str, lib: Library, cpu_only: bool, model: Option<Str
     let place = if cloud.is_some() { " (at Anthropic)" } else if cpu_only { " (CPU only)" } else { "" };
     println!("Flux MoE · {model}{place} · {}", lib.folder.display());
     let started = std::time::Instant::now();
-    let messages = vec![json!({"role": "system", "content": skills::system(&lib)}), json!({"role": "user", "content": question})];
+    let messages = vec![json!({"role": "system", "content": skills::system(&lib, cloud.is_some())}), json!({"role": "user", "content": question})];
     let memory = Mutex::new(Memory::default());
     let totals = Mutex::new(ollama::Stats::default());
     let print = |ev: Ev| {
