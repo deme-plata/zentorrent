@@ -70,8 +70,28 @@ impl Default for Sound {
 }
 
 impl Sound {
+    /// Volume above 100 % as a gain factor, on mpv's own (cubic) volume curve, so the
+    /// slider feels as before. It is applied in the filter chain, before the limiter:
+    /// mpv's own volume comes after every filter, where nothing can catch its clipping
+    /// (measured 2026-11-27: 130 % put a full-scale track 6.7 dB over).
+    pub fn boost(&self) -> Option<f64> {
+        (self.volume > 100.5).then(|| (self.volume.min(130.0) / 100.0).powi(3))
+    }
+
+    /// What mpv's own volume is set to: everything up to 100 %.
+    pub fn mpv_volume(&self) -> f64 {
+        self.volume.clamp(0.0, 100.0)
+    }
+
+    /// Can these settings push a full-scale track over full scale? An EQ boost, a wider
+    /// stereo image, or volume above 100 % can; cuts and the rest cannot.
+    fn can_clip(&self) -> bool {
+        self.eq.iter().any(|&g| g >= 0.1) || self.width >= 1.02 || self.boost().is_some()
+    }
+
     /// mpv's `af` (audio filter chain) for these settings. Flat bands are left
-    /// out; a limiter follows any boost so the EQ can't clip.
+    /// out; a limiter follows anything that can make the sound louder than full
+    /// scale, so no setting clips.
     pub fn af(&self) -> String {
         let mut f: Vec<String> = Vec::new();
         for (i, (&hz, &g)) in BANDS.iter().zip(self.eq.iter()).enumerate() {
@@ -86,10 +106,17 @@ impl Sound {
             f.push("@xfeed:lavfi=[crossfeed=strength=0.3]".into());
         }
         if (self.width - 1.0).abs() >= 0.02 {
-            f.push(format!("@wide:lavfi=[extrastereo=m={:.2}]", self.width));
+            // c=0: extrastereo's own clipping is a hard cut (measured: width 2.0 flattened a
+            // hard-panned track's peaks); the limiter below holds the level instead.
+            f.push(format!("@wide:lavfi=[extrastereo=m={:.2}:c=0]", self.width));
         }
-        if self.eq.iter().any(|&g| g >= 0.1) {
-            f.push("@limit:lavfi=[alimiter=limit=0.97]".into());
+        if let Some(gain) = self.boost() {
+            f.push(format!("@gain:lavfi=[volume={gain:.3}]"));
+        }
+        if self.can_clip() {
+            // level=0: left on, alimiter scales its output back up to full scale, and the
+            // 0.97 ceiling is gone again (measured: peak 0.00 dB with it, -0.26 dB without).
+            f.push("@limit:lavfi=[alimiter=limit=0.97:level=0]".into());
         }
         f.join(",")
     }
@@ -488,7 +515,7 @@ impl Player {
         if self.mpv.is_none() {
             let m = Mpv::new(self.registry, self.live.clone(), self.repaint.clone())?;
             self.mpv = Some(m);
-            self.apply_sound();
+            self.push_sound();
         }
         Ok(self.mpv.as_ref().unwrap())
     }
@@ -675,10 +702,14 @@ impl Player {
     /// Push the sound settings to mpv and save them.
     pub fn apply_sound(&mut self) {
         self.sound.save();
+        self.push_sound();
+    }
+
+    fn push_sound(&mut self) {
         let Some(m) = &self.mpv else { return };
         let s = &self.sound;
         let r = [
-            m.set("volume", &format!("{:.0}", s.volume)),
+            m.set("volume", &format!("{:.0}", s.mpv_volume())),
             m.set("replaygain", &s.replaygain),
             m.set("speed", &format!("{:.2}", s.speed)),
             m.set("af", &s.af()),
@@ -758,10 +789,142 @@ mod tests {
         let af = s.af();
         assert!(af.starts_with("@eq0:lavfi=[equalizer=f=31:width_type=o:width=1:gain=5.0]"), "{af}");
         assert!(af.contains("@eq9:lavfi=[equalizer=f=16000") && af.contains("gain=-2.0]"));
-        assert!(af.contains("@xfeed") && af.ends_with("@limit:lavfi=[alimiter=limit=0.97]"), "a boost gets a limiter: {af}");
+        assert!(af.contains("@xfeed") && af.ends_with("@limit:lavfi=[alimiter=limit=0.97:level=0]"), "a boost gets a limiter that keeps its ceiling: {af}");
         s.eq = [-3.0; 10];
         assert!(!s.af().contains("@limit"), "cuts can't clip");
+        // Everything else that can go over full scale gets the limiter too, as the last filter.
+        let wide = Sound { width: 2.0, ..Default::default() };
+        assert_eq!(wide.af(), "@wide:lavfi=[extrastereo=m=2.00:c=0],@limit:lavfi=[alimiter=limit=0.97:level=0]");
+        let narrow = Sound { width: 0.5, ..Default::default() };
+        assert_eq!(narrow.af(), "@wide:lavfi=[extrastereo=m=0.50:c=0]", "narrower can't clip");
+        let loud = Sound { volume: 130.0, ..Default::default() };
+        assert_eq!(loud.af(), "@gain:lavfi=[volume=2.197],@limit:lavfi=[alimiter=limit=0.97:level=0]");
+        assert_eq!((loud.mpv_volume(), Sound { volume: 80.0, ..Default::default() }.mpv_volume()), (100.0, 80.0), "mpv's own volume stops at 100 %");
+        assert_eq!((Sound { volume: 100.0, ..Default::default() }.af(), Sound { volume: 60.0, ..Default::default() }.af()), (String::new(), String::new()));
         let back: Sound = serde_json::from_str(r#"{"volume": 80}"#).unwrap();
         assert_eq!((back.volume, back.speed, back.replaygain.as_str()), (80.0, 1.0, "track"), "old/partial settings files load");
+    }
+
+    /// 3 s of a near-full-scale stereo track (16-bit WAV): bass both sides, and a 440 Hz
+    /// tone that differs between the sides, so a bass boost and a wider image both add to it.
+    fn loud_wav(path: &std::path::Path) {
+        let (rate, secs) = (44_100u32, 3u32);
+        let mut data = Vec::new();
+        for n in 0..rate * secs {
+            let t = n as f64 / rate as f64;
+            let bass = 0.6 * (std::f64::consts::TAU * 62.0 * t).sin();
+            let l = bass + 0.37 * (std::f64::consts::TAU * 440.0 * t).sin();
+            let r = bass - 0.37 * (std::f64::consts::TAU * 440.0 * t + 1.0).sin();
+            for v in [l, r] {
+                data.extend_from_slice(&((v * 32767.0) as i16).to_le_bytes());
+            }
+        }
+        let mut w = Vec::new();
+        w.extend_from_slice(b"RIFF");
+        w.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+        w.extend_from_slice(b"WAVEfmt ");
+        for v in [16u32.to_le_bytes().to_vec(), 1u16.to_le_bytes().to_vec(), 2u16.to_le_bytes().to_vec(), rate.to_le_bytes().to_vec(),
+                  (rate * 4).to_le_bytes().to_vec(), 4u16.to_le_bytes().to_vec(), 16u16.to_le_bytes().to_vec()] {
+            w.extend_from_slice(&v);
+        }
+        w.extend_from_slice(b"data");
+        w.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        w.extend_from_slice(&data);
+        std::fs::write(path, w).unwrap();
+    }
+
+    /// The highest sample (1.0 = full scale) in a WAV mpv wrote, and how many samples it has.
+    fn peak_of(path: &std::path::Path) -> (f32, usize) {
+        let b = std::fs::read(path).unwrap();
+        let u16at = |i: usize| u16::from_le_bytes([b[i], b[i + 1]]);
+        let u32at = |i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+        let (mut at, mut tag, mut bits) = (12, 1u16, 16u16);
+        while at + 8 <= b.len() {
+            let (id, len, body) = (&b[at..at + 4], u32at(at + 4) as usize, at + 8);
+            if id == b"fmt " {
+                tag = u16at(body);
+                bits = u16at(body + 14);
+                if tag == 0xFFFE {
+                    tag = u16at(body + 24); // WAVE_FORMAT_EXTENSIBLE: the real format is in the sub-format
+                }
+            }
+            if id == b"data" {
+                let end = if len == 0 { b.len() } else { body.saturating_add(len).min(b.len()) };
+                let samples: Vec<f32> = match (tag, bits) {
+                    (3, 32) => b[body..end].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+                    (1, 16) => b[body..end].chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0).collect(),
+                    (1, 32) => b[body..end].chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32 / 2147483648.0).collect(),
+                    other => panic!("a WAV format this test does not read: {other:?}"),
+                };
+                return (samples.iter().fold(0.0f32, |m, v| m.max(v.abs())), samples.len());
+            }
+            at = body + len + (len & 1);
+        }
+        panic!("no audio in {}", path.display());
+    }
+
+    /// The real player (libmpv, writing to a file instead of the sound card): with the
+    /// loudest settings the Sound window offers, a full-scale track stays under full scale.
+    /// 2026-11-27, measured with the same filters in ffmpeg before this fix: volume 130 %
+    /// was 6.7 dB over, width 2.0 hard-clipped, and the EQ's limiter let peaks back up to 0 dB.
+    #[test]
+    fn the_loudest_settings_do_not_clip_in_the_real_player() {
+        if ffi::api().is_err() {
+            eprintln!("libmpv is not on this machine: not tested here");
+            return;
+        }
+        std::env::set_var("ZENTORRENT_MPV_AO", "pcm");
+        let dir = std::env::temp_dir().join(format!("zt-loud-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("loud.wav");
+        loud_wav(&src);
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let play = |sound: Sound, name: &str| -> f32 {
+            let out = dir.join(name);
+            let mut p = Player::new(rt.handle().clone(), Arc::new(|| {}));
+            p.sound = sound;
+            {
+                let m = p.mpv().expect("the player starts");
+                m.set("ao-pcm-file", &out.to_string_lossy()).unwrap();
+                m.set("audio-format", "float").unwrap();
+                m.cmd(&["loadfile", &src.to_string_lossy(), "replace"]).unwrap();
+            }
+            assert_eq!(p.error, None, "the sound settings were taken");
+            // Written as fast as it decodes; done when all of it is there and the player is idle.
+            let (t0, want) = (std::time::Instant::now(), 3 * 44_100 * 2 * 2 * 9 / 10);
+            loop {
+                let (idle, err) = {
+                    let l = p.live.lock().unwrap();
+                    (l.idle, l.error.clone())
+                };
+                assert_eq!(err, None);
+                let size = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+                if idle && size >= want {
+                    break;
+                }
+                assert!(t0.elapsed() < std::time::Duration::from_secs(60), "the player did not finish ({size} bytes written)");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            drop(p); // closes the file
+            let (peak, n) = peak_of(&out);
+            assert!(n >= 3 * 44_100 * 2 * 9 / 10, "{name}: only {n} samples");
+            peak
+        };
+        let plain = play(Sound { replaygain: "no".into(), ..Default::default() }, "plain.wav");
+        assert!((0.90..=1.0).contains(&plain), "untouched settings play the track as it is: peak {plain}");
+        let mut eq = [0.0; 10];
+        eq[..4].copy_from_slice(&[6.0, 5.0, 4.0, 2.0]);
+        for (name, sound) in [
+            ("volume.wav", Sound { volume: 130.0, ..Default::default() }),
+            ("width.wav", Sound { width: 2.5, ..Default::default() }),
+            ("bass.wav", Sound { eq, ..Default::default() }),
+            ("all.wav", Sound { volume: 130.0, width: 2.5, eq, crossfeed: true, normalize: true, ..Default::default() }),
+        ] {
+            let peak = play(Sound { replaygain: "no".into(), ..sound }, name);
+            assert!(peak <= 0.975, "{name}: peak {peak} is over the limiter's ceiling");
+            assert!(peak >= 0.5, "{name}: peak {peak} — the sound went missing");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
