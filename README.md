@@ -101,6 +101,8 @@ Sort by added, name, size, progress, speed, ratio or status, and filter to **Vid
 
 A local model (installed and set up for you through Ollama, on your GPU when it fits) that knows your torrents, files and feed history: give an overview, **top picks** from thousands of feed items mixed across genres with a ⬇ per row, play things, build playlists, and tidy folders behind a preview you approve (with undo). Live progress shows tokens per second, VRAM and whether it runs on the GPU or the CPU.
 
+Prefer a bigger model? The model picker also offers **Claude Mythos 5.2** and **Claude Fable 5.2**, on your own Anthropic API key. These run at Anthropic, not on your computer: what you ask and the names Flux MoE looks up are sent to api.anthropic.com (not through the VPN), and ZenTorrent says so before the first message. Mythos is only for organisations Anthropic has verified; Fable 5.2 is the same model for every account. The local model stays the default.
+
 ### Info tab
 
 A torrent's **.nfo** is shown the way it was drawn (code page 437, monospace), READMEs as rich text.

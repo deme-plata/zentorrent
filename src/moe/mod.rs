@@ -6,11 +6,14 @@
 //! with a preview the user applies, and an Undo).
 //!
 //! * `ollama`   — the local model: start/install, pick a model, streamed chat
+//! * `claude`   — Claude Mythos / Fable 5.2 instead, at Anthropic, on the user's own
+//!                API key: only when the user picks it (what is asked leaves the computer)
 //! * `skills`   — the system prompt, the tools, and what each tool does
 //! * `organize` — folder summaries, checked moves, the undo journal
 //! * `gauge`    — live GPU / VRAM / CPU load while an answer is generated
 //! * `vm`       — 🐧 Linux virtualize: boot a downloaded Linux image in QEMU
 
+pub mod claude;
 pub mod gauge;
 pub mod ollama;
 pub mod mix;
@@ -182,6 +185,10 @@ pub struct Moe {
     offers: Vec<(String, f64)>,
     /// The picker's "Get …" panel: which model, and whether it fits here.
     offer: Option<(String, ollama::Fit)>,
+    /// The picker's Claude panel: the model waiting for the user's OK and API key.
+    claude_ask: Option<String>,
+    /// The key being typed there (kept only until it is saved or cancelled).
+    claude_key: String,
     can_undo: bool,
     /// A message typed this frame, waiting for the app to take a library snapshot.
     pending: Option<String>,
@@ -212,6 +219,8 @@ impl Default for Moe {
             models: Vec::new(),
             offers: Vec::new(),
             offer: None,
+            claude_ask: None,
+            claude_key: String::new(),
             can_undo: organize::can_undo(),
             pending: None,
             task: None,
@@ -272,6 +281,17 @@ impl Moe {
         self.status = Status::Preparing;
         let (events, ctx, pick) = (self.events.clone(), ctx.clone(), self.settings.model.clone());
         rt.spawn(async move {
+            // Claude was picked and its key is here: nothing local is needed, and nothing is
+            // installed for it. The local models still show in the picker when Ollama runs.
+            if let Some(m) = pick.clone().filter(|m| claude::is(m) && claude::key().is_some()) {
+                Moe::push(&events, &ctx, Ev::Setup(ollama::Setup::Ready(m)));
+                if ollama::reachable().await {
+                    if let Ok(have) = ollama::models().await {
+                        Moe::push(&events, &ctx, Ev::Models(have.into_iter().filter(|m| m.tools).map(|m| m.name).collect()));
+                    }
+                }
+                return;
+            }
             if !install_ok && ollama::find_binary().is_none() && !ollama::reachable().await {
                 Moe::push(&events, &ctx, Ev::NeedsSetup);
                 return;
@@ -327,9 +347,10 @@ impl Moe {
             stop: Arc::new(AtomicBool::new(false)),
         };
         gauge::start(run.load.clone(), run.stop.clone());
+        let cloud = claude::is(&model);
         let (events, ctx2, stop, m) = (self.events.clone(), ctx.clone(), run.stop.clone(), model.clone());
         rt.spawn(async move {
-            while !stop.load(Ordering::Relaxed) {
+            while !cloud && !stop.load(Ordering::Relaxed) {
                 if let Some((t, v)) = ollama::residency(&m).await {
                     Moe::push(&events, &ctx2, Ev::Residency(t, v));
                 }
@@ -340,8 +361,11 @@ impl Moe {
         let (events, ctx, memory, cpu) = (self.events.clone(), ctx.clone(), self.memory.clone(), self.settings.cpu_only);
         self.task = Some(rt.spawn(async move {
             let on = |e: Ev| Moe::push(&events, &ctx, e);
-            ollama::ensure_placement(&model, cpu).await;
-            let r = agent(ollama::BASE, &model, messages, cpu, &lib, &memory, &on).await;
+            if !cloud {
+                ollama::ensure_placement(&model, cpu).await;
+            }
+            let base = if cloud { claude::BASE } else { ollama::BASE };
+            let r = agent(base, &model, messages, cpu, &lib, &memory, &on).await;
             Moe::push(&events, &ctx, Ev::Done(r));
         }));
     }
@@ -365,7 +389,11 @@ impl Moe {
                 }
                 Ev::NeedsSetup => self.status = Status::NeedsSetup,
                 Ev::Setup(ollama::Setup::Ready(m)) => {
-                    self.lines.push(Line::Note(format!("Flux MoE is ready — model {m}, on this computer.")));
+                    self.lines.push(Line::Note(if claude::is(&m) {
+                        format!("Flux MoE is ready — {}, at Anthropic: what you ask is sent there, not kept on this computer.", claude::label(&m))
+                    } else {
+                        format!("Flux MoE is ready — model {m}, on this computer.")
+                    }));
                     self.status = Status::Ready(m);
                 }
                 Ev::Setup(ollama::Setup::Failed(e)) => self.status = Status::Failed(e),
@@ -512,10 +540,16 @@ impl Moe {
         ui.horizontal(|ui| {
             ui.heading("✨ Flux MoE");
             if let Some(m) = &current {
-                ui.label(RichText::new("on this computer").weak());
+                if claude::is(m) {
+                    ui.label(RichText::new("at Anthropic — not on this computer").color(Color32::from_rgb(230, 160, 60)));
+                } else {
+                    ui.label(RichText::new("on this computer").weak());
+                }
                 let mut pick = m.clone();
                 let mut get: Option<(String, f64)> = None;
-                egui::ComboBox::from_id_salt("moe-model").selected_text(&pick).show_ui(ui, |ui| {
+                let mut ask_key = false;
+                let shown = if claude::is(&pick) { claude::label(&pick) } else { pick.clone() };
+                egui::ComboBox::from_id_salt("moe-model").selected_text(shown).show_ui(ui, |ui| {
                     // The families the skills are tested with; the current model always shows.
                     for name in self.models.iter().filter(|n| ollama::PICKER_FAMILIES.iter().any(|f| n.starts_with(f)) || *n == m) {
                         ui.selectable_value(&mut pick, name.clone(), name);
@@ -528,7 +562,18 @@ impl Moe {
                             }
                         }
                     }
+                    // Not on this computer: Anthropic's models, on the user's own API key.
+                    ui.separator();
+                    for (id, name) in claude::MODELS {
+                        ui.selectable_value(&mut pick, id.to_string(), format!("{name} (at Anthropic, needs an API key)"));
+                    }
+                    if ui.selectable_label(false, "Anthropic API key…").clicked() {
+                        ask_key = true;
+                    }
                 });
+                if ask_key {
+                    self.claude_ask = Some(if claude::is(m) { m.clone() } else { claude::MODELS[0].0.to_string() });
+                }
                 if let Some((tag, gb)) = get {
                     let dir = ollama::models_dir();
                     let drive = dir.components().next().map(|c| c.as_os_str().to_string_lossy().into_owned()).unwrap_or_default();
@@ -536,9 +581,14 @@ impl Moe {
                     self.offer = Some((tag, f));
                 }
                 if &pick != m {
-                    self.settings.model = Some(pick.clone());
-                    self.save_settings();
-                    self.status = Status::Ready(pick);
+                    if claude::is(&pick) && claude::key().is_none() {
+                        // First say what leaves the computer, and get the key.
+                        self.claude_ask = Some(pick);
+                    } else {
+                        self.settings.model = Some(pick.clone());
+                        self.save_settings();
+                        self.status = Status::Ready(pick);
+                    }
                 }
             } else if failed {
                 if ui.button("Retry").clicked() {
@@ -628,6 +678,51 @@ impl Moe {
                 });
             });
         }
+        // The picker's Claude models: what leaves the computer, and the key, before anything is sent.
+        if let Some(model) = self.claude_ask.clone() {
+            egui::Frame::new().fill(Color32::from_rgb(34, 38, 48)).corner_radius(8.0).inner_margin(egui::Margin::same(10)).show(ui, |ui| {
+                ui.label(RichText::new(format!("Use {}?", claude::label(&model))).strong());
+                ui.label(
+                    "This model runs at Anthropic, not on this computer. What you ask, and what Flux MoE looks up to answer \
+                     (the names of your torrents, files and feed items), is sent to api.anthropic.com over HTTPS and billed \
+                     to your Anthropic account. It does not go through the ZenTorrent VPN. Downloads and moves still wait \
+                     for your OK here.",
+                );
+                if model.contains("mythos") {
+                    ui.label(RichText::new("Claude Mythos is only for organisations Anthropic has verified. Claude Fable 5.2 is the same model, for every account.").weak());
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Anthropic API key:");
+                    ui.add(egui::TextEdit::singleline(&mut self.claude_key).password(true).desired_width(320.0).hint_text("sk-ant-…"));
+                });
+                let saved = claude::key().is_some();
+                ui.horizontal(|ui| {
+                    let typed = !self.claude_key.trim().is_empty();
+                    let go = ui.add_enabled(typed || saved, egui::Button::new(RichText::new(if typed || !saved { "Save key and use it" } else { "Use it" }).strong()));
+                    if go.clicked() {
+                        let kept = if typed { claude::save_key(&self.claude_key) } else { Ok(()) };
+                        self.claude_key.clear();
+                        match kept {
+                            Ok(()) => {
+                                self.lines.push(Line::Note(format!(
+                                    "Flux MoE now uses {}, at Anthropic. Pick a local model in the picker to keep everything on this computer again.",
+                                    claude::label(&model)
+                                )));
+                                self.settings.model = Some(model.clone());
+                                self.save_settings();
+                                self.status = Status::Ready(model.clone());
+                                self.claude_ask = None;
+                            }
+                            Err(e) => self.lines.push(Line::Error(format!("The key could not be saved: {e}"))),
+                        }
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.claude_key.clear();
+                        self.claude_ask = None;
+                    }
+                });
+            });
+        }
         if self.status == Status::NeedsSetup {
             ui.add_space(8.0);
             ui.label(
@@ -637,6 +732,13 @@ impl Moe {
             );
             if ui.button(RichText::new("Set up Flux MoE (≈ 4 GB, once)").strong()).clicked() {
                 self.prepare(rt, ctx, true);
+            }
+            if ui
+                .button("Or use Claude at Anthropic instead…")
+                .on_hover_text("Nothing to download, but what you ask is sent to Anthropic. Needs your own Anthropic API key.")
+                .clicked()
+            {
+                self.claude_ask = Some(claude::MODELS[0].0.to_string());
             }
         }
         ui.separator();
@@ -1070,6 +1172,11 @@ async fn agent(
 ) -> Result<Vec<Value>, String> {
     let tools = skills::tools();
     let first_new = messages.len();
+    // A Claude model answers from Anthropic, on the user's key; anything else is local.
+    let key = match claude::is(model) {
+        true => Some(claude::key().ok_or_else(|| "no Anthropic API key is saved — choose \"Anthropic API key…\" in the model picker".to_string())?),
+        false => None,
+    };
     // The tools called this turn, and whether the model was already sent back once for
     // claiming something it did not do.
     let mut used: Vec<String> = Vec::new();
@@ -1077,7 +1184,11 @@ async fn agent(
     let mut cut_off = false;
     let mut looped = false;
     for _ in 0..MAX_STEPS {
-        let reply = match ollama::chat(base, model, &messages, &tools, cpu_only, |t| on(Ev::Text(t.to_string()))).await {
+        let step = match &key {
+            Some(k) => claude::chat(base, k, model, &messages, &tools, |t| on(Ev::Text(t.to_string()))).await,
+            None => ollama::chat(base, model, &messages, &tools, cpu_only, |t| on(Ev::Text(t.to_string()))).await,
+        };
+        let reply = match step {
             Ok(r) => r,
             // A tool call cut off mid-way (Ollama: "invalid tool call arguments … unexpected end
             // of JSON input"): once, ask for a shorter one instead of ending the answer.
@@ -1096,13 +1207,17 @@ async fn agent(
         if reply.looped {
             on(Ev::Live(reply.content.clone()));
         }
-        messages.push(json!({"role": "assistant", "content": reply.content, "tool_calls": reply.tool_calls}));
+        let mut said = json!({"role": "assistant", "content": reply.content, "tool_calls": reply.tool_calls});
+        if let Some(raw) = &reply.raw {
+            said["claude"] = raw.clone();
+        }
+        messages.push(said);
         // Talking in circles ("I'll scan the folder again…" over and over, calling nothing): it
         // was stopped; once, tell it to act, then give up.
         if reply.looped && reply.tool_calls.is_empty() {
             if looped {
                 on(Ev::Tool("it kept repeating itself — stopped; nothing was done".into()));
-                return Ok(messages.split_off(first_new));
+                return Ok(remember(messages.split_off(first_new)));
             }
             looped = true;
             on(Ev::Tool("it started repeating itself — stopped it and asked it to act".into()));
@@ -1124,7 +1239,7 @@ async fn agent(
                 Some(_) => on(Ev::Tool("it said it was done, but called no tool: nothing was started or saved".into())),
                 None => {}
             }
-            return Ok(messages.split_off(first_new));
+            return Ok(remember(messages.split_off(first_new)));
         }
         for call in &reply.tool_calls {
             let name = call["function"]["name"].as_str().unwrap_or("");
@@ -1154,7 +1269,20 @@ async fn agent(
             messages.push(json!({"role": "tool", "tool_name": name, "content": content}));
         }
     }
-    Ok(messages.split_off(first_new))
+    Ok(remember(messages.split_off(first_new)))
+}
+
+/// What a turn leaves in the history. Claude's own blocks (its reasoning among them) are
+/// only good inside the turn that made them: the next message has a new skill prompt and
+/// a trimmed history, and Anthropic's API refuses reasoning replayed against a changed
+/// conversation. So they stay behind; the text and the tool calls are remembered.
+fn remember(mut msgs: Vec<Value>) -> Vec<Value> {
+    for m in &mut msgs {
+        if let Some(o) = m.as_object_mut() {
+            o.remove("claude");
+        }
+    }
+    msgs
 }
 
 /// `zentorrent --ask "<question>"`: one Flux MoE turn in the terminal, against the
@@ -1163,15 +1291,24 @@ pub async fn ask(question: &str, lib: Library, cpu_only: bool, model: Option<Str
     use std::io::Write;
     let settings: Settings = crate::db::load("flux-moe", Some(&settings_path())).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
     let cpu_only = cpu_only || settings.cpu_only;
-    // Installed but stopped (closed from the tray, or quit by itself): start it again.
-    ollama::wake().await?;
-    let have = ollama::models().await?;
-    // --model: that model or an error, never a quiet fallback (it is for comparing models).
-    if let Some(m) = model.as_deref().filter(|m| !have.iter().any(|x| x.name == *m && x.tools)) {
-        return Err(format!("{m} is not installed here, or cannot use tools (ollama pull {m})"));
-    }
-    let model = ollama::choose(&have, model.as_deref().or(settings.model.as_deref())).ok_or("no model that can use tools is installed")?;
-    println!("Flux MoE · {model}{} · {}", if cpu_only { " (CPU only)" } else { "" }, lib.folder.display());
+    // A Claude model (--model, or the tab's pick) answers from Anthropic: no local model is touched.
+    let cloud = model.as_deref().or(settings.model.as_deref()).filter(|m| claude::is(m)).map(str::to_string);
+    let model = match cloud.clone() {
+        Some(m) => m,
+        None => {
+            // Installed but stopped (closed from the tray, or quit by itself): start it again.
+            ollama::wake().await?;
+            let have = ollama::models().await?;
+            // --model: that model or an error, never a quiet fallback (it is for comparing models).
+            if let Some(m) = model.as_deref().filter(|m| !have.iter().any(|x| x.name == *m && x.tools)) {
+                return Err(format!("{m} is not installed here, or cannot use tools (ollama pull {m})"));
+            }
+            ollama::choose(&have, model.as_deref().or(settings.model.as_deref())).ok_or("no model that can use tools is installed")?
+        }
+    };
+    let base = if cloud.is_some() { claude::BASE } else { ollama::BASE };
+    let place = if cloud.is_some() { " (at Anthropic)" } else if cpu_only { " (CPU only)" } else { "" };
+    println!("Flux MoE · {model}{place} · {}", lib.folder.display());
     let started = std::time::Instant::now();
     let messages = vec![json!({"role": "system", "content": skills::system(&lib)}), json!({"role": "user", "content": question})];
     let memory = Mutex::new(Memory::default());
@@ -1192,12 +1329,13 @@ pub async fn ask(question: &str, lib: Library, cpu_only: bool, model: Option<Str
         }
         let _ = std::io::stdout().flush();
     };
-    if ollama::ensure_placement(&model, cpu_only).await {
+    if cloud.is_none() && ollama::ensure_placement(&model, cpu_only).await {
         println!("  (the model was on the CPU though a GPU is here — reloading it onto the GPU)");
     }
-    agent(ollama::BASE, &model, messages, cpu_only, &lib, &memory, &print).await?;
+    agent(base, &model, messages, cpu_only, &lib, &memory, &print).await?;
     let s = *totals.lock().unwrap();
-    println!("\n({})", summary(&model, &s, started.elapsed().as_secs_f64(), ollama::residency(&model).await));
+    let residency = if cloud.is_some() { None } else { ollama::residency(&model).await };
+    println!("\n({})", summary(&model, &s, started.elapsed().as_secs_f64(), residency));
     Ok(())
 }
 
@@ -1289,6 +1427,48 @@ mod tests {
         assert!(evs.iter().any(|e| matches!(e, Ev::Action(Action::Download { title, .. }) if title == "Trance Classics 2026")));
         assert_eq!(out.last().unwrap()["content"], "Waiting for you to press Download.");
         assert_eq!(out.iter().filter(|m| m["role"] == "tool").count(), 2);
+    }
+
+    /// A Claude model: the same loop, against Anthropic's API. Its own blocks (reasoning,
+    /// call ids) go back unchanged with the tool result, and are not kept after the turn.
+    #[test]
+    fn a_claude_model_runs_the_same_skills() {
+        use claude::testing::{answer, fake};
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-test-agent");
+        let (base, server) = fake(vec![
+            (200, answer(Some("Search the feeds."), "", &[("search_feeds", json!({"query": "trance", "sort": "seeders"}))], "tool_use")),
+            (200, answer(None, "Top pick: Trance Classics 2026 (300 seeders).", &[], "end_turn")),
+        ]);
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let events = Mutex::new(Vec::new());
+        let on = |e: Ev| events.lock().unwrap().push(e);
+        let memory = Mutex::new(Memory::default());
+        let msgs = vec![json!({"role": "system", "content": skills::SYSTEM}), json!({"role": "user", "content": "find trance"})];
+        let out = rt.block_on(agent(&base, "claude-mythos-5-2", msgs, false, &library(), &memory, &on)).unwrap();
+        let requests = server.join().unwrap();
+
+        // Anthropic's shapes: the key in its header, the skill prompt as `system`, no Ollama options.
+        let (head, first) = &requests[0];
+        assert!(head.contains("x-api-key: sk-test-agent"), "{head}");
+        assert_eq!(first["model"], "claude-mythos-5-2");
+        assert_eq!(first["system"], skills::SYSTEM);
+        assert!(first["tools"].as_array().unwrap().iter().all(|t| t["input_schema"]["type"] == "object") && first["tools"].as_array().unwrap().len() >= 8);
+        assert!(first.get("options").is_none() && first.get("think").is_none());
+        // Step two: its reasoning and call come back as sent, and the result answers that call.
+        let second = requests[1].1["messages"].as_array().unwrap();
+        assert_eq!(second[1]["content"][0], json!({"type": "thinking", "thinking": "Search the feeds.", "signature": "sig-abc"}));
+        assert_eq!(second[1]["content"][1]["id"], "toolu_0");
+        let result = &second[2]["content"][0];
+        assert_eq!(result["tool_use_id"], "toolu_0");
+        let text = result["content"].as_str().unwrap();
+        assert!(text.contains("Trance Classics 2026") && !text.contains("SECRET") && !text.contains("https://"), "{text}");
+
+        let evs = events.into_inner().unwrap();
+        assert!(evs.iter().any(|e| matches!(e, Ev::Tool(r) if r.contains("searched your feeds"))));
+        assert!(evs.iter().any(|e| matches!(e, Ev::Stats(s) if s.eval_count == 41)));
+        assert_eq!(out.last().unwrap()["content"], "Top pick: Trance Classics 2026 (300 seeders).");
+        assert!(out.iter().all(|m| m.get("claude").is_none()), "its blocks are not kept for the next message");
+        assert_eq!(out.iter().filter(|m| m["role"] == "tool").count(), 1);
     }
 
     /// 2026-10-15: "workout mix do it now and play" — the model scanned, then wrote "Playlist

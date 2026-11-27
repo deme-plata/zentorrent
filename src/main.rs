@@ -209,7 +209,7 @@ fn main() -> eframe::Result<()> {
     // (the real local model, your feeds and that folder; actions are printed, not done).
     if args.get(1).map(String::as_str) == Some("--ask") {
         let Some(question) = args.get(2) else {
-            eprintln!("usage: zentorrent --ask \"<question>\" [folder] [--cpu] [--model <ollama tag>]");
+            eprintln!("usage: zentorrent --ask \"<question>\" [folder] [--cpu] [--model <ollama tag | claude-mythos-5-2 | claude-fable-5-2>]");
             std::process::exit(2);
         };
         let folder = args.get(3).filter(|a| !a.starts_with("--")).map(PathBuf::from).unwrap_or_else(default_dir);

@@ -124,6 +124,9 @@ pub struct Reply {
     pub stats: Stats,
     /// It was stopped for repeating itself (see `looping`); `content` has each line once.
     pub looped: bool,
+    /// Claude only (see `claude`): the answer's blocks as the API sent them, reasoning
+    /// included — they go back unchanged with the tool results of the same turn.
+    pub raw: Option<Value>,
 }
 
 /// The same sentence for the third time: a small model talking in circles (2026-10-18:
