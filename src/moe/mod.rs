@@ -75,6 +75,8 @@ enum Ev {
     Offers(Vec<(String, f64)>),
     /// A model fetched from the picker is ready.
     Pulled(String),
+    /// The models folder was changed (and Ollama stopped): start again from there.
+    ModelsDir(std::path::PathBuf),
     /// Ollama is not installed; wait for the user's click before downloading it.
     NeedsSetup,
     Text(String),
@@ -109,6 +111,19 @@ struct Settings {
     /// Serve ZenTorrent's tools over MCP (127.0.0.1, with a token).
     #[serde(default)]
     mcp: bool,
+    /// Where Ollama keeps the models, when the user moved them (off a full drive).
+    #[serde(default)]
+    models_dir: Option<std::path::PathBuf>,
+}
+
+/// A models folder the user picked, waiting for their OK.
+#[derive(Clone)]
+struct Relocate {
+    from: std::path::PathBuf,
+    to: std::path::PathBuf,
+    /// GB of models in `from`, and GB free where `to` is.
+    used_gb: f64,
+    free_gb: Option<f64>,
 }
 
 fn settings_path() -> std::path::PathBuf {
@@ -187,6 +202,8 @@ pub struct Moe {
     offer: Option<(String, ollama::Fit)>,
     /// The picker's Claude panel: the model waiting for the user's OK and API key.
     claude_ask: Option<String>,
+    /// "Models folder…": the folder picked, waiting for the user's OK.
+    relocate: Option<Relocate>,
     /// The key being typed there (kept only until it is saved or cancelled).
     claude_key: String,
     can_undo: bool,
@@ -203,7 +220,11 @@ pub struct Moe {
 
 impl Default for Moe {
     fn default() -> Self {
-        let settings = crate::db::load("flux-moe", Some(&settings_path())).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        let settings: Settings = crate::db::load("flux-moe", Some(&settings_path())).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        // The models folder the user chose holds for everything this run does with Ollama.
+        if let Some(dir) = &settings.models_dir {
+            std::env::set_var("OLLAMA_MODELS", dir);
+        }
         Moe {
             status: Status::Unknown,
             lines: Vec::new(),
@@ -220,6 +241,7 @@ impl Default for Moe {
             offers: Vec::new(),
             offer: None,
             claude_ask: None,
+            relocate: None,
             claude_key: String::new(),
             can_undo: organize::can_undo(),
             pending: None,
@@ -323,6 +345,39 @@ impl Moe {
         });
     }
 
+    /// Stop Ollama, move the models if asked, point Ollama at the new folder, start again.
+    /// Whatever goes wrong before the switch leaves everything as it was (Retry starts Ollama).
+    fn start_relocate(&mut self, rt: &tokio::runtime::Runtime, ctx: &egui::Context, r: Relocate, move_them: bool) {
+        self.status = Status::Preparing;
+        self.lines.push(Line::Note(format!("Changing Flux MoE's models folder to {}…", r.to.display())));
+        let (events, ctx) = (self.events.clone(), ctx.clone());
+        rt.spawn(async move {
+            let say = |t: String| Moe::push(&events, &ctx, Ev::Setup(ollama::Setup::Line(t)));
+            let fail = |t: String| Moe::push(&events, &ctx, Ev::Setup(ollama::Setup::Failed(t)));
+            if !ollama::stop().await {
+                return fail(
+                    "Ollama is still running, and it only reads its models folder when it starts. Quit it (its icon by the \
+                     clock → Quit Ollama), then choose the folder again. Nothing was changed."
+                        .into(),
+                );
+            }
+            if move_them {
+                let (from, to, events2, ctx2) = (r.from.clone(), r.to.clone(), events.clone(), ctx.clone());
+                let moved =
+                    tokio::task::spawn_blocking(move || ollama::move_models(&from, &to, &|t| Moe::push(&events2, &ctx2, Ev::Setup(ollama::Setup::Line(t))))).await;
+                match moved {
+                    Ok(Ok((files, bytes))) => say(format!("Moved {files} files, {:.1} GB.", bytes as f64 / 1e9)),
+                    Ok(Err(e)) => return fail(format!("The models were not moved ({e}). They are still in {}; nothing was changed.", r.from.display())),
+                    Err(e) => return fail(format!("The move stopped ({e}). The models are still in {}; nothing was changed.", r.from.display())),
+                }
+            }
+            if let Err(e) = ollama::set_models_dir(&r.to) {
+                return fail(e);
+            }
+            Moe::push(&events, &ctx, Ev::ModelsDir(r.to));
+        });
+    }
+
     pub fn send(&mut self, text: String, rt: &tokio::runtime::Runtime, ctx: &egui::Context, lib: Library) {
         let Status::Ready(model) = &self.status else { return };
         let model = model.clone();
@@ -386,6 +441,15 @@ impl Moe {
                     self.settings.model = Some(tag.clone());
                     self.save_settings();
                     self.status = Status::Ready(tag);
+                }
+                Ev::ModelsDir(dir) => {
+                    self.lines.push(Line::Note(format!("Flux MoE's models are now kept in {}.", dir.display())));
+                    self.settings.models_dir = Some(dir);
+                    self.save_settings();
+                    self.models.clear();
+                    self.offers.clear();
+                    // Starts Ollama again, which reads the folder as it starts.
+                    self.status = Status::Unknown;
                 }
                 Ev::NeedsSetup => self.status = Status::NeedsSetup,
                 Ev::Setup(ollama::Setup::Ready(m)) => {
@@ -620,6 +684,18 @@ impl Moe {
                 {
                     self.save_settings();
                 }
+                if ui
+                    .add_enabled(!self.busy && self.status != Status::Preparing, egui::Button::new("Models folder…").small())
+                    .on_hover_text(format!("Where the AI models are kept — they are big, and this can be another drive.\nNow: {}", ollama::models_dir().display()))
+                    .clicked()
+                {
+                    let from = ollama::models_dir();
+                    if let Some(to) = rfd::FileDialog::new().set_title("A folder for Flux MoE's models").pick_folder() {
+                        if to != from {
+                            self.relocate = Some(Relocate { used_gb: ollama::models_size(&from) as f64 / 1e9, free_gb: ollama::free_disk_gb(&to), from, to });
+                        }
+                    }
+                }
                 if self.can_undo && ui.button("↶ Undo last organize").on_hover_text("Put the last applied moves back").clicked() {
                     // The app puts them back, with the torrents in them.
                     actions.push(Action::UndoMoves);
@@ -678,6 +754,39 @@ impl Moe {
                 });
             });
         }
+        // "Models folder…": where they go, what moves, and that Ollama restarts — before anything happens.
+        if let Some(r) = self.relocate.clone() {
+            egui::Frame::new().fill(Color32::from_rgb(34, 38, 48)).corner_radius(8.0).inner_margin(egui::Margin::same(10)).show(ui, |ui| {
+                ui.label(RichText::new("Keep Flux MoE's models in this folder?").strong());
+                let free = r.free_gb.map(|f| format!(" ({f:.1} GB free there)")).unwrap_or_default();
+                ui.label(format!("New: {}{free}\nNow: {} ({:.1} GB of models)", r.to.display(), r.from.display(), r.used_gb));
+                ui.label(
+                    RichText::new(
+                        "Ollama is stopped and started again for this: it only reads its models folder when it starts. \
+                         Moving copies everything first and removes the old copy only when all of it has arrived.",
+                    )
+                    .weak(),
+                );
+                let room = r.free_gb.is_none_or(|f| f >= r.used_gb + 0.5);
+                if !room {
+                    ui.colored_label(Color32::from_rgb(230, 160, 60), "There is not enough room there for the models you have.");
+                }
+                ui.horizontal(|ui| {
+                    let moved = ui.add_enabled(room && r.used_gb > 0.0, egui::Button::new(RichText::new("Move the models and switch").strong())).clicked();
+                    let only = ui
+                        .button("Switch without moving")
+                        .on_hover_text("The models you have stay where they are (delete them there yourself to free the space); Flux MoE downloads a model into the new folder.")
+                        .clicked();
+                    if moved || only {
+                        self.relocate = None;
+                        self.start_relocate(rt, ctx, r.clone(), moved);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.relocate = None;
+                    }
+                });
+            });
+        }
         // The picker's Claude models: what leaves the computer, and the key, before anything is sent.
         if let Some(model) = self.claude_ask.clone() {
             egui::Frame::new().fill(Color32::from_rgb(34, 38, 48)).corner_radius(8.0).inner_margin(egui::Margin::same(10)).show(ui, |ui| {
@@ -727,10 +836,11 @@ impl Moe {
             ui.add_space(8.0);
             ui.label(
                 "Flux MoE runs an AI model on this computer, so nothing you ask leaves it. That needs Ollama \
-                 (about 1.6 GB) and a model (about 2.5 GB), downloaded once and checked against ZenTorrent's \
+                 (about 1.6 GB) and a model (about 2.5 GB; 6.6 GB on a graphics card with 6 GB or more), downloaded once \
+                 into the models folder (see \"Models folder…\" above to keep it off this drive) and checked against ZenTorrent's \
                  signed list before anything runs.",
             );
-            if ui.button(RichText::new("Set up Flux MoE (≈ 4 GB, once)").strong()).clicked() {
+            if ui.button(RichText::new("Set up Flux MoE (4 to 8 GB, once)").strong()).clicked() {
                 self.prepare(rt, ctx, true);
             }
             if ui
@@ -1303,7 +1413,7 @@ pub async fn ask(question: &str, lib: Library, cpu_only: bool, model: Option<Str
             if let Some(m) = model.as_deref().filter(|m| !have.iter().any(|x| x.name == *m && x.tools)) {
                 return Err(format!("{m} is not installed here, or cannot use tools (ollama pull {m})"));
             }
-            ollama::choose(&have, model.as_deref().or(settings.model.as_deref())).ok_or("no model that can use tools is installed")?
+            ollama::choose(&have, model.as_deref().or(settings.model.as_deref()), ollama::wants_default()).ok_or("no model that can use tools is installed")?
         }
     };
     let base = if cloud.is_some() { claude::BASE } else { ollama::BASE };

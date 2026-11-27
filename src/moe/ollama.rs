@@ -77,12 +77,16 @@ pub async fn models() -> Result<Vec<Model>, String> {
 
 /// The model to use: the user's pick if it can use tools, else the best one
 /// already pulled (Qwen first: it follows tool instructions best), else None.
-pub fn choose(models: &[Model], preferred: Option<&str>) -> Option<String> {
+/// `big`: this computer can run `DEFAULT` (see `wants_default`).
+pub fn choose(models: &[Model], preferred: Option<&str>, big: bool) -> Option<String> {
     let usable: Vec<&Model> = models.iter().filter(|m| m.tools && !m.name.contains("embed")).collect();
     if let Some(p) = preferred {
         if let Some(m) = usable.iter().find(|m| m.name == p) {
             return Some(m.name.clone());
         }
+    }
+    if big && usable.iter().any(|m| m.name == DEFAULT.0) {
+        return Some(DEFAULT.0.to_string());
     }
     // An instruct (non-thinking) Qwen first: measured 2026-10-09, qwen3:4b-instruct called the
     // right tool after 29 tokens where thinking qwen3:4b wrote 340 tokens of monologue first.
@@ -100,7 +104,21 @@ pub const PICKER_FAMILIES: &[&str] = &["qwen", "lfm3"];
 /// oldest Ollama that runs it). Ollama checks every layer's digest when it pulls. Not pulled
 /// unasked: the first set-up still takes the signed list's model.
 /// LFM3-1.7B (Liquid AI, 2026-10): made for local agents, calls tools, 256K context.
-pub const OFFERS: &[(&str, f64, &str)] = &[("lfm3:1.7b", 1.1, "0.40.13")];
+pub const OFFERS: &[(&str, f64, &str)] = &[(DEFAULT.0, DEFAULT.1, "0.20.2"), ("lfm3:1.7b", 1.1, "0.40.13")];
+
+/// The model Flux MoE uses when it is here and the computer can run it: (tag, GB to
+/// download, graphics memory in GB it wants). Measured 2026-11-27 on three everyday
+/// requests (overview, organize by genre, a mix): qwen3.5:9b did all three right, where
+/// qwen3:4b-instruct did one, asked instead of acting on the second and answered nothing
+/// on the third. It is three times the size, so: a first set-up takes it when the
+/// graphics card has the memory and the disk has the room; on a computer already set up
+/// it is never fetched unasked — the picker offers it, and once it is there it is used.
+pub const DEFAULT: (&str, f64, u64) = ("qwen3.5:9b", 6.6, 6);
+
+/// Can this computer run `DEFAULT` well enough to prefer it?
+pub fn wants_default() -> bool {
+    vram_gb() >= DEFAULT.2
+}
 
 /// Ollama's version ("0.40.13"); None when it does not answer.
 pub async fn version() -> Option<String> {
@@ -609,13 +627,23 @@ async fn ensure_inner(preferred: Option<String>, say: &impl Fn(Setup)) -> Result
         }
     }
     let have = models().await?;
-    let found = choose(&have, preferred.as_deref());
-    // The user's own pick, or an instruct Qwen (the skills are tuned on it), is used as it is.
-    // Anything else (a thinking model, a 9 GB gemma on a 6 GB card) is only the fallback:
-    // the manifest's model is pulled first.
+    let big = wants_default();
+    let found = choose(&have, preferred.as_deref(), big);
+    // The user's own pick, the default, or an instruct Qwen (the skills are tuned on it), is
+    // used as it is. Anything else (a thinking model, a 9 GB gemma on a 6 GB card) is only
+    // the fallback: the manifest's model is pulled first.
     if let Some(m) = &found {
-        if preferred.as_deref() == Some(m.as_str()) || (m.starts_with("qwen") && m.contains("instruct")) {
+        if preferred.as_deref() == Some(m.as_str()) || m == DEFAULT.0 || (m.starts_with("qwen") && m.contains("instruct")) {
             return Ok(m.clone());
+        }
+    }
+    // A first set-up (no model here yet) on a computer that can run the default: take it,
+    // when there is room where the models go. If it will not come, a smaller one does.
+    if found.is_none() && big && free_disk_gb(&models_dir()).is_none_or(|free| free >= DEFAULT.1 * 1.1 + 1.0) {
+        say(Setup::Line(format!("Getting the model {} ({} GB, once)…", DEFAULT.0, DEFAULT.1)));
+        match pull(DEFAULT.0, say).await {
+            Ok(()) => return Ok(DEFAULT.0.to_string()),
+            Err(e) => say(Setup::Line(format!("  {} failed: {e} — taking a smaller one", DEFAULT.0))),
         }
     }
     let m = match manifest_cache {
@@ -662,6 +690,145 @@ pub fn models_dir() -> PathBuf {
         .map(PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".ollama").join("models"))
+}
+
+/// Keep Ollama's models in `dir` from now on. It is Ollama's own setting, the variable
+/// OLLAMA_MODELS: set for this run of ZenTorrent (and so for an Ollama it starts), and on
+/// Windows for the user as well, so the Ollama that Windows starts by itself looks there
+/// too. Ollama reads it when it starts.
+pub fn set_models_dir(dir: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    std::env::set_var("OLLAMA_MODELS", dir);
+    user_env::set("OLLAMA_MODELS", &dir.to_string_lossy())
+}
+
+#[cfg(windows)]
+mod user_env {
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::System::Registry::{RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SendMessageTimeoutW, HWND_BROADCAST, SMTO_ABORTIFHUNG, WM_SETTINGCHANGE};
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(Some(0)).collect()
+    }
+
+    /// One of the user's own environment variables (HKCU\Environment: no admin rights).
+    pub fn set(name: &str, value: &str) -> Result<(), String> {
+        let (key, name_w, data) = (wide("Environment"), wide(name), wide(value));
+        // SAFETY: NUL-terminated UTF-16 strings that outlive the call; size in bytes.
+        let r = unsafe { RegSetKeyValueW(HKEY_CURRENT_USER, key.as_ptr(), name_w.as_ptr(), REG_SZ, data.as_ptr().cast(), (data.len() * 2) as u32) };
+        if r != ERROR_SUCCESS {
+            return Err(format!("could not set {name} for your Windows account (error {r})"));
+        }
+        // Tell the running programs (Explorer, which starts the others) that the variables changed.
+        // SAFETY: a NUL-terminated string that outlives the call; no result is wanted.
+        unsafe { SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, key.as_ptr() as isize, SMTO_ABORTIFHUNG, 2000, std::ptr::null_mut()) };
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+mod user_env {
+    pub fn set(_: &str, _: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// Stop Ollama, so that it starts again reading a new models folder. True when nothing
+/// answers on its port any more. On Windows its tray program and its server are ended;
+/// elsewhere ZenTorrent does not end a program it may not have started, and only looks.
+pub async fn stop() -> bool {
+    if !reachable().await {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        for image in ["ollama app.exe", "ollama.exe"] {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/F", "/IM", image])
+                .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+        for _ in 0..20 {
+            if !reachable().await {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+    !reachable().await
+}
+
+fn files_under(dir: &std::path::Path, out: &mut Vec<(PathBuf, u64)>) {
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let p = e.path();
+        match e.metadata() {
+            Ok(m) if m.is_dir() => files_under(&p, out),
+            Ok(m) => out.push((p, m.len())),
+            Err(_) => {}
+        }
+    }
+}
+
+/// The parts of a models folder that are Ollama's: the model files and their lists.
+const MODEL_PARTS: [&str; 2] = ["blobs", "manifests"];
+
+/// Bytes of models in `dir`.
+pub fn models_size(dir: &std::path::Path) -> u64 {
+    let mut files = Vec::new();
+    for part in MODEL_PARTS {
+        files_under(&dir.join(part), &mut files);
+    }
+    files.iter().map(|f| f.1).sum()
+}
+
+/// Move Ollama's models from `from` to `to`. Everything is copied first; only when all of
+/// it has arrived, at its full size, is the old copy removed — a move that stops half-way
+/// leaves the models where they were. Returns (files, bytes) moved. Ollama must not be running.
+pub fn move_models(from: &std::path::Path, to: &std::path::Path, say: &dyn Fn(String)) -> Result<(u64, u64), String> {
+    if to.starts_with(from) || from.starts_with(to) {
+        return Err("the new folder and the old one are inside each other".into());
+    }
+    let mut files = Vec::new();
+    for part in MODEL_PARTS {
+        files_under(&from.join(part), &mut files);
+    }
+    let total: u64 = files.iter().map(|f| f.1).sum();
+    std::fs::create_dir_all(to).map_err(|e| format!("{}: {e}", to.display()))?;
+    if let Some(free) = free_disk_gb(to).filter(|&free| free * 1e9 < total as f64 + 5e8) {
+        return Err(format!("{:.1} GB of models, and only {free:.1} GB free there", total as f64 / 1e9));
+    }
+    let (mut done, mut told) = (0u64, 0u64);
+    for (src, len) in &files {
+        let dst = to.join(src.strip_prefix(from).map_err(|e| e.to_string())?);
+        if let Some(dir) = dst.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        }
+        // Already there at its full size (a move that was stopped and is run again): not copied twice.
+        if dst.metadata().map(|m| m.len()).ok() != Some(*len) {
+            let copied = std::fs::copy(src, &dst).map_err(|e| format!("{}: {e}", src.display()))?;
+            if copied != *len {
+                return Err(format!("{} arrived {copied} bytes long, not {len}", dst.display()));
+            }
+        }
+        done += len;
+        if done - told >= 1 << 30 {
+            told = done;
+            say(format!("  moved {:.1} of {:.1} GB", done as f64 / 1e9, total as f64 / 1e9));
+        }
+    }
+    for part in MODEL_PARTS {
+        let old = from.join(part);
+        if old.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&old) {
+                say(format!("  the models are in the new folder; the old copy in {} could not be removed ({e}) — delete it yourself", old.display()));
+            }
+        }
+    }
+    Ok((files.len() as u64, total))
 }
 
 /// Free space on the drive holding `path` (or its nearest existing parent), GB.
@@ -757,6 +924,38 @@ mod tests {
     }
 
     #[test]
+    fn models_move_whole_or_not_at_all() {
+        let dir = std::env::temp_dir().join(format!("zt-models-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (from, to) = (dir.join("C").join("models"), dir.join("D").join("ollama"));
+        let put = |root: &std::path::Path, rel: &str, bytes: &[u8]| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, bytes).unwrap();
+        };
+        put(&from, "blobs/sha256-aaaa", &[1u8; 5000]);
+        put(&from, "blobs/sha256-bbbb", &[2u8; 300]);
+        put(&from, "manifests/registry.ollama.ai/library/qwen3.5/9b", b"{\"layers\":[]}");
+        put(&from, "history.txt", b"not a model: stays");
+        assert_eq!(models_size(&from), 5000 + 300 + 13);
+        // A first try that was stopped: one file there in full, one only in part.
+        put(&to, "blobs/sha256-aaaa", &[1u8; 5000]);
+        put(&to, "blobs/sha256-bbbb", &[2u8; 7]);
+
+        let said = std::sync::Mutex::new(Vec::new());
+        assert_eq!(move_models(&from, &to, &|t| said.lock().unwrap().push(t)), Ok((3, 5313)));
+        assert_eq!(std::fs::read(to.join("blobs/sha256-bbbb")).unwrap(), vec![2u8; 300], "the part-file was replaced by the whole one");
+        assert_eq!(std::fs::read(to.join("manifests/registry.ollama.ai/library/qwen3.5/9b")).unwrap(), b"{\"layers\":[]}");
+        assert_eq!(models_size(&to), 5313);
+        assert!(!from.join("blobs").exists() && !from.join("manifests").exists(), "the old copy is gone");
+        assert!(from.join("history.txt").exists(), "what is not a model is left alone");
+        assert!(move_models(&to, &to.join("inner"), &|_| {}).is_err(), "not into itself");
+        assert_eq!(models_size(&to), 5313, "and nothing was touched by that");
+        assert_eq!(move_models(&dir.join("nothing-here"), &dir.join("E"), &|_| {}), Ok((0, 0)), "nothing to move is not an error");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn thinking_is_not_shown() {
         assert_eq!(strip_thinking("<think>hmm</think>Hello"), "Hello");
         assert_eq!(strip_thinking("A<think>x</think>B<think>y</think>C"), "ABC");
@@ -781,13 +980,20 @@ mod tests {
     fn the_best_tool_model_is_chosen() {
         let m = |n: &str, s, t| Model { name: n.into(), size: s, tools: t };
         let have = vec![m("gemma4:latest", 9, true), m("qwen3:4b-instruct", 3, true), m("qwen3:8b", 5, true), m("llava:7b", 4, false), m("nomic-embed-text", 1, true)];
-        assert_eq!(choose(&have, None).as_deref(), Some("qwen3:4b-instruct"), "instruct before a bigger thinking model");
-        assert_eq!(choose(&have, Some("gemma4:latest")).as_deref(), Some("gemma4:latest"));
-        assert_eq!(choose(&have, Some("llava:7b")).as_deref(), Some("qwen3:4b-instruct"), "a pick that can't use tools is not used");
+        assert_eq!(choose(&have, None, false).as_deref(), Some("qwen3:4b-instruct"), "instruct before a bigger thinking model");
+        assert_eq!(choose(&have, Some("gemma4:latest"), false).as_deref(), Some("gemma4:latest"));
+        assert_eq!(choose(&have, Some("llava:7b"), false).as_deref(), Some("qwen3:4b-instruct"), "a pick that can't use tools is not used");
         let with_lfm = [have.clone(), vec![m("lfm3:1.7b", 1, true)]].concat();
-        assert_eq!(choose(&with_lfm, Some("lfm3:1.7b")).as_deref(), Some("lfm3:1.7b"), "LFM3 when picked");
-        assert_eq!(choose(&with_lfm, None).as_deref(), Some("qwen3:4b-instruct"), "the default stays");
-        assert_eq!(choose(&[m("llava:7b", 4, false)], None), None);
+        assert_eq!(choose(&with_lfm, Some("lfm3:1.7b"), false).as_deref(), Some("lfm3:1.7b"), "LFM3 when picked");
+        assert_eq!(choose(&with_lfm, None, false).as_deref(), Some("qwen3:4b-instruct"), "the default stays");
+        // qwen3.5:9b, once it is here: used on a computer that can run it, not on one that cannot,
+        // and never over the user's own pick.
+        let with_default = [have.clone(), vec![m("qwen3.5:9b", 6, true)]].concat();
+        assert_eq!(choose(&with_default, None, true).as_deref(), Some("qwen3.5:9b"));
+        assert_eq!(choose(&with_default, None, false).as_deref(), Some("qwen3:4b-instruct"));
+        assert_eq!(choose(&with_default, Some("qwen3:8b"), true).as_deref(), Some("qwen3:8b"));
+        assert_eq!(choose(&have, None, true).as_deref(), Some("qwen3:4b-instruct"), "not here: not chosen (and not fetched unasked)");
+        assert_eq!(choose(&[m("llava:7b", 4, false)], None, true), None);
     }
 
     #[test]
