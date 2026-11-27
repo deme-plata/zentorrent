@@ -6915,7 +6915,7 @@ dependencies = [
 
 [[package]]
 name = "zentorrent"
-version = "0.10.26"
+version = "0.10.27"
 dependencies = [
  "anyhow",
  "blake3",
