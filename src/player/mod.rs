@@ -7,6 +7,7 @@
 //! * `playlist` — a torrent's files (and its .m3u playlists) → what plays, in order
 //! * `audio`    — the engine: queue, gapless playback, sound settings
 //! * `loudness` — how loud a track is (EBU R128), for music without ReplayGain tags
+//! * `warm`     — the sound filters keep their memory across a track change
 //! * `ui`       — the now-playing bar, the playlist panel and the Sound window
 
 pub mod archive;
@@ -19,6 +20,7 @@ pub mod playlist;
 pub mod stream;
 pub mod ui;
 pub mod vis;
+pub mod warm;
 
 use std::path::PathBuf;
 use std::sync::Arc;

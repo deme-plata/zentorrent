@@ -309,6 +309,18 @@ pub fn sound(ctx: &egui::Context, p: &mut Player, open: &mut bool, bands: Option
                 )
                 .changed();
             ui.end_row();
+            ui.label("Track changes");
+            apply |= ui
+                .checkbox(&mut p.sound.lead_in, "the equalizer carries on across tracks (FLAC, WAV)")
+                .on_hover_text(
+                    "Without this, the equalizer starts every track from nothing, which is a small click at the change in \
+                     continuous music (live albums, mixes). With it, the next track is prepared with the last second of the \
+                     one before, which only the equalizer hears. Lossless files of the same format only; MP3 and AAC change \
+                     tracks as before. Not yet tried on Windows: if a second of the previous track is heard again at a \
+                     change, turn this off.",
+                )
+                .changed();
+            ui.end_row();
             ui.label("Headphones");
             apply |= ui.checkbox(&mut p.sound.crossfeed, "crossfeed (less tiring hard-panned stereo)").changed();
             ui.end_row();

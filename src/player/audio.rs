@@ -46,6 +46,9 @@ pub struct Sound {
     pub normalize: bool,
     /// "no", "track" or "album"
     pub replaygain: String,
+    /// Keep the filters' memory across a track change (see `warm`): no step from the
+    /// equalizer between lossless tracks. On where it has been measured (Linux).
+    pub lead_in: bool,
     /// With "track": tracks that carry no ReplayGain tags are measured by ZenTorrent
     /// (EBU R128, see `loudness`) and played at the same level as tagged ones.
     pub measure: bool,
@@ -65,6 +68,7 @@ impl Default for Sound {
             preset: "Flat".into(),
             normalize: false,
             replaygain: "track".into(),
+            lead_in: !cfg!(windows),
             measure: true,
             crossfeed: false,
             width: 1.0,
@@ -249,6 +253,12 @@ pub struct Live {
     pub artist: String,
     /// mpv moved to this entry of its playlist.
     pub mpv_pos: Option<i64>,
+    /// For each entry of mpv's playlist: how far into what mpv plays the track itself
+    /// starts (the lead-in of `warm`; 0 for a track queued as it is).
+    pub leads: Vec<f64>,
+    /// mpv's own clock for the playing entry, lead-in included.
+    raw_time: f64,
+    raw_duration: f64,
     pub idle: bool,
     /// A track failed to play (reason text).
     pub error: Option<String>,
@@ -260,6 +270,15 @@ pub struct Live {
     pub close: bool,
     /// mpv shut itself down (a quit that got past the bindings): the handle must go.
     pub gone: bool,
+}
+
+impl Live {
+    /// `time` and `duration` as the track's own: without the lead-in of the entry playing.
+    fn settle(&mut self) {
+        let lead = self.mpv_pos.and_then(|p| self.leads.get(p as usize).copied()).unwrap_or(0.0);
+        self.time = (self.raw_time - lead).max(0.0);
+        self.duration = if self.raw_duration > 0.0 { (self.raw_duration - lead).max(0.0) } else { 0.0 };
+    }
 }
 
 /// Keys of mpv's video window that ZenTorrent handles itself. Without them the
@@ -387,15 +406,15 @@ impl Mpv {
                         let p = unsafe { &*(ev.data as *const ffi::EventProperty) };
                         let none = p.data.is_null() || p.format == 0;
                         match ev.reply_userdata {
-                            P_TIME => l.time = if none { 0.0 } else { unsafe { *(p.data as *const f64) } },
-                            P_DURATION => l.duration = if none { 0.0 } else { unsafe { *(p.data as *const f64) } },
+                            P_TIME => l.raw_time = if none { 0.0 } else { unsafe { *(p.data as *const f64) } },
+                            P_DURATION => l.raw_duration = if none { 0.0 } else { unsafe { *(p.data as *const f64) } },
                             P_PAUSE => l.paused = !none && unsafe { *(p.data as *const i32) } != 0,
                             P_IDLE => l.idle = !none && unsafe { *(p.data as *const i32) } != 0,
                             P_FULLSCREEN => l.fullscreen = !none && unsafe { *(p.data as *const i32) } != 0,
                             P_POS => l.mpv_pos = if none { None } else { Some(unsafe { *(p.data as *const i64) }) },
                             P_TITLE | P_ARTIST => {
                                 let s = if none { String::new() } else { unsafe { CStr::from_ptr(*(p.data as *const *const c_char)) }.to_string_lossy().into_owned() };
-                                if ev.reply_userdata == P_TITLE { l.title = s } else { l.artist = s }
+                                if ev.reply_userdata == P_TITLE { l.title = super::warm::tidy_title(&s).to_string() } else { l.artist = s }
                             }
                             _ => {}
                         }
@@ -430,6 +449,7 @@ impl Mpv {
                     }
                     _ => {}
                 }
+                l.settle();
                 l.version += 1;
                 drop(l);
                 repaint();
@@ -451,24 +471,33 @@ impl Mpv {
         if rc < 0 { Err(ffi::err_text(self.api, rc)) } else { Ok(()) }
     }
 
-    /// `loadfile`, with options that hold for this file only (its measured gain).
-    /// mpv 0.38 put an index argument before the options; both forms are tried once and
-    /// the one this mpv takes is remembered. A file is never left unplayed over its
-    /// options: if neither form is taken, it is loaded without them.
-    fn load(&self, src: &str, mode: &str, opts: Option<&str>) -> Result<(), String> {
-        let Some(o) = opts else { return self.cmd(&["loadfile", src, mode]) };
-        let with = |indexed: bool| if indexed { self.cmd(&["loadfile", src, mode, "-1", o]) } else { self.cmd(&["loadfile", src, mode, o]) };
+    /// `loadfile` with options that hold for this file only, or an error: for a load that
+    /// would be wrong without them. mpv 0.38 put an index argument before the options;
+    /// both forms are tried once and the one this mpv takes is remembered.
+    fn load_with(&self, src: &str, mode: &str, opts: &str) -> Result<(), String> {
+        let with = |indexed: bool| if indexed { self.cmd(&["loadfile", src, mode, "-1", opts]) } else { self.cmd(&["loadfile", src, mode, opts]) };
         let tries = match self.indexed.get() {
             Some(known) => vec![known],
             None => vec![true, false],
         };
+        let mut last = Err("no form of loadfile was taken".to_string());
         for indexed in tries {
-            if with(indexed).is_ok() {
+            last = with(indexed);
+            if last.is_ok() {
                 self.indexed.set(Some(indexed));
-                return Ok(());
+                break;
             }
         }
-        self.cmd(&["loadfile", src, mode])
+        last
+    }
+
+    /// `loadfile`, with options that are only an improvement (the track's measured gain):
+    /// a file is never left unplayed over them. If they are not taken, it is loaded without.
+    fn load(&self, src: &str, mode: &str, opts: Option<&str>) -> Result<(), String> {
+        match opts {
+            Some(o) if self.load_with(src, mode, o).is_ok() => Ok(()),
+            _ => self.cmd(&["loadfile", src, mode]),
+        }
     }
 
     fn set(&self, name: &str, value: &str) -> Result<(), String> {
@@ -492,6 +521,14 @@ impl Drop for Mpv {
 
 // ── the player ──────────────────────────────────────────────────────────────
 
+impl Drop for Player {
+    fn drop(&mut self) {
+        // mpv first (it holds the lead-in files open), then the files.
+        self.mpv = None;
+        let _ = std::fs::remove_dir_all(&self.lead_dir);
+    }
+}
+
 pub struct Player {
     mpv: Option<Mpv>,
     pub registry: &'static Registry,
@@ -500,6 +537,14 @@ pub struct Player {
     pub sound: Sound,
     /// Order positions in mpv's playlist, in mpv's order (current, next).
     in_mpv: Vec<usize>,
+    /// The lead-in each of those entries was queued with (see `warm`; 0 = none).
+    leads: Vec<f64>,
+    /// A lead-in entry failed to play once: none are made any more this run.
+    warm_off: bool,
+    /// Where this player writes its lead-in files (one second of sound each), and the
+    /// number of the last one. Four names in turn: mpv may still hold the one before.
+    lead_dir: PathBuf,
+    lead_slot: u32,
     /// Why the player can't start (libmpv missing…), shown in the UI.
     pub error: Option<String>,
     repaint: Arc<dyn Fn() + Send + Sync>,
@@ -531,6 +576,13 @@ impl Player {
             loud: super::loudness::Loudness::new(!cfg!(test), repaint.clone()),
             loud_seen: 0,
             in_mpv: Vec::new(),
+            leads: Vec::new(),
+            warm_off: false,
+            lead_dir: {
+                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                std::env::temp_dir().join(format!("zentorrent-lead-in-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)))
+            },
+            lead_slot: 0,
             error: None,
             repaint,
             marks: super::bookmark::Bookmarks::load(),
@@ -610,23 +662,67 @@ impl Player {
         self.jump(pos, complete);
     }
 
+    /// What to queue instead of `next` so that the filters keep their memory across the
+    /// change from the track at play-order position `cur` (see `warm`). None: nothing has
+    /// a memory to keep (no filter is on), or it cannot be done exactly for these two.
+    fn warm(&mut self, cur: usize, next: &Track, complete: &dyn Fn(usize) -> bool) -> Option<super::warm::Entry> {
+        if self.warm_off || !self.sound.lead_in || self.sound.af().is_empty() {
+            return None;
+        }
+        let prev = self.queue.tracks.get(*self.queue.order.get(cur)?)?;
+        let a = self.on_disk(prev, complete(prev.file))?;
+        let b = self.on_disk(next, complete(next.file))?;
+        std::fs::create_dir_all(&self.lead_dir).ok()?;
+        self.lead_slot = self.lead_slot.wrapping_add(1);
+        super::warm::entry(&a, &b, &self.lead_dir.join(format!("{}.wav", self.lead_slot % 4)))
+    }
+
+    /// Tell the event thread which lead-in each of mpv's entries has.
+    fn share_leads(&self) {
+        let mut l = self.live.lock().unwrap();
+        l.leads = self.leads.clone();
+        l.settle();
+    }
+
+    /// Put the track after play-order position `cur` behind the playing one in mpv's
+    /// queue: with a lead-in when that keeps the filters' memory, else as it is.
+    fn append_next(&mut self, cur: usize, complete: &dyn Fn(usize) -> bool) {
+        let Some(n) = self.queue.after(cur) else { return };
+        let t = self.queue.tracks[self.queue.order[n]].clone();
+        let src = self.source(&t, complete(t.file));
+        let gain = self.gain(&t, complete(t.file));
+        let warm = self.warm(cur, &t, complete);
+        let Some(m) = self.mpv.as_ref() else { return };
+        let mut lead = None;
+        if let Some(e) = warm {
+            let opts = match &gain {
+                Some(g) => format!("{},{g}", e.opts),
+                None => e.opts.clone(),
+            };
+            // Without its options this entry would play the lead-in out loud: all or nothing.
+            if m.load_with(&e.url, "append", &opts).is_ok() {
+                lead = Some(e.lead);
+            }
+        }
+        if lead.is_none() && m.load(&src, "append", gain.as_deref()).is_ok() {
+            lead = Some(0.0);
+        }
+        if let Some(lead) = lead {
+            self.in_mpv.push(n);
+            self.leads.push(lead);
+            self.share_leads();
+        }
+    }
+
     /// Play the track at play-order position `pos`, and queue the one after it.
     pub fn jump(&mut self, pos: usize, complete: &dyn Fn(usize) -> bool) {
         let Some(&ti) = self.queue.order.get(pos) else { return };
         let track = self.queue.tracks[ti].clone();
         let src = self.source(&track, complete(track.file));
-        let next = self.queue.after(pos).map(|p| (p, self.queue.tracks[self.queue.order[p]].clone()));
-        let next_src = next.as_ref().map(|(_, t)| self.source(t, complete(t.file)));
         let gain = self.gain(&track, complete(track.file));
-        let next_gain = next.as_ref().and_then(|(_, t)| self.gain(t, complete(t.file)));
         let result = (|| -> Result<(), String> {
             let m = self.mpv()?;
-            m.load(&src, "replace", gain.as_deref())?;
-            m.set("pause", "no")?;
-            if let Some(s) = &next_src {
-                m.load(s, "append", next_gain.as_deref())?;
-            }
-            Ok(())
+            m.load(&src, "replace", gain.as_deref())
         })();
         match result {
             Ok(()) => {
@@ -635,11 +731,20 @@ impl Player {
                 self.changed = std::time::Instant::now();
                 self.resumed = None;
                 self.resume = self.marks.get(&super::bookmark::key(&self.queue.hash, &track.path)).map(|at| (pos, at));
-                self.in_mpv = std::iter::once(pos).chain(next.map(|(p, _)| p)).collect();
+                self.in_mpv = vec![pos];
+                self.leads = vec![0.0];
                 if let Ok(mut l) = self.live.lock() {
                     l.mpv_pos = Some(0);
-                    l.time = 0.0;
-                    l.duration = track.duration.unwrap_or(0.0);
+                    l.leads = vec![0.0];
+                    l.raw_time = 0.0;
+                    l.raw_duration = track.duration.unwrap_or(0.0);
+                    l.settle();
+                }
+                // The next track is queued before playing goes on: from a pause, nothing
+                // is heard until mpv knows what follows.
+                self.append_next(pos, complete);
+                if let Some(Err(e)) = self.mpv.as_ref().map(|m| m.set("pause", "no")) {
+                    self.error = Some(e);
                 }
             }
             Err(e) => self.error = Some(e),
@@ -662,6 +767,22 @@ impl Player {
             self.marks.save();
             self.queue.pos = None;
             self.in_mpv.clear();
+        self.leads.clear();
+            return;
+        }
+        // A track queued with a lead-in (see `warm`) could not be played: play it the plain
+        // way, and make no more lead-ins this run. A step at a track change is better than
+        // music that stops.
+        let failed = {
+            let mut l = self.live.lock().unwrap();
+            if l.error.is_some() && l.leads.iter().any(|&lead| lead > 0.0) { l.error.take() } else { None }
+        };
+        if failed.is_some() {
+            self.warm_off = true;
+            let at = self.in_mpv.iter().zip(&self.leads).find(|(_, &lead)| lead > 0.0).map(|(&p, _)| p);
+            if let Some(p) = at {
+                self.jump(p, complete);
+            }
             return;
         }
         self.bookmark();
@@ -685,21 +806,23 @@ impl Player {
         }
         // mpv moved on by itself (gapless): drop what's behind, queue the next.
         let now = self.in_mpv[p];
-        let _ = m.cmd(&["playlist-clear"]); // keeps only the playing entry
+        let lead = self.leads.get(p).copied().unwrap_or(0.0);
+        // First what the event thread reads (which entry plays, and its lead-in), then
+        // mpv's own list: there is no moment where the two disagree.
         self.in_mpv = vec![now];
+        self.leads = vec![lead];
+        {
+            let mut l = self.live.lock().unwrap();
+            l.mpv_pos = Some(0);
+            l.leads = vec![lead];
+            l.settle();
+        }
+        let _ = m.cmd(&["playlist-clear"]); // keeps only the playing entry
         self.queue.pos = Some(now);
         self.changed = std::time::Instant::now();
         let path = self.queue.tracks[self.queue.order[now]].path.clone();
         self.resume = self.marks.get(&super::bookmark::key(&self.queue.hash, &path)).map(|at| (now, at));
-        self.live.lock().unwrap().mpv_pos = Some(0);
-        if let Some(n) = self.queue.after(now) {
-            let t = self.queue.tracks[self.queue.order[n]].clone();
-            let src = self.source(&t, complete(t.file));
-            let gain = self.gain(&t, complete(t.file));
-            if self.mpv.as_ref().unwrap().load(&src, "append", gain.as_deref()).is_ok() {
-                self.in_mpv.push(n);
-            }
-        }
+        self.append_next(now, complete);
     }
 
     pub fn toggle_pause(&mut self) {
@@ -725,7 +848,12 @@ impl Player {
 
     pub fn seek(&mut self, secs: f64) {
         if let Some(m) = &self.mpv {
-            let _ = m.cmd(&["seek", &format!("{secs:.2}"), "absolute"]);
+            // mpv's clock for an entry with a lead-in starts that much earlier.
+            let lead = {
+                let l = self.live.lock().unwrap();
+                l.mpv_pos.and_then(|p| l.leads.get(p as usize).copied()).unwrap_or(0.0)
+            };
+            let _ = m.cmd(&["seek", &format!("{:.2}", secs + lead), "absolute"]);
         }
     }
 
@@ -776,6 +904,7 @@ impl Player {
         }
         self.queue.pos = None;
         self.in_mpv.clear();
+        self.leads.clear();
     }
 
     /// Push the sound settings to mpv and save them.
@@ -803,17 +932,18 @@ impl Player {
     /// Re-queue the track after the playing one (after shuffle/repeat/reorder changes).
     pub fn requeue(&mut self, complete: &dyn Fn(usize) -> bool) {
         let (Some(cur), Some(m)) = (self.queue.pos, self.mpv.as_ref()) else { return };
-        let _ = m.cmd(&["playlist-clear"]);
+        let at = self.live.lock().unwrap().mpv_pos.unwrap_or(0) as usize;
+        let lead = self.leads.get(at).copied().unwrap_or(0.0);
         self.in_mpv = vec![cur];
-        self.live.lock().unwrap().mpv_pos = Some(0);
-        if let Some(n) = self.queue.after(cur) {
-            let t = self.queue.tracks[self.queue.order[n]].clone();
-            let src = self.source(&t, complete(t.file));
-            let gain = self.gain(&t, complete(t.file));
-            if self.mpv.as_ref().unwrap().load(&src, "append", gain.as_deref()).is_ok() {
-                self.in_mpv.push(n);
-            }
+        self.leads = vec![lead];
+        {
+            let mut l = self.live.lock().unwrap();
+            l.mpv_pos = Some(0);
+            l.leads = vec![lead];
+            l.settle();
         }
+        let _ = m.cmd(&["playlist-clear"]);
+        self.append_next(cur, complete);
     }
 }
 
@@ -993,9 +1123,20 @@ mod tests {
         panic!("no audio in {}", path.display());
     }
 
-    /// Play `files` as a queue through the real player (libmpv, writing `frames` frames
-    /// to `out` as fast as it decodes) and return what came out: left channel, sample rate.
+    /// A lead-in of a second (and a quarter of a sample).
+    fn led(lead: f64) -> bool {
+        lead > 1.0 && lead < 1.001
+    }
+
     fn render(out: &std::path::Path, sound: Sound, files: &[PathBuf], frames: u64, measured: bool) -> (Vec<f32>, u32) {
+        let (left, rate, _) = render_led(out, sound, files, frames, measured);
+        (left, rate)
+    }
+
+    /// Play `files` as a queue through the real player (libmpv, writing `frames` frames
+    /// to `out` as fast as it decodes) and return what came out: left channel, sample
+    /// rate, and whether the second track was queued with a lead-in.
+    fn render_led(out: &std::path::Path, sound: Sound, files: &[PathBuf], frames: u64, measured: bool) -> (Vec<f32>, u32, bool) {
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
         let mut p = Player::new(rt.handle().clone(), Arc::new(|| {}));
         p.sound = sound;
@@ -1009,11 +1150,15 @@ mod tests {
             m.set("ao", "pcm").unwrap();
             m.set("ao-pcm-file", &out.to_string_lossy()).unwrap();
             m.set("audio-format", "float").unwrap();
+            // This writes as fast as it decodes: a short first track could be over before
+            // the second is queued. From a pause, the queue is complete before it starts.
+            m.set("pause", "yes").unwrap();
         }
         let tracks: Vec<Track> = files.iter().enumerate().map(|(i, f)| Track::file(i, &f.to_string_lossy(), format!("T{i}"), None, Kind::Audio)).collect();
         let n = tracks.len();
         p.start(Queue { tracks, order: (0..n).collect(), ..Default::default() }, 0, &|_| true);
         assert_eq!(p.error, None);
+        let with_lead_in = p.leads.get(1).is_some_and(|&l| led(l));
         let t0 = std::time::Instant::now();
         loop {
             p.tick(&|_| true);
@@ -1030,7 +1175,8 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
         drop(p); // closes the file
-        left_of(out)
+        let (left, rate) = left_of(out);
+        (left, rate, with_lead_in)
     }
 
     fn scratch(name: &str) -> Option<PathBuf> {
@@ -1064,18 +1210,16 @@ mod tests {
 
         // With filters the level and phase move, so look for the gap itself: silence at
         // the change, or a jump between two neighbouring samples bigger than this tone makes.
-        // The limiter and the widening must leave none at all (the limiter used to leave
-        // 5 ms of silence). The equalizer is different: mpv builds the filters anew for
-        // each file, so its bands start the new track with an empty memory. That is no
-        // silence and no lost sample, but it is a step at the change — measured 2026-11-27
-        // with the Bass preset, crossfeed, widening and 110 % at once: 3.6 times the tone's
-        // own. Known, not fixed here; the bound only keeps it from growing unnoticed.
+        // None is left by anything: the limiter used to leave 5 ms of silence, and the
+        // equalizer a step 3.6 times the tone's own (it began every file with an empty
+        // memory; now it hears the previous track's last second first, see `warm`).
         let mut eq = [0.0; 10];
         eq[..4].copy_from_slice(&[6.0, 5.0, 4.0, 2.0]);
         for (name, sound, most) in [
             ("limiter", Sound { volume: 130.0, ..quiet.clone() }, 1.05),
             ("wide", Sound { width: 1.5, ..quiet.clone() }, 1.05),
-            ("everything", Sound { eq, width: 1.5, crossfeed: true, volume: 110.0, ..quiet.clone() }, 6.0),
+            ("bass", Sound { eq, ..quiet.clone() }, 1.05),
+            ("everything", Sound { eq, width: 1.5, crossfeed: true, volume: 110.0, normalize: true, ..quiet.clone() }, 1.05),
         ] {
             let (left, _) = render(&dir.join(format!("{name}.wav")), sound, &[a.clone(), b.clone()], total as u64, false);
             assert_eq!(left.len(), total as usize, "{name}: not one frame more or less");
@@ -1092,6 +1236,199 @@ mod tests {
             let own = peak * (std::f32::consts::TAU * hz as f32 / rate as f32);
             assert!(step <= own * most, "{name}: a jump of {step} between two samples (the tone's own is {own})");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The lead-in at the sample rates and track lengths where every other way of doing it
+    /// was a sample off (2026-11-27: lengths that are a round time, like exactly 2 s, and
+    /// every rate outside the 44.1 kHz family). Two checks in the real player: a filter that
+    /// leaves this signal as it is (narrowing, on a tone that is the same on both sides), so
+    /// every sample can be compared; and the Bass preset, where there must be no step.
+    #[test]
+    fn a_lead_in_is_exact_at_any_sample_rate_and_track_length() {
+        let Some(dir) = scratch("grid") else { return };
+        let (hz, amp) = (440.0, 0.25);
+        let mut eq = [0.0; 10];
+        eq[..4].copy_from_slice(&[6.0, 5.0, 4.0, 2.0]);
+        let quiet = Sound { replaygain: "no".into(), measure: false, ..Default::default() };
+        for rate in [22_050u32, 44_100, 48_000, 96_000] {
+            for (cut, len) in [(2 * rate, rate), (2 * rate, 2 * rate), (2 * rate - 11, 2 * rate), (2 * rate, 2 * rate + 11), (3 * rate + 1, (1.37 * rate as f64) as u32 + 1)] {
+                let (a, b, total) = (dir.join("a.wav"), dir.join("b.wav"), cut + len);
+                tone_wav(&a, rate, 0, cut, hz, amp);
+                tone_wav(&b, rate, cut, len, hz, amp);
+                let what = format!("{rate} Hz, {cut} + {len} frames");
+
+                let (left, got, with) = render_led(&dir.join("same.wav"), Sound { width: 0.5, ..quiet.clone() }, &[a.clone(), b.clone()], total as u64, false);
+                assert!(with && got == rate, "{what}: a lead-in is used");
+                assert_eq!(left.len(), total as usize, "{what}: not one frame more or less");
+                let worst = left.iter().enumerate().map(|(n, &x)| (x as f64 - amp * (std::f64::consts::TAU * hz * n as f64 / rate as f64).sin()).abs()).fold(0.0, f64::max);
+                assert!(worst < 1e-3, "{what}: every sample where it belongs (worst is {worst} off)");
+
+                let (left, _, with) = render_led(&dir.join("bass.wav"), Sound { eq, ..quiet.clone() }, &[a, b], total as u64, false);
+                assert!(with, "{what}: a lead-in is used");
+                assert_eq!(left.len(), total as usize, "{what}, Bass preset: not one frame more or less");
+                let body = &left[rate as usize / 5..left.len() - rate as usize / 5];
+                let peak = body.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+                let step = body.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max);
+                let own = peak * (std::f32::consts::TAU * hz as f32 / rate as f32);
+                assert!(step <= own * 1.05, "{what}, Bass preset: a jump of {step} between two samples (the tone's own is {own})");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FLAC (made with ffmpeg, when it is here), 16 and 24 bit: with a lead-in the next
+    /// track is still itself — its own ReplayGain and its own title, not those of the
+    /// second of the track before that mpv is given first — and there is no step.
+    #[test]
+    fn flac_tracks_with_a_lead_in_keep_their_own_tags() {
+        let Some(dir) = scratch("flac") else { return };
+        let ffmpeg = |args: &[&str]| std::process::Command::new("ffmpeg").args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y"]).args(args).status().map(|s| s.success()).unwrap_or(false);
+        if !ffmpeg(&["-version"]) {
+            eprintln!("ffmpeg is not on this machine: FLAC not tested here");
+            return;
+        }
+        let (rate, cut, total, hz, amp) = (44_100u32, 88_211u32, 176_400u32, 440.0, 0.25);
+        let (wa, wb) = (dir.join("a.wav"), dir.join("b.wav"));
+        tone_wav(&wa, rate, 0, cut, hz, amp);
+        tone_wav(&wb, rate, cut, total - cut, hz, amp);
+        let mut eq = [0.0; 10];
+        eq[..4].copy_from_slice(&[6.0, 5.0, 4.0, 2.0]);
+        for bits in ["16", "24"] {
+            let (a, b) = (dir.join(format!("a{bits}.flac")), dir.join(format!("b{bits}.flac")));
+            for (src, dst, gain, title) in [(&wa, &a, "-6.02 dB", "First"), (&wb, &b, "+6.02 dB", "Second")] {
+                let fmt = if bits == "24" { "s32" } else { "s16" };
+                assert!(ffmpeg(&["-i", &src.to_string_lossy(), "-sample_fmt", fmt, "-bits_per_raw_sample", bits, "-metadata", &format!("REPLAYGAIN_TRACK_GAIN={gain}"),
+                    "-metadata", "REPLAYGAIN_TRACK_PEAK=0.250000", "-metadata", &format!("TITLE={title}"), &dst.to_string_lossy()]));
+            }
+            assert_eq!(crate::player::warm::lossless(&a).map(|l| l.wide), Some(bits == "24"), "{bits}-bit FLAC");
+
+            // No step, not a frame off, with the Bass preset (ReplayGain off, so the level stays).
+            let sound = Sound { eq, replaygain: "no".into(), measure: false, ..Default::default() };
+            let (left, _, with) = render_led(&dir.join("eq.wav"), sound, &[a.clone(), b.clone()], total as u64, false);
+            assert!(with, "{bits}-bit FLAC: a lead-in is used");
+            assert_eq!(left.len(), total as usize, "{bits}-bit FLAC: not one frame more or less");
+            let body = &left[rate as usize / 5..left.len() - rate as usize / 5];
+            let peak = body.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let step = body.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max);
+            let own = peak * (std::f32::consts::TAU * hz as f32 / rate as f32);
+            assert!(step <= own * 1.05, "{bits}-bit FLAC: a jump of {step} between two samples (the tone's own is {own})");
+
+            // Each track at its own ReplayGain: the first 6 dB down, the second 6 dB up. A cut
+            // at 16 kHz is the filter here: it leaves a 440 Hz tone alone.
+            let mut cut_high = [0.0; 10];
+            cut_high[9] = -3.0;
+            let (left, _, with) = render_led(&dir.join("rg.wav"), Sound { eq: cut_high, measure: false, ..Default::default() }, &[a, b], total as u64, false);
+            assert!(with);
+            let level = |t: f64| left[(t * rate as f64) as usize..][..441].iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            assert!((level(1.0) / 0.125 - 1.0).abs() < 0.05 && (level(3.0) / 0.5 - 1.0).abs() < 0.05, "{bits}-bit FLAC: levels {} then {} (wanted 0.125 then 0.5)", level(1.0), level(3.0));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A track queued with a lead-in is still that track to everything else: its clock
+    /// starts at 0 and runs its own length, a seek lands where it was asked to, its name
+    /// is its own — and the queue goes on after it, with a lead-in for the next again.
+    #[test]
+    fn a_track_with_a_lead_in_keeps_its_own_clock_and_name() {
+        let Some(dir) = scratch("clock") else { return };
+        let files: Vec<PathBuf> = (0..3u32).map(|i| dir.join(format!("{i}.wav"))).collect();
+        for (i, f) in files.iter().enumerate() {
+            tone_wav(f, 44_100, 0, 2 * 44_100, 300.0 + 100.0 * i as f64, 0.3);
+        }
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let mut p = Player::new(rt.handle().clone(), Arc::new(|| {}));
+        let mut eq = [0.0; 10];
+        eq[1] = 5.0;
+        p.sound = Sound { eq, measure: false, ..Default::default() };
+        p.mpv().expect("the player starts").set("ao", "null").unwrap();
+        let tracks: Vec<Track> = files.iter().enumerate().map(|(i, f)| Track::file(i, &f.to_string_lossy(), format!("T{i}"), None, Kind::Audio)).collect();
+        p.start(Queue { tracks, order: vec![0, 1, 2], ..Default::default() }, 0, &|_| true);
+        assert!(p.leads.len() == 2 && p.leads[0] == 0.0 && led(p.leads[1]), "the second track is queued with a lead-in: {:?}", p.leads);
+        let (t0, mut seen, mut playing, mut sought) = (std::time::Instant::now(), vec![0usize], false, None);
+        // (time, length, name, was this 0.25 s or more after the seek?)
+        let mut second: Vec<(f64, f64, String, bool)> = Vec::new();
+        loop {
+            p.tick(&|_| true);
+            let (idle, time, dur, title) = {
+                let l = p.live.lock().unwrap();
+                (l.idle, l.time, l.duration, l.title.clone())
+            };
+            playing |= dur > 0.0 && !idle;
+            if let Some(pos) = p.queue.pos.filter(|pos| seen.last() != Some(pos)) {
+                seen.push(pos);
+                if pos == 1 {
+                    assert!(p.leads.len() == 2 && p.leads.iter().all(|&l| led(l)), "and the third one too: {:?}", p.leads);
+                }
+            }
+            // The second track, once it has settled in (0.3 s after the change).
+            if p.queue.pos == Some(1) && p.changed.elapsed() > std::time::Duration::from_millis(300) && dur > 0.0 {
+                let settled = sought.is_some_and(|s: std::time::Instant| s.elapsed() > std::time::Duration::from_millis(250));
+                second.push((time, dur, title, settled));
+                if sought.is_none() {
+                    p.seek(1.2);
+                    sought = Some(std::time::Instant::now());
+                }
+            }
+            if playing && idle {
+                break;
+            }
+            assert!(t0.elapsed() < std::time::Duration::from_secs(30), "stuck after {seen:?}");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(seen, [0, 1, 2]);
+        let (first_time, dur, title, _) = second.first().cloned().expect("the second track was seen playing");
+        assert!((dur - 2.0).abs() < 0.01, "its own length, not the lead-in's on top: {dur}");
+        assert!((0.2..0.9).contains(&first_time), "its own time: {first_time} s, 0.3 s in");
+        assert_eq!(title, "1.wav");
+        // After the seek to 1.2 s: it carries on from there (never before it, never past its end).
+        let after: Vec<f64> = second.iter().filter(|s| s.3).map(|s| s.0).collect();
+        assert!(!after.is_empty() && after.iter().all(|t| (1.15..=2.0).contains(t)), "after seeking to 1.2 s: {:?}", &after[..after.len().min(8)]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A lead-in entry that mpv cannot play must not stop the music: the track is played
+    /// the plain way, and lead-ins are left alone for the rest of the run.
+    #[test]
+    fn a_lead_in_that_fails_falls_back_to_the_plain_track() {
+        let Some(dir) = scratch("fallback") else { return };
+        let files: Vec<PathBuf> = (0..3u32).map(|i| dir.join(format!("{i}.wav"))).collect();
+        for (i, f) in files.iter().enumerate() {
+            tone_wav(f, 44_100, 0, 2 * 44_100, 300.0 + 100.0 * i as f64, 0.3);
+        }
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let mut p = Player::new(rt.handle().clone(), Arc::new(|| {}));
+        let mut eq = [0.0; 10];
+        eq[1] = 5.0;
+        p.sound = Sound { eq, measure: false, ..Default::default() };
+        p.mpv().expect("the player starts").set("ao", "null").unwrap();
+        let tracks: Vec<Track> = files.iter().enumerate().map(|(i, f)| Track::file(i, &f.to_string_lossy(), format!("T{i}"), None, Kind::Audio)).collect();
+        p.start(Queue { tracks, order: vec![0, 1, 2], ..Default::default() }, 0, &|_| true);
+        assert!(p.leads.len() == 2 && led(p.leads[1]), "{:?}", p.leads);
+        // What mpv reports when an entry will not play.
+        p.live.lock().unwrap().error = Some("could not play this track: no audio or video data played".into());
+        p.tick(&|_| true);
+        assert!(p.warm_off);
+        assert_eq!((p.queue.pos, p.error.clone()), (Some(1), None), "the track that had the lead-in plays, as it is");
+        assert_eq!(p.leads, [0.0, 0.0], "and the one after it is queued as it is too");
+        let (t0, mut seen, mut playing) = (std::time::Instant::now(), vec![1usize], false);
+        loop {
+            p.tick(&|_| true);
+            let (idle, dur) = {
+                let l = p.live.lock().unwrap();
+                (l.idle, l.duration)
+            };
+            playing |= dur > 0.0 && !idle;
+            if let Some(pos) = p.queue.pos.filter(|pos| seen.last() != Some(pos)) {
+                seen.push(pos);
+            }
+            if playing && idle {
+                break;
+            }
+            assert!(t0.elapsed() < std::time::Duration::from_secs(30), "stuck after {seen:?}");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(seen, [1, 2], "and the queue goes on");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1159,6 +1496,18 @@ mod tests {
         // +8 dB, nor the quiet track's start the loud one's -12 dB.
         let wrong: Vec<(usize, f32)> = p.iter().copied().enumerate().skip(5).take(390).filter(|(_, v)| (v / want - 1.0).abs() > 0.25).collect();
         assert!(wrong.len() <= 3, "{} hundredths of a second at the wrong level around the change: {:?}", wrong.len(), &wrong[..wrong.len().min(12)]);
+
+        // With a filter on, the second track is queued with a lead-in (see `warm`): its
+        // gain must still be its own, and none of the loud lead-in may be heard.
+        let mut eq = [0.0; 10];
+        eq[5] = -3.0;
+        let (left, _) = render(&dir.join("eq.wav"), Sound { eq, ..Default::default() }, &[dir.join("loud.wav"), dir.join("quiet.wav")], 2 * each as u64, true);
+        assert_eq!(left.len(), 2 * each as usize);
+        let p = peaks(&left);
+        let level = p[50];
+        assert!(level > want * 0.5 && level < want, "1 kHz cut by 3 dB from {want}: {level}");
+        let wrong: Vec<(usize, f32)> = p.iter().copied().enumerate().skip(5).take(390).filter(|(_, v)| (v / level - 1.0).abs() > 0.25).collect();
+        assert!(wrong.len() <= 3, "with a lead-in: {} hundredths of a second at the wrong level: {:?}", wrong.len(), &wrong[..wrong.len().min(12)]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
